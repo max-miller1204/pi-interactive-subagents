@@ -86,6 +86,15 @@ function allow(
 		? Object.keys(child.launch.nested?.agents ?? {})
 		: Object.keys(catalogOf(input).agents);
 }
+function modelAllow(
+	input: CatalogInput,
+	child?: { launch: { depth: number; nested: Catalog | null } },
+): string[] {
+	const catalog = catalogOf(input);
+	return allow(input, child).filter(
+		(name) => catalog.agents[name]?.modelInvocable,
+	);
+}
 function usedNames(runtime: Runtime): Set<string> {
 	const list = runtime.list();
 	return new Set([
@@ -126,7 +135,7 @@ export function registerTools(
 	let guidelines = "";
 	const registerStart = () => {
 		const input = getCatalog();
-		const next = subagentsSection(input, allow(input, child));
+		const next = subagentsSection(input, modelAllow(input, child));
 		if (next === guidelines) return;
 		guidelines = next;
 		pi.registerTool({
@@ -212,15 +221,20 @@ export function registerTools(
 			const listing = runtime.list();
 			const input = getCatalog();
 			const lines = [
-				subagentsSection(input, allow(input, child)),
+				subagentsSection(input, modelAllow(input, child)),
 				"Live subagents:",
 			];
 			for (const run of listing.live) {
 				const active = runtime.runs.get(run.name);
 				if (active === undefined)
 					throw new Error(`Missing live subagent ${run.name}.`);
+				const state = run.broken
+					? "broken"
+					: run.phase === "finished"
+						? "done"
+						: (run.view?.state ?? "starting");
 				lines.push(
-					`${run.name} (${run.launch.agent}): ${run.phase}; elapsed: ${Math.max(0, Math.floor((Date.now() - active.spec.startedAt) / 1000))}s; open questions: ${run.openQuestions.join(", ") || "none"}`,
+					`${run.name} (${run.launch.agent}): ${state}; elapsed: ${Math.max(0, Math.floor((Date.now() - active.spec.startedAt) / 1000))}s; open questions: ${run.openQuestions.join(", ") || "none"}`,
 				);
 			}
 			for (const name of listing.launching) lines.push(`${name}: starting`);
@@ -246,11 +260,9 @@ export function registerCommand(
 	pi.registerCommand("subagent", {
 		description: "Start a subagent. Usage: /subagent <agent> [task]",
 		getArgumentCompletions(prefix) {
-			const names = allow(getCatalog(), child).filter(
-				(name) =>
-					name.startsWith(prefix) &&
-					(child !== undefined ||
-						catalogOf(getCatalog()).agents[name]?.modelInvocable),
+			const input = getCatalog();
+			const names = allow(input, child).filter((name) =>
+				name.startsWith(prefix),
 			);
 			return names.map((name) => ({ value: name, label: name }));
 		},

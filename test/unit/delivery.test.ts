@@ -97,6 +97,49 @@ function fixture(
 	};
 }
 
+test("read-only delivery view reports a blocked ready item and a broken delivery", () => {
+	const f = fixture();
+	try {
+		f.deliverer.onInput();
+		assert.deepEqual(f.deliverer.view(Date.now() + 3000), {
+			promptBlocked: false,
+			brokenError: null,
+		});
+		f.add("ready");
+		assert.equal(f.deliverer.view(Date.now() + 1000).promptBlocked, false);
+		assert.equal(f.deliverer.view(Date.now() + 3000).promptBlocked, true);
+		f.deliverer.onAgentStart();
+		assert.equal(f.deliverer.view(Date.now() + 3000).promptBlocked, false);
+		f.source.build = (item) => ({
+			kind: "message",
+			trigger: false,
+			message: {
+				customType: "test",
+				content: "test",
+				display: true,
+				details: { deliveryId: item.id },
+			},
+		});
+		const silent = fixture({ appendQuiet: false });
+		try {
+			silent.add("broken");
+			silent.source.build = f.source.build;
+			assert.throws(
+				() => silent.deliverer.pump(),
+				/Pi did not append subagent message/,
+			);
+			assert.match(
+				silent.deliverer.view(Date.now()).brokenError ?? "",
+				/Pi did not append subagent message/,
+			);
+		} finally {
+			silent.cleanup();
+		}
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("keeps an offered item until its receiving session exists on disk", () => {
 	const f = fixture();
 	try {

@@ -183,6 +183,7 @@ export const ResultDetails = Obj({
 	name: Name,
 	agent: AgentName,
 	profile: Name,
+	autoExit: Type.Boolean(),
 	status: ResultStatus,
 	text: Type.String(),
 	truncated: Type.Boolean(),

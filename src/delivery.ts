@@ -65,6 +65,20 @@ export class Deliverer {
 	get offeredCount(): number {
 		return this.offered.size;
 	}
+	view(
+		now: number,
+	): Readonly<{ promptBlocked: boolean; brokenError: string | null }> {
+		return {
+			promptBlocked:
+				!this.disposed &&
+				this.promptStarting !== null &&
+				now - this.promptStarting.since > 2000 &&
+				this.sources.some((source) =>
+					source.items().some((item) => !this.offered.has(item.id)),
+				),
+			brokenError: this.broken?.message ?? null,
+		};
+	}
 	private sessionIds(): { inSession: Set<string>; durable: boolean } {
 		const inSession = new Set<string>();
 		if (this.sources.some((source) => source.items().length > 0)) {

@@ -431,6 +431,32 @@ function fixture(
 		activeTools: () => activeTools,
 	};
 }
+test("result stores auto-exit provenance and done rows retain agent, duration and tokens for 10 seconds", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	run.spec.launch.autoExit = false;
+	writeJsonAtomic(join(run.runDir, "spec.json"), run.spec);
+	await f.runtime.start({ reason: "new" });
+	f.advance(62000);
+	await f.runtime.tick();
+	assert.equal(run.result().autoExit, false);
+	await f.runtime.tick();
+	assert.deepEqual(f.runtime.done, [
+		{
+			name: "worker-1",
+			agent: "worker",
+			startedAt: run.spec.startedAt,
+			contextTokens: 3,
+			until: 73000,
+		},
+	]);
+	f.advance(9999);
+	await f.runtime.tick();
+	assert.equal(f.runtime.done.length, 1);
+	f.advance(1);
+	await f.runtime.tick();
+	assert.equal(f.runtime.done.length, 0);
+});
 test("a corrupt run fails while a healthy run still finishes with one pane scan", async (t) => {
 	const f = fixture(t);
 	const bad = f.prepare("bad", true);

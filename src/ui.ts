@@ -9,8 +9,9 @@ import {
 	type TUI,
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
+import type { Deliverer } from "./delivery.ts";
 import type { Runtime } from "./parent.ts";
-import type { ResultDetails } from "./schema.ts";
+import type { ChildStatus, ResultDetails } from "./schema.ts";
 
 export function formatDuration(ms: number): string {
 	const seconds = Math.max(0, Math.floor(ms / 1000));
@@ -36,7 +37,7 @@ export function resultContent(details: ResultDetails): string {
 			state = "ended without output";
 			break;
 		case "closed":
-			state = `was closed in its pane${details.text ? " by a human" : ""}`;
+			state = `was closed in its pane${!details.autoExit && details.text.length > 0 ? " by a human" : ""}`;
 			break;
 		case "failed":
 			state = `could not start: ${details.errorMessage}`;
@@ -79,11 +80,22 @@ export function resultContent(details: ResultDetails): string {
 	return lines.join("\n\n");
 }
 
-type ViewRuntime = Pick<Runtime, "runs" | "done" | "deliverer">;
-type DeliveryView = {
-	promptPreflightSince?: number | null;
-	brokenError?: Error;
-};
+export interface ViewRuntime {
+	runs: ReadonlyMap<
+		string,
+		{
+			spec: { startedAt: number; launch: { name: string; agent: string } };
+			phase: "live" | "finishing" | "finished";
+			view?: Pick<
+				ChildStatus,
+				"state" | "question" | "human" | "contextTokens"
+			>;
+			broken?: Error;
+		}
+	>;
+	done: Runtime["done"];
+	deliverer: Pick<Deliverer, "view"> | undefined;
+}
 export function createWidget(
 	runtime: ViewRuntime,
 	tui: TUI,
@@ -136,15 +148,12 @@ export function createWidget(
 				if (row.until > time)
 					lines.push(
 						truncateToWidth(
-							`${theme.fg("success", "✓")} ${theme.fg("muted", row.name)}  ${theme.fg("success", "done")}`,
+							`${theme.fg("success", "✓")} ${theme.fg("muted", row.name)}  ${theme.fg("muted", row.agent)}  ${theme.fg("success", "done")}  ${theme.fg("muted", formatDuration(time - row.startedAt))}  ${theme.fg("muted", formatTokens(row.contextTokens))}`,
 							width,
 						),
 					);
-			const delivery = runtime.deliverer as DeliveryView | undefined;
-			if (
-				delivery?.promptPreflightSince != null &&
-				time - delivery.promptPreflightSince > 2000
-			)
+			const delivery = runtime.deliverer?.view(time);
+			if (delivery?.promptBlocked)
 				lines.push(
 					truncateToWidth(
 						theme.fg("warning", "waiting for your prompt to start"),
@@ -154,10 +163,7 @@ export function createWidget(
 			if (delivery?.brokenError)
 				lines.push(
 					truncateToWidth(
-						theme.fg(
-							"error",
-							`delivery stopped: ${delivery.brokenError.message}`,
-						),
+						theme.fg("error", `delivery stopped: ${delivery.brokenError}`),
 						width,
 					),
 				);
@@ -187,12 +193,17 @@ export function registerRenderers(
 		"subagent_result",
 		(message, { expanded }, theme) => {
 			const details = detailsOf<ResultDetails>(message.details);
-			const header = `${details.status === "completed" ? "✓" : "●"} ${details.name}  ${details.agent}  ${details.status}  ${formatDuration(details.durationMs)}  ${formatTokens(details.contextTokens)}`;
+			const success =
+				details.status === "completed" ||
+				(details.status === "closed" &&
+					!details.autoExit &&
+					details.text.length > 0);
+			const header = `${success ? "✓" : "●"} ${details.name}  ${details.agent}  ${details.status}  ${formatDuration(details.durationMs)}  ${formatTokens(details.contextTokens)}`;
 			const body = expanded
 				? `${resultContent(details)}\nFull transcript: ${details.childSessionFile}`
 				: details.text.split("\n").slice(0, 3).join("\n");
 			return new Text(
-				`${theme.fg(details.status === "completed" ? "success" : "warning", header)}\n${body}`,
+				`${theme.fg(success ? "success" : "warning", header)}\n${body}`,
 				0,
 				0,
 			);
@@ -292,14 +303,26 @@ export function registerToolRenderers(name: "subagent" | "subagent_message") {
 			},
 			_options: unknown,
 			theme: Theme,
-			_context?: unknown,
+			_context: { isError: boolean },
 		): Component {
+			if (_context.isError) {
+				const diagnostic = result.content
+					.filter((part) => part.type === "text")
+					.map((part) => part.text)
+					.join(" ")
+					.replace(/\s+/g, " ")
+					.trim();
+				if (!diagnostic)
+					throw new Error(`The ${name} tool error has no diagnostic.`);
+				return new Text(theme.fg("error", diagnostic), 0, 0);
+			}
+			const target = result.details?.name;
+			if (!target)
+				throw new Error(`The ${name} tool result has no subagent name.`);
 			return new Text(
 				theme.fg(
 					"muted",
-					name === "subagent"
-						? `Started ${result.details?.name}`
-						: `Message to ${result.details?.name}`,
+					name === "subagent" ? `Started ${target}` : `Message to ${target}`,
 				),
 				0,
 				0,

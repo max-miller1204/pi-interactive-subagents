@@ -235,7 +235,13 @@ export class Runtime {
 	readonly ownerKey: string;
 	readonly ownerDir: string;
 	readonly runsRoot: string;
-	readonly done: { name: string; until: number }[] = [];
+	readonly done: {
+		name: string;
+		agent: string;
+		startedAt: number;
+		contextTokens: number | null;
+		until: number;
+	}[] = [];
 	private readonly pi: ExtensionAPI;
 	private ctx: ExtensionContext;
 	private readonly deps: RuntimeDeps;
@@ -373,6 +379,7 @@ export class Runtime {
 			name: launch.name,
 			agent: launch.agent,
 			profile: launch.profile,
+			autoExit: launch.autoExit,
 			status: "failed",
 			text: "",
 			truncated: false,
@@ -720,11 +727,21 @@ export class Runtime {
 			throw new Error(
 				`Cannot remove subagent ${run.spec.launch.name} before pane cleanup and process exit.`,
 			);
+		const result = readJsonStrict(
+			ResultDetails,
+			join(run.runDir, "result.json"),
+		);
 		rmSync(run.runDir, { recursive: true });
 		this.runs.delete(run.spec.launch.name);
 		const source = this.sources.find((source) => source.key === run.spec.runId);
 		if (source !== undefined) this.retiredSources.add(source);
-		this.done.push({ name: run.spec.launch.name, until: this.now() + 10_000 });
+		this.done.push({
+			name: run.spec.launch.name,
+			agent: run.spec.launch.agent,
+			startedAt: run.spec.startedAt,
+			contextTokens: result.contextTokens,
+			until: this.now() + 10_000,
+		});
 	}
 	list() {
 		return {

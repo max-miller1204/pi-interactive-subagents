@@ -13,6 +13,14 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import * as schemas from "../../src/schema.ts";
 
+test("result details require the auto-exit provenance flag", () => {
+	assert.ok("autoExit" in schemas.ResultDetails.properties);
+	const flag = schemas.ResultDetails.properties.autoExit;
+	assert.equal(Value.Check(flag, true), true);
+	assert.equal(Value.Check(flag, false), true);
+	assert.equal(Value.Check(flag, "false"), false);
+});
+
 test("thinking levels keep their literal types and strict runtime values", () => {
 	const launchLevel: schemas.Launch["thinking"] = "low";
 	const profileLevel: schemas.ProfileDef["thinking"] = "low";

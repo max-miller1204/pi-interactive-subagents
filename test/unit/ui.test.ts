@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+} from "@earendil-works/pi-coding-agent";
+import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { Deliverer, type Source } from "../../src/delivery.ts";
+import type { ResultDetails } from "../../src/schema.ts";
 import {
 	createWidget,
 	formatDuration,
@@ -9,33 +15,44 @@ import {
 	registerRenderers,
 	registerToolRenderers,
 	resultContent,
+	type ViewRuntime,
 } from "../../src/ui.ts";
+
+const baseResult: ResultDetails = {
+	v: 1,
+	deliveryId: "run:result",
+	runId: "run",
+	name: "scout-1",
+	agent: "scout",
+	profile: "quick",
+	autoExit: true,
+	status: "completed",
+	text: "one\ntwo\nthree\nfour",
+	truncated: false,
+	undelivered: [],
+	openQuestions: [],
+	durationMs: 1000,
+	contextTokens: 500,
+	childSessionFile: "/child",
+	spawnerSessionFile: "/parent",
+};
 
 test("formatting and result details", () => {
 	assert.equal(formatDuration(62000), "1:02");
 	assert.equal(formatTokens(18200), "18.2k");
 	assert.equal(formatTokens(null), "-");
-	const detail = {
-		name: "scout-1",
-		agent: "scout",
+	const detail: ResultDetails = {
+		...baseResult,
 		status: "crashed",
 		durationMs: 62000,
 		contextTokens: 18200,
-		text: "one\ntwo\nthree\nfour",
-		childSessionFile: "/child",
 		paneTail: "oops",
 		undelivered: ["Hi"],
 		openQuestions: [{ qid: "q-abcdef12", text: "Help?" }],
 		truncated: true,
 	};
-	assert.match(
-		resultContent(detail as any),
-		/Pane output \(last 40 lines\):\noops/,
-	);
-	assert.match(
-		resultContent(detail as any),
-		/Continue it with subagent_message/,
-	);
+	assert.match(resultContent(detail), /Pane output \(last 40 lines\):\noops/);
+	assert.match(resultContent(detail), /Continue it with subagent_message/);
 });
 
 test("widget renders colored, truncated live and finished rows, notices, and stays empty when idle", () => {
@@ -45,10 +62,13 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 			colors.push(color);
 			return value;
 		},
-	} as any;
-	const tui = { requestRender: () => {} } as any;
+	} as unknown as Theme;
+	const tui = { requestRender: () => {} } as unknown as TUI;
 	const now = Date.now();
-	const runtime: any = { runs: new Map(), done: [], deliverer: undefined };
+	type WidgetRun =
+		ViewRuntime["runs"] extends ReadonlyMap<string, infer T> ? T : never;
+	const runs = new Map<string, WidgetRun>();
+	const runtime: ViewRuntime = { runs, done: [], deliverer: undefined };
 	const widget = createWidget(runtime, tui, theme, () => now);
 	assert.deepEqual(widget.render(30), []);
 	for (const [name, state, question, human] of [
@@ -57,13 +77,13 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 		["person", "waiting", false, true],
 		["start", "starting", false, false],
 	] as const) {
-		runtime.runs.set(name, {
+		runs.set(name, {
 			spec: { startedAt: now - 62000, launch: { name, agent: "scout" } },
 			phase: "live",
 			view: { state, question, human, contextTokens: 18200 },
 		});
 	}
-	runtime.runs.set("broken", {
+	runs.set("broken", {
 		spec: {
 			startedAt: now - 62000,
 			launch: { name: "broken", agent: "scout" },
@@ -71,9 +91,22 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 		broken: new Error("bad"),
 		phase: "live",
 	});
-	runtime.done.push({ name: "done", until: now + 1000 });
+	runtime.done.push({
+		name: "done",
+		agent: "worker",
+		startedAt: now - 62000,
+		contextTokens: 18200,
+		until: now + 1000,
+	});
 	const lines = widget.render(100);
 	assert.equal(lines.length, 6);
+	const doneLine = lines.find((line: string) => line.includes("done"));
+	assert.ok(doneLine);
+	assert.match(doneLine, /done {2}worker {2}done {2}1:02 {2}18.2k/);
+	assert.equal(
+		createWidget(runtime, tui, theme, () => now + 1000).render(100).length,
+		5,
+	);
 	assert.match(lines.join("\n"), /waiting question/);
 	assert.match(lines.join("\n"), /waiting human/);
 	assert.match(lines.join("\n"), /1:02/);
@@ -83,15 +116,151 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 	assert.ok(
 		widget.render(15).every((line: string) => visibleWidth(line) <= 15),
 	);
-	runtime.deliverer = {
-		promptPreflightSince: now - 3000,
-		brokenError: new Error("disk failed"),
+	const pending: { id: string }[] = [];
+	const source: Source = {
+		key: "test",
+		items: () => pending,
+		build: (item) => ({
+			kind: "message",
+			trigger: false,
+			message: {
+				customType: "test",
+				content: "test",
+				display: true,
+				details: { deliveryId: item.id },
+			},
+		}),
+		confirm: () => {},
 	};
+	const delivery = new Deliverer(
+		{ sendMessage: () => {} } as unknown as ExtensionAPI,
+		{
+			isIdle: () => true,
+			sessionManager: {
+				getSessionFile: () => "/missing",
+				getEntries: () => [],
+			},
+		} as unknown as ExtensionContext,
+		[source],
+		() => false,
+		false,
+	);
+	runtime.deliverer = delivery;
+	delivery.onInput();
+	assert.doesNotMatch(
+		createWidget(runtime, tui, theme, () => Date.now() + 3000)
+			.render(100)
+			.join("\n"),
+		/waiting for your prompt/,
+	);
+	pending.push({ id: "ready" });
 	assert.match(
-		widget.render(100).join("\n"),
+		createWidget(runtime, tui, theme, () => Date.now() + 3000)
+			.render(100)
+			.join("\n"),
 		/waiting for your prompt to start/,
 	);
-	assert.match(widget.render(100).join("\n"), /delivery stopped: disk failed/);
+	delivery.shutdown();
+	const broken = new Deliverer(
+		{ sendMessage: () => {} } as unknown as ExtensionAPI,
+		{
+			isIdle: () => true,
+			sessionManager: {
+				getSessionFile: () => "/missing",
+				getEntries: () => [],
+			},
+		} as unknown as ExtensionContext,
+		[source],
+		() => false,
+		false,
+	);
+	runtime.deliverer = broken;
+	assert.throws(() => broken.pump(), /did not append/);
+	assert.match(
+		createWidget(runtime, tui, theme, () => Date.now() + 3000)
+			.render(100)
+			.join("\n"),
+		/delivery stopped: Pi did not append subagent message ready/,
+	);
+	broken.shutdown();
+});
+
+test("tool error lines show the diagnostic and not an undefined success label", () => {
+	const theme = {
+		fg: (color: string, value: string) => `${color}:${value}`,
+	} as unknown as Theme;
+	for (const tool of ["subagent", "subagent_message"] as const) {
+		const text = registerToolRenderers(tool)
+			.renderResult(
+				{ content: [{ type: "text", text: `Unknown ${tool} request.` }] },
+				{},
+				theme,
+				{ isError: true },
+			)
+			.render(120)
+			.join("\n");
+		assert.match(text, /error:Unknown/);
+		assert.doesNotMatch(text, /undefined|Started |Message to /);
+	}
+});
+
+test("closed human results show success while auto-exit closure remains a warning", () => {
+	const renderers = new Map<string, any>();
+	registerRenderers({
+		registerMessageRenderer: (name: string, fn: any) => renderers.set(name, fn),
+	} as unknown as ExtensionAPI);
+	const theme = {
+		fg: (color: string, value: string) => `${color}:${value}`,
+	} as any;
+	const details: ResultDetails = {
+		...baseResult,
+		name: "worker-1",
+		agent: "worker",
+		status: "closed",
+		contextTokens: 11,
+		text: "Human reply",
+	};
+	for (const autoExit of [false, true]) {
+		const d = { ...details, autoExit };
+		const collapsed = renderers
+			.get("subagent_result")(
+				{ content: "wrong", details: d },
+				{ expanded: false },
+				theme,
+			)
+			.render(120)
+			.join("\n");
+		const expanded = renderers
+			.get("subagent_result")(
+				{ content: "wrong", details: d },
+				{ expanded: true },
+				theme,
+			)
+			.render(120)
+			.join("\n");
+		assert.match(collapsed, new RegExp(autoExit ? "warning:" : "success:"));
+		assert.match(
+			expanded,
+			autoExit
+				? /was closed in its pane after/
+				: /was closed in its pane by a human after/,
+		);
+		assert.match(collapsed, /Human reply/);
+		assert.doesNotMatch(expanded, /wrong/);
+	}
+	const noText = { ...details, autoExit: false, text: "" };
+	assert.match(
+		renderers
+			.get("subagent_result")(
+				{ content: "wrong", details: noText },
+				{ expanded: true },
+				theme,
+			)
+			.render(120)
+			.join("\n"),
+		/warning:.*closed/,
+	);
+	assert.doesNotMatch(resultContent(noText), /by a human/);
 });
 
 test("message renderers use details and reveal extended result fields", () => {
@@ -112,17 +281,7 @@ test("message renderers use details and reveal extended result fields", () => {
 		fg: (_color: string, value: string) => value,
 		bg: (_color: string, value: string) => value,
 	} as any;
-	const details = {
-		name: "scout-1",
-		agent: "scout",
-		status: "completed",
-		durationMs: 1000,
-		contextTokens: 500,
-		text: "one\ntwo\nthree\nfour",
-		childSessionFile: "/child",
-		undelivered: ["Unseen"],
-		openQuestions: [],
-	};
+	const details: ResultDetails = { ...baseResult, undelivered: ["Unseen"] };
 	const message = { content: "This content must not be read", details };
 	const collapsed = renderers
 		.get("subagent_result")(message, { expanded: false, outputPad: 0 }, theme)
@@ -137,20 +296,20 @@ test("message renderers use details and reveal extended result fields", () => {
 	assert.match(expanded, /four/);
 	assert.match(expanded, /\/child/);
 	assert.match(expanded, /Unseen/);
-	const call = registerToolRenderers("subagent").renderCall!(
-		{ agent: "scout", task: "Read", profile: "quick" } as any,
-		theme,
-		{} as any,
-	).render(100);
+	const call = registerToolRenderers("subagent")
+		.renderCall({ agent: "scout", profile: "quick" }, theme, {})
+		.render(100);
 	assert.equal(call.length, 1);
-	const result = registerToolRenderers("subagent_message").renderResult!(
-		{
-			content: [{ type: "text", text: "Queued." }],
-			details: { name: "scout" },
-		} as any,
-		{} as any,
-		theme,
-		{} as any,
-	).render(100);
+	const result = registerToolRenderers("subagent_message")
+		.renderResult(
+			{
+				content: [{ type: "text", text: "Queued." }],
+				details: { name: "scout" },
+			},
+			{},
+			theme,
+			{ isError: false },
+		)
+		.render(100);
 	assert.equal(result.length, 1);
 });
