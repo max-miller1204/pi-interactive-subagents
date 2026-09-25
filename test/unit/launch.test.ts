@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -623,21 +624,15 @@ test("preflight rejects invalid command words before any filesystem change", asy
 	]) {
 		const f = transaction(t);
 		change(f);
-		const changes: string[] = [];
 		const parentContentBefore = readFileSync(f.parent);
 		const parentBefore = statSync(f.parent, { bigint: true });
 		const sessionEntriesBefore = readdirSync(f.sessions);
 		const ownerEntriesBefore = readdirSync(f.ownerDir);
-		const watchers = [f.ownerDir, f.sessions].map((dir) =>
-			watch(dir, (event, name) => changes.push(`${event}:${name}`)),
-		);
+		chmodSync(f.parent, 0o400);
+		chmodSync(f.sessions, 0o500);
+		chmodSync(f.ownerDir, 0o500);
 		try {
 			await assert.rejects(launchRun(f.plan, f.context), /NUL|too long/);
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			assert.deepEqual(
-				changes.filter((change) => change !== "rename:parent.jsonl"),
-				[],
-			);
 			assert.equal(readFileSync(f.parent).compare(parentContentBefore), 0);
 			const parentAfter = statSync(f.parent, { bigint: true });
 			assert.equal(parentAfter.dev, parentBefore.dev);
@@ -647,7 +642,9 @@ test("preflight rejects invalid command words before any filesystem change", asy
 			assert.deepEqual(readdirSync(f.sessions), sessionEntriesBefore);
 			assert.deepEqual(readdirSync(f.ownerDir), ownerEntriesBefore);
 		} finally {
-			for (const watcher of watchers) watcher.close();
+			chmodSync(f.parent, 0o600);
+			chmodSync(f.sessions, 0o700);
+			chmodSync(f.ownerDir, 0o700);
 		}
 		assert.equal(f.calls.length, 0);
 		assert.equal(f.names.size, 0);
