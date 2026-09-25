@@ -144,19 +144,74 @@ test("empty list is valid; every malformed pane line fails loudly", async () => 
 		"%1\t2\t0\t-1\t\t",
 		"%1\t2\t0\t\tSIG TERM\t",
 		"bad\t2\t0\t\t\t",
-		"%1\t2\t1\t\t\t",
 		"%1\t2\t0\t\t\t\n\n",
 	]) {
 		await assert.rejects(fake(`${line}\n`).listPanes(), /pane|line/i, line);
 	}
 	await assert.rejects(
-		fake("%1\t2\t1\t\t\t\n").listPanes(),
-		/tmux reports pane %1 as dead with no exit status and no signal\./,
-	);
-	await assert.rejects(
 		fake("%1\t2\t0\t\t\t\n%1\t3\t0\t\t\t\n").listPanes(),
 		/duplicate/i,
 	);
+});
+
+test("an unreaped dead pane signals the tmux server and stays an error if the status is still missing", async () => {
+	const calls: string[][] = [];
+	const signaled: number[] = [];
+	const tmux = createTmux(
+		"/tmp/isolated-tmux-test.sock",
+		async (_file, args) => {
+			calls.push(args);
+			const command = args[2];
+			if (command === "display-message")
+				return { stdout: "4242\n", stderr: "" };
+			return { stdout: "%1\t2\t1\t\t\t\n", stderr: "" };
+		},
+		(pid) => ({ pid, start: "server start" }),
+		(pid) => {
+			signaled.push(pid);
+		},
+	);
+	await assert.rejects(
+		tmux.listPanes(),
+		/tmux reports pane %1 as dead with no exit status and no signal\./,
+	);
+	assert.deepEqual(signaled, [4242]);
+	assert.deepEqual(
+		calls.map((args) => args[2]),
+		["list-panes", "display-message", "list-panes"],
+	);
+});
+
+test("an unreaped dead pane is readable after the tmux server reaps it", async () => {
+	let lists = 0;
+	const tmux = createTmux(
+		"/tmp/isolated-tmux-test.sock",
+		async (_file, args) => {
+			if (args[2] === "display-message")
+				return { stdout: "4242\n", stderr: "" };
+			lists++;
+			return {
+				stdout: lists === 1 ? "%1\t2\t1\t\t\t/s\n" : "%1\t2\t1\t0\t\t/s\n",
+				stderr: "",
+			};
+		},
+		(pid) => ({ pid, start: "server start" }),
+		() => undefined,
+	);
+	assert.deepEqual(
+		[...(await tmux.listPanes()).values()],
+		[
+			{
+				paneId: "%1",
+				pid: 2,
+				dead: true,
+				status: 0,
+				signal: null,
+				session: "/s",
+			},
+		],
+	);
+	assert.equal(lists, 2);
 });
 
 test("version check rejects 3.2 and accepts 3.3 and later", async () => {

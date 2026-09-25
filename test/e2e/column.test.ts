@@ -143,14 +143,27 @@ test("separate row subtrees reject column resizing during launch, rollback, and 
 	const audit = join(run.root, "resize-audit");
 	assert.match(audit, /^[A-Za-z0-9_./-]+$/);
 	writeFileSync(audit, "", { flag: "wx" });
-	await run.tmux([
-		"set-hook",
-		"-w",
+	const session = await run.tmux([
+		"display-message",
+		"-p",
 		"-t",
 		run.parentPane,
+		"#{session_id}",
+	]);
+	assert.match(session, /^\$[0-9]+$/);
+	await run.tmux([
+		"set-hook",
+		"-t",
+		session,
 		"after-resize-pane",
 		`run-shell 'echo resize >> ${audit}'`,
 	]);
+	// after-resize-pane is a session hook. tmux ignores -w for it.
+	// Remove the hook before the test directory is deleted.
+	// A leftover hook makes later resize-pane commands fail.
+	t.after(async () => {
+		await run.tmux(["set-hook", "-u", "-t", session, "after-resize-pane"]);
+	});
 	const first = children[0];
 	const middle = children[1];
 	const last = children[2];

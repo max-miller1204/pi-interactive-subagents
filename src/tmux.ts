@@ -69,21 +69,33 @@ function parsePane(line: string): PaneState {
 	}
 	const dead = deadText === "1";
 	const signal = signalText || null;
-	if (dead && status === null && signal === null) {
-		throw new Error(
+	if (dead && status === null && signal === null)
+		throw new UnreapedPaneError(paneId);
+	return { paneId, pid, dead, status, signal, session };
+}
+
+// Linux tmux links libutempter. That library replaces the SIGCHLD handler
+// while it updates utmp. tmux can miss the child exit and leave a zombie.
+// The pane then looks dead with no status and no signal.
+class UnreapedPaneError extends Error {
+	constructor(paneId: string) {
+		super(
 			`tmux reports pane ${paneId} as dead with no exit status and no signal.`,
 		);
+		this.name = "UnreapedPaneError";
 	}
-	return { paneId, pid, dead, status, signal, session };
 }
 
 export function createTmux(
 	socket: string = tmuxSocket(),
 	execute: TmuxExec = exec,
 	identify: typeof processIdentity = processIdentity,
+	signalServer: (pid: number) => void = (pid) => {
+		process.kill(pid, "SIGCHLD");
+	},
 ): Tmux {
 	if (!socket) throw new Error("Subagents need Pi to run inside tmux.");
-	return {
+	const client: Tmux = {
 		async serverIdentity() {
 			const text = (await this.run(["display-message", "-p", "#{pid}"])).trim();
 			const pid = Number(text);
@@ -123,29 +135,54 @@ export function createTmux(
 			}
 		},
 		async listPanes() {
-			const output = await this.run([
-				"list-panes",
-				"-a",
-				"-F",
-				"#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{@pi_subagent_session}",
-			]);
-			const panes = new Map<string, PaneState>();
-			if (output === "") return panes;
-			const lines = (
-				output.endsWith("\n") ? output.slice(0, -1) : output
-			).split("\n");
-			for (const line of lines) {
-				const pane = parsePane(line);
-				if (panes.has(pane.paneId))
-					throw new Error(`Duplicate tmux pane ${pane.paneId}.`);
-				panes.set(pane.paneId, pane);
+			const read = async () => {
+				const output = await client.run([
+					"list-panes",
+					"-a",
+					"-F",
+					"#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{@pi_subagent_session}",
+				]);
+				const panes = new Map<string, PaneState>();
+				if (output === "") return panes;
+				const lines = (
+					output.endsWith("\n") ? output.slice(0, -1) : output
+				).split("\n");
+				for (const line of lines) {
+					const pane = parsePane(line);
+					if (panes.has(pane.paneId))
+						throw new Error(`Duplicate tmux pane ${pane.paneId}.`);
+					panes.set(pane.paneId, pane);
+				}
+				return panes;
+			};
+			try {
+				return await read();
+			} catch (error) {
+				if (!(error instanceof UnreapedPaneError)) throw error;
+				// Ask tmux to run its child handler. One signal reaps every zombie.
+				// Read the list again. A pane that is still unreaped is a hard error.
+				const text = (
+					await client.run(["display-message", "-p", "#{pid}"])
+				).trim();
+				const pid = Number(text);
+				if (!/^[1-9][0-9]*$/.test(text) || !Number.isSafeInteger(pid))
+					throw new Error(`Invalid tmux server pid: ${JSON.stringify(text)}.`, {
+						cause: error,
+					});
+				const server = identify(pid);
+				if (server === null || server.pid !== pid)
+					throw new Error(`Cannot identify tmux server process ${pid}.`, {
+						cause: error,
+					});
+				signalServer(pid);
+				return await read();
 			}
-			return panes;
 		},
 		capture(paneId) {
 			return this.run(["capture-pane", "-p", "-J", "-S", "-40", "-t", paneId]);
 		},
 	};
+	return client;
 }
 
 export function assertServerIdentity(

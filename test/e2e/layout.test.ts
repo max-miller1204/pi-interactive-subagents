@@ -370,10 +370,10 @@ test("19.3.27: killed test parent leaves an open orphan and one stopped recovery
 	const runnerIdentity = processIdentity(process.pid);
 	assert.ok(runnerIdentity);
 	process.kill(parent.pid, "SIGKILL");
-	await run.waitFor(
-		() => !processAlive(child.spec.owner),
-		"only test parent exits",
-	);
+	await run.waitFor(async () => {
+		await tmux.listPanes();
+		return !processAlive(child.spec.owner);
+	}, "only test parent exits");
 	assert.deepEqual(processIdentity(process.pid), runnerIdentity);
 	const notice = `The parent Pi process ended without a quit. This pane is now a normal Pi session. Its result is not delivered. Session: ${child.spec.launch.childSessionFile}`;
 	await visible(t, run, `Error: ${notice}`, child.pane.paneId);
@@ -381,7 +381,10 @@ test("19.3.27: killed test parent leaves an open orphan and one stopped recovery
 	assert.equal(processAlive(child.pane.process), true);
 	assert.equal(existsSync(join(child.path, "result.json")), false);
 	await run.sendKeys(child.pane.paneId, "/quit");
-	await run.waitFor(() => !processAlive(child.pane.process), "orphan exit");
+	await run.waitFor(async () => {
+		await tmux.listPanes();
+		return !processAlive(child.pane.process);
+	}, "orphan exit");
 	assert.equal((await verified(run, child)).dead, true);
 	// A different session keeps the stopped record available for a strict disk check.
 	const recoverySession = join(run.root, "recovery.jsonl");
