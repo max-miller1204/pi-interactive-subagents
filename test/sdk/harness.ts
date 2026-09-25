@@ -15,6 +15,7 @@ import type { TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fauxProvider } from "@earendil-works/pi-ai";
 import {
+	type AgentBeforeSettleEvent,
 	type AgentSession,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
@@ -23,6 +24,7 @@ import {
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
+	type TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 
 export function readSessionFile(session: AgentSession): unknown[] {
@@ -43,6 +45,7 @@ export async function createHarness(
 		tools?: string[];
 		extensionSource?: string;
 		appendSystemPrompt?: string[];
+		controlBoundaries?: boolean;
 	} = {},
 ) {
 	const root = mkdtempSync(join(tmpdir(), "pi-pinned-"));
@@ -66,6 +69,29 @@ export async function createHarness(
 		writeFileSync(extensionPath, options.extensionSource);
 		extensionPaths.push(extensionPath);
 	}
+	let releaseBoundary: (() => void) | undefined;
+	let reportBoundary:
+		| ((event: TurnEndEvent | AgentBeforeSettleEvent) => void)
+		| undefined;
+	const boundaryReached = new Promise<TurnEndEvent | AgentBeforeSettleEvent>(
+		(resolve) => {
+			reportBoundary = resolve;
+		},
+	);
+	const controlledFactory: ExtensionFactory = (pi) => {
+		if (options.controlBoundaries) {
+			const hold = async (event: TurnEndEvent | AgentBeforeSettleEvent) => {
+				const released = new Promise<void>((resolve) => {
+					releaseBoundary = resolve;
+				});
+				reportBoundary?.(event);
+				await released;
+			};
+			pi.on("turn_end", hold);
+			pi.on("agent_before_settle", hold);
+		}
+		factory(pi);
+	};
 	const services = await createAgentSessionServices({
 		cwd,
 		agentDir,
@@ -80,7 +106,9 @@ export async function createHarness(
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
-			extensionFactories: [{ name: "pinned-contract", factory }],
+			extensionFactories: [
+				{ name: "pinned-contract", factory: controlledFactory },
+			],
 			additionalExtensionPaths: extensionPaths,
 			...(options.appendSystemPrompt
 				? { appendSystemPrompt: options.appendSystemPrompt }
@@ -113,7 +141,21 @@ export async function createHarness(
 		onError: (error) => errors.push(error),
 	});
 	assertNoErrors();
-	return { session, faux, services, assertNoErrors };
+	const sessionFile = session.sessionManager.getSessionFile();
+	assert.ok(sessionFile, "The SDK harness needs a writable session path.");
+	return {
+		session,
+		faux,
+		services,
+		assertNoErrors,
+		sessionFile,
+		boundaryReached,
+		releaseBoundary: () => {
+			assert.ok(releaseBoundary, "No boundary is waiting for release.");
+			releaseBoundary();
+			releaseBoundary = undefined;
+		},
+	};
 }
 
 export async function cleanupTmuxServer(
