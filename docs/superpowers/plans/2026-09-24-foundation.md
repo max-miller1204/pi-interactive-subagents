@@ -64,15 +64,16 @@
 
 ### Task 2: Pin Pi 0.87 behavior before using it
 
-**Files:** Create `test/sdk/harness.ts`, `test/sdk/pinned.test.ts`. Modify test scripts only if a discovered SDK entry point differs from the spec.
+**Files:** Create `test/sdk/harness.ts`, `test/sdk/pinned.test.ts`, `scripts/patch-pi-declarations.mjs`, and `test/unit/patch-pi-declarations.test.ts`. Modify `package.json` and `package-lock.json` for the approved strict NodeNext declaration patch.
 
 **Interfaces:** Produces SDK characterization tests P1 through P15 from spec section 23. Uses Pi SDK, `fauxProvider()` from the root pi-ai export, `bindExtensions({ mode: "tui", ... })`, and temp sessions. Later tasks consume the verified Pi contracts.
 
 - [ ] **Step 1: Write P1 through P5.** Assert committed boundary drafts and `continue`, idle `sendMessage` with both trigger values, and the distinction between a header-only session and a new session with no file. Use `getEntries()` and actual JSONL files, not mocks of session append.
 - [ ] **Step 2: Write P6 through P10.** Assert input before an awaited preflight, `agent_start` after it, argv interactive input in an isolated CLI SDK/process fixture, shutdown order on session replacement, queue clearing and compaction preserving already appended entries, and prompt guideline refresh on re-registration. Record received events and inspect the actual next model request.
 - [ ] **Step 3: Write P11 through P15.** Use an isolated Pi CLI for prompt-file and model fallback flags; use the bare SDK session for registered provider IDs; load `typebox` through an extension and check no defaults apply; assert `getSystemPrompt()` contains appended text. Give each P-number its own `test(...)` call.
-- [ ] **Step 4: Run `npm run test:sdk`.** Expected: 15 passing tests, none skipped. If a pinned claim is false under 0.87.1, STOP. Correct `spec-v2.md` with the user before building any consumer of that claim.
-- [ ] **Step 5: Commit.** `git add test/sdk && git commit -m "test: pin Pi session contracts"`.
+- [ ] **Step 4: Fix Pi 0.87.1 declaration errors without hiding them.** Pin `@types/node@24.13.6` and `@modelcontextprotocol/sdk@1.30.1` as development dependencies. Write a failing test for a version-gated, idempotent install patch that checks and adds the JSON import attribute to exactly 41 Pi AI declaration files. Run the patch from `postinstall`. Test a different Pi AI version and an unexpected declaration line as failures. Never edit an installed declaration by hand.
+- [ ] **Step 5: Run `npm run test:sdk`, `npm run typecheck`, `npm run lint`, and `npm run test:unit`.** Expected: 15 pinned SDK tests pass without skips, the strict NodeNext typecheck passes, and all unit and lint checks pass. If another pinned claim is false under 0.87.1, STOP. Correct `spec-v2.md` with the user before building a consumer of that claim.
+- [ ] **Step 6: Commit.** `git add test/sdk test/unit/patch-pi-declarations.test.ts scripts/patch-pi-declarations.mjs package.json package-lock.json && git commit -m "test: pin Pi session contracts"`.
 
 ### Task 3: Closed schemas and strict atomic JSON
 
