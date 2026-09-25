@@ -136,6 +136,28 @@ test("confirms an item once the session file exists", () => {
 	}
 });
 
+test("offeredCount reports actual unconfirmed offers without exposing the set", () => {
+	const f = fixture({ disk: true });
+	try {
+		assert.equal(f.deliverer.offeredCount, 0);
+		f.add("00000000000000000001-abcd1234");
+		f.deliverer.pump();
+		assert.equal(f.deliverer.offeredCount, 1);
+		assert.throws(
+			() => Object.assign(f.deliverer, { offeredCount: 0 }),
+			TypeError,
+		);
+		f.entries.push({
+			type: "custom_message",
+			details: { deliveryId: "run:outbox:00000000000000000001-abcd1234" },
+		});
+		f.deliverer.reconcile();
+		assert.equal(f.deliverer.offeredCount, 0);
+	} finally {
+		f.cleanup();
+	}
+});
+
 const completed = { outcome: "completed" as const };
 
 test("three ready messages at idle start one turn and draft the remaining two in order", () => {

@@ -62,6 +62,9 @@ export class Deliverer {
 		this.child = child;
 		this.runActive = !ctx.isIdle();
 	}
+	get offeredCount(): number {
+		return this.offered.size;
+	}
 	private sessionIds(): { inSession: Set<string>; durable: boolean } {
 		const inSession = new Set<string>();
 		if (this.sources.some((source) => source.items().length > 0)) {
