@@ -19,6 +19,7 @@ import {
 	readBranch,
 	type Scenario,
 	scenario,
+	waitFor,
 } from "./harness.ts";
 
 const agent = (autoExit = true) =>
@@ -118,10 +119,18 @@ function checkedNotice(entries: SessionEntry[], runIds: string[]) {
 	assert.ok(matching[0]);
 	return matching[0];
 }
-async function rendered(run: Scenario, pane: string, expected: string) {
+async function rendered(
+	run: Pick<Scenario, "capture" | "tmux" | "waitFor">,
+	pane: string,
+	expected: string,
+) {
 	const screen = await run.waitFor(async () => {
 		const text = await run.capture(pane);
-		return text.includes(expected) ? text : undefined;
+		return text
+			.split("\n")
+			.some((row) => row.includes(expected) && row.indexOf(expected) <= 4)
+			? text
+			: undefined;
 	}, `visible ${expected}`);
 	const width = Number(
 		await run.tmux(["display-message", "-p", "-t", pane, "#{pane_width}"]),
@@ -137,6 +146,67 @@ async function rendered(run: Scenario, pane: string, expected: string) {
 	assert.ok(line, `renderer cut or misaligned ${expected}`);
 	return screen;
 }
+test("UI readiness ignores quoted script text until the aligned response appears", async () => {
+	const expected = "Immediate result received.";
+	const frames = [` #script [{"say":"${expected}"}]`, ` ${expected}`];
+	let captures = 0;
+	const run = {
+		waitFor,
+		capture: async () => {
+			const frame = frames[captures++];
+			assert.ok(
+				frame !== undefined,
+				"UI readiness read past the expected response",
+			);
+			return frame;
+		},
+		tmux: async (args: string[]) => {
+			assert.deepEqual(args, [
+				"display-message",
+				"-p",
+				"-t",
+				"%1",
+				"#{pane_width}",
+			]);
+			return "240";
+		},
+	};
+	assert.equal(await rendered(run, "%1", expected), ` ${expected}`);
+	assert.equal(captures, 2);
+});
+
+async function newSessionReady(
+	run: Pick<Scenario, "capture" | "tmux" | "waitFor" | "parentPane">,
+) {
+	return rendered(run, run.parentPane, "✓ New session started");
+}
+
+test("new-session readiness does not match the previous question", async () => {
+	const frames = ["New session question?", " ✓ New session started"];
+	let captures = 0;
+	const run = {
+		parentPane: "%1",
+		waitFor,
+		capture: async () => {
+			const frame = frames[captures++];
+			assert.ok(frame !== undefined);
+			return frame;
+		},
+		tmux: async (args: string[]) => {
+			assert.deepEqual(args, [
+				"display-message",
+				"-p",
+				"-t",
+				"%1",
+				"#{pane_width}",
+			]);
+			return "240";
+		},
+	};
+	assert.equal(await newSessionReady(run), " ✓ New session started");
+	assert.equal(captures, 2);
+});
+
 async function childPane(run: Scenario) {
 	return run.waitFor(() => {
 		const paths = run.childRuns();
@@ -234,6 +304,7 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 			spawn(task),
 			steer("Immediate steer."),
 			{ say: "Parent ready." },
+			{ say: "Immediate result received." },
 		]),
 	});
 	const file = await childFile(run);
@@ -299,6 +370,40 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 		checkedResult(run.readParent(), active.spec.runId, file).status,
 		"completed",
 	);
+	const response = await run.waitFor(() => {
+		const branch = run.readParent();
+		const index = branch.findIndex(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "subagent_result",
+		);
+		return branch
+			.slice(index + 1)
+			.find(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "assistant",
+			);
+	}, "parent response to immediate-steer result");
+	assert.ok(
+		response.type === "message" && response.message.role === "assistant",
+	);
+	assert.equal(
+		response.message.stopReason,
+		"stop",
+		JSON.stringify(response.message),
+	);
+	assert.equal(
+		run
+			.readParent()
+			.filter(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.stopReason === "error",
+			).length,
+		0,
+	);
+	await rendered(run, run.parentPane, "Immediate result received.");
 });
 
 test("three steers persist in sequence in an interactive child", async (t) => {
@@ -714,10 +819,7 @@ test("new session adopts a child result without starting a turn", async (t) => {
 		"new session question",
 	);
 	await run.sendKeys(run.parentPane, "/new");
-	await run.waitFor(
-		async () => (await run.capture()).includes("New session"),
-		"new session UI",
-	);
+	await newSessionReady(run);
 	await prompt(run, [
 		steer("New session answer", "worker", String(question.details.qid)),
 		{ say: "Answer sent." },
@@ -1145,10 +1247,7 @@ test("quit after new stores the notice for the new session", async (t) => {
 		"question before new quit",
 	);
 	await run.sendKeys(run.parentPane, "/new");
-	await run.waitFor(
-		async () => (await run.capture()).includes("New session"),
-		"new session before quit",
-	);
+	await newSessionReady(run);
 	await prompt(run, [{ say: "New session saved." }]);
 	const file = await run.waitFor(
 		() =>
@@ -1276,10 +1375,7 @@ test("quit after an unsaved new session preserves recovery under the saved spawn
 		"question before unsaved new",
 	);
 	await run.sendKeys(run.parentPane, "/new");
-	await run.waitFor(
-		async () => (await run.capture()).includes("New session"),
-		"unsaved new session",
-	);
+	await newSessionReady(run);
 	assert.deepEqual(otherSessions(run, child), []);
 	await run.sendKeys(run.parentPane, "/quit");
 	const dir = join(run.agentDir, "subagent-runs", "undelivered", oldId);

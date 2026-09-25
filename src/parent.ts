@@ -55,6 +55,8 @@ import {
 import {
 	assertPaneIdentity,
 	assertServerIdentity,
+	balancePaneColumn,
+	type ColumnPane,
 	checkTmuxVersion,
 	type PaneState,
 	type Tmux,
@@ -494,9 +496,10 @@ export class Runtime {
 		});
 	}
 	private async rebalance(excludePaneId: string): Promise<void> {
-		const target = this.newestLivePane(excludePaneId);
-		if (target !== undefined)
-			await this.deps.tmux.run(["select-layout", "-E", "-t", target]);
+		await balancePaneColumn(
+			this.deps.tmux,
+			this.liveColumnPanes(excludePaneId),
+		);
 	}
 	private async closePane(run: ParentRun): Promise<string | undefined> {
 		run.paneCleanup = "unknown";
@@ -801,6 +804,14 @@ export class Runtime {
 		if (!this.enabled || this.disposed)
 			throw new Error("Subagents are off in this session.");
 	}
+	private liveColumnPanes(exclude?: string): ColumnPane[] {
+		return [...this.runs.values()]
+			.filter((run) => run.phase === "live" && run.pane.paneId !== exclude)
+			.map((run) => ({
+				pane: run.pane,
+				session: run.spec.launch.childSessionFile,
+			}));
+	}
 	private newestLivePane(exclude?: string): string | undefined {
 		return [...this.runs.values()]
 			.filter((run) => run.phase === "live" && run.pane.paneId !== exclude)
@@ -863,6 +874,7 @@ export class Runtime {
 				}
 			},
 			newestLivePane: (exclude) => this.newestLivePane(exclude),
+			liveColumnPanes: (exclude) => this.liveColumnPanes(exclude),
 			commit: (run) => {
 				this.launching.delete(run.spec.launch.name);
 				this.attach(run);

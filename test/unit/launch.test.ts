@@ -327,6 +327,23 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			names.delete(name);
 		},
 		newestLivePane: () => (vertical ? "%8" : undefined),
+		liveColumnPanes: () =>
+			vertical
+				? [
+						{
+							pane: {
+								v: 1,
+								paneId: "%8",
+								process: { pid: 122, start: "previous start" },
+								server: {
+									socket: "/socket",
+									process: { pid: 99, start: "server start" },
+								},
+							},
+							session: "/previous",
+						},
+					]
+				: [],
 		commit: (run) => {
 			events.push("live");
 			assert.deepEqual(
@@ -394,6 +411,8 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 				if (state.fail === command) throw new Error(`${command} failed`);
 				if (command === "split-window") return state.pane;
 				if (command === "display-message") return state.pid;
+				if (command === "list-panes")
+					return `%8\t122\t121\t0\t119\t30\t/previous\n%9\t123\t121\t31\t119\t29\t${readJsonStrict(RunSpec, join(runDir, "spec.json")).launch.childSessionFile}\n`;
 				return "";
 			},
 			async listPanes() {
@@ -573,14 +592,18 @@ test("a newer child gets a vertical split and column-only layout", async (t) => 
 		"#{pane_id}",
 		"",
 	]);
-	assert.deepEqual(f.calls.at(-1), ["select-layout", "-E", "-t", "%9"]);
+	assert.deepEqual(
+		f.calls.filter((args) => args[0] === "resize-pane"),
+		[["resize-pane", "-t", "%8", "-y", "30"]],
+	);
+	assert.ok(!f.calls.some((args) => args[0] === "select-layout"));
 });
 
 for (const command of [
 	"split-window",
 	"set-option",
 	"display-message",
-	"select-layout",
+	"resize-pane",
 ]) {
 	for (const cause of ["failure", "disposed"]) {
 		test(`rollback after ${cause} at ${command}`, async (t) => {
@@ -594,7 +617,7 @@ for (const command of [
 					: /Pi replaced the session.*It was not started/,
 			);
 			const killed =
-				command === "select-layout" ||
+				command === "resize-pane" ||
 				(command === "display-message" && cause === "disposed");
 			const retained =
 				!killed && !(command === "split-window" && cause === "failure");
@@ -602,8 +625,7 @@ for (const command of [
 				f.calls.some((args) => args[0] === "kill-pane"),
 				killed,
 			);
-			if (killed)
-				assert.deepEqual(f.calls.at(-1), ["select-layout", "-E", "-t", "%8"]);
+			if (killed) assert.deepEqual(f.calls.at(-1), ["kill-pane", "-t", "%9"]);
 			assert.deepEqual(readdirSync(f.ownerDir), retained ? [runId] : []);
 			assert.equal(readdirSync(f.sessions).length, retained ? 2 : 1);
 			assert.equal(f.names.size, retained ? 1 : 0);
@@ -777,8 +799,8 @@ for (const mismatch of ["pid", "session", "server", "unknown"] as const)
 
 test("verified early rollback checks pane ownership and cleans files", async (t) => {
 	const f = transaction(t, true);
-	f.state.fail = "select-layout";
-	await assert.rejects(launchRun(f.plan, f.context), /select-layout failed/);
+	f.state.fail = "resize-pane";
+	await assert.rejects(launchRun(f.plan, f.context), /resize-pane failed/);
 	assert.equal(
 		f.calls.some((args) => args[0] === "kill-pane"),
 		true,

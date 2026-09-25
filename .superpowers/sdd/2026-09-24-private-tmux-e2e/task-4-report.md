@@ -1,6 +1,15 @@
 # Task 4 report
 
-## Status: BLOCKED / NEEDS_CONTEXT
+## Current status: PASS
+
+The authorized continuation below resolves both original blockers.
+Three fresh complete E2E runs on the final code each passed 55 tests, with zero failures and zero skips.
+`npm test` passed with 385 unit tests and 80 SDK tests.
+The final diff check passed.
+The original report below is retained as historical RED evidence.
+Its blocked status and scope statements are superseded by the continuation section.
+
+## Initial status: BLOCKED / NEEDS_CONTEXT (historical)
 
 Scenarios 25, 27, and 29 pass with real Pi processes.
 Scenarios 26 and 28 fail in all three full E2E runs.
@@ -301,3 +310,302 @@ No fallback was added.
 The report is committed with the tests.
 The complete command and capture logs remain in the local ignored `logs/` directory named above.
 The report includes the blocking evidence so the decision does not depend only on temporary process state.
+
+## Authorized continuation and final result
+
+The continuation started from `89a435a4ee4f0d7fee95863b381bd7488473f99e`.
+The user supplied two rulings on 2026-09-25 at 11:25:51:
+
+1. Replace the impossible macOS `ps eww` oracle with a permitted test-only `lifecycle_probe` in the live, verified child. Return only the two tmux environment values and the presence of `STALE`, plus the required process and session binding fields. Do not add a `ps` fallback or full-environment logging.
+2. Treat preservation of the user's pane width as the behavior authority. Replace `select-layout -E` with a safe targeted column balance. Preserve strict command errors and pane identity checks. Verify multiple user panes after splits and cleanup.
+
+The user also required a fix for scenario 2's exhausted faux script.
+All three requirements are implemented.
+No handoff or global file was changed.
+
+### Continuation changes
+
+- `src/tmux.ts`: Add `balancePaneColumn` and strict pane geometry parsing.
+- `src/launch.ts`: Use targeted balance after vertical splits and verified rollback cleanup.
+- `src/parent.ts`: Supply saved pane ownership and use targeted balance after child cleanup.
+- `test/unit/column.test.ts`: Add 19 adapter tests for commands, geometry, ownership, errors, and unrelated panes.
+- `test/unit/launch.test.ts`: Update the transaction fixture and error assertions for targeted resize commands.
+- `test/fixtures/lifecycle-tools.ts`: Add a restricted environment mode to the existing permitted probe.
+- `test/e2e/layout.test.ts`: Bind the environment observation to the live child. Check two user panes through all three splits and all three child removals. Wait for complete aligned UI output, not quoted script text.
+- `test/e2e/core.test.ts`: Supply scenario 2's result turn. Assert no provider error. Fix two UI readiness races with deterministic regression tests.
+- `test/e2e/lifecycle.test.ts`: Wait for saved tool results before asserting three denial outcomes.
+
+### Scenario 26: authorized RED and GREEN
+
+The environment probe returns this strict shape:
+
+```text
+pid, sessionFile, runDir, tmux, tmuxPane, stalePresent
+```
+
+The probe reads the two values directly from `process.env`.
+It checks `STALE` with `Object.hasOwn(process.env, "STALE")`.
+It does not enumerate the environment or return unrelated variables.
+Its environment mode does not return arguments or active tools.
+
+The test permits `lifecycle_probe` in the child agent's tool list.
+The real child calls it with `{ environment: true }`.
+The saved child session must contain exactly one successful probe tool result.
+The strict result must have the saved child PID, canonical session, and run directory.
+The PID's process start identity must still match.
+`verifiedPane` must report a live child before and after the observation.
+`tmux` must equal the exact private socket, private server PID, and actual tmux session number.
+`tmuxPane` must equal the saved child pane ID.
+`stalePresent` must be false.
+
+For RED, a temporary test-fixture mutation set `process.env.STALE = "x"` inside the actual child immediately before the probe read.
+The test failed on `stalePresent: true` versus `false` for child PID `87139`.
+The mutation was removed before the GREEN runs.
+This was not a fake observation or a production launch override.
+The private server still contained `STALE=x` in the GREEN case.
+
+Command and evidence:
+
+```sh
+node scripts/run-tests.mjs --isolated-tmux --test --test-name-pattern='19.3.26' test/e2e/layout.test.ts
+```
+
+RED log: `logs/task4-env-probe-red.log`.
+GREEN logs: `logs/task4-continued-focused-1.log`, `logs/task4-continued-focused-2.log`, and all three final complete logs.
+No `ps` fallback remains in scenario 26.
+
+### Scenario 28: targeted column algorithm
+
+The chosen operation is `resize-pane -t <owned-pane> -y <height>`.
+No production `select-layout -E` call remains.
+The algorithm never requests a width change.
+
+The caller supplies each live child's saved `PaneFile` and session path.
+The adapter performs these steps:
+
+1. Reject duplicate or invalid pane IDs.
+2. Return without a command when fewer than two children remain.
+3. Compare each saved server identity with the current server.
+4. Read the window geometry with strict numeric and field-count checks.
+5. Match each selected pane's PID and session with the saved ownership data.
+6. Require one contiguous vertical column with equal left edges and widths.
+7. Reject another pane that overlaps the column's horizontal interval.
+8. Divide the sum of child heights evenly. Assign the remainder to the top panes.
+9. Resize the top panes in order. Leave the last pane to receive the remaining rows.
+10. Read the final geometry and compare it with the exact expected state.
+
+The final comparison covers every pane in the window.
+It requires all unrelated panes to retain their full geometry and identity.
+It requires each child to retain its identity and horizontal geometry.
+It requires the planned child top positions and heights.
+The adapter checks the server again around the snapshots and before resize commands.
+Malformed data, changed identities, ambiguous layouts, command failures, and unexpected results throw.
+There is no whole-window fallback.
+The existing verified kill and exit-confirmation logic remains in place.
+
+A separate private tmux experiment confirmed the resize sequence before using it in production.
+It used two user panes in a 60-column side column.
+Their heights were 30 and 29 rows.
+Three child heights changed from `30,14,14` to `20,19,19` through two targeted resize commands.
+The two user panes stayed at `60x30` and `60x29`.
+Log: `logs/task4-targeted-experiment.log`.
+
+The pre-change real-process scenario and `logs/task4-layout-proof.log` are the RED evidence for the old command.
+The final scenario now reaches all three children.
+It also removes the middle child first, then the top child, then the last child.
+After each removal it verifies the delivered strict result, confirmed run cleanup, removed pane, unchanged user dimensions, and even remaining child heights.
+
+Final observed geometry in all three complete runs:
+
+| State | User pane 1 | User pane 2 | Child widths | Child heights |
+| --- | --- | --- | --- | --- |
+| Before children | 60x30 | 60x29 | none | none |
+| One child | 60x30 | 60x29 | 89 | 60 |
+| Two children | 60x30 | 60x29 | 89, 89 | 30, 29 |
+| Three children | 60x30 | 60x29 | 89, 89, 89 | 20, 19, 19 |
+| Middle child removed | 60x30 | 60x29 | 89, 89 | 30, 29 |
+| Top child removed | 60x30 | 60x29 | 89 | 60 |
+| Last child removed | 60x30 | 60x29 | none | none |
+
+All three child panes have left edge 151 before cleanup.
+The parent grows back to 179 columns after the last child closes.
+Neither user pane changes width or height.
+The test captures parent, child, and both user UI states throughout.
+
+Focused command:
+
+```sh
+node --test test/unit/column.test.ts test/unit/launch.test.ts
+```
+
+Result: 65 passed, zero failed.
+Log: `logs/task4-column-unit-2.log`.
+The adapter tests cover exact resize commands, malformed geometry, missing panes, gaps, overlapping unrelated panes, stale server/PID/session data, command errors, and unexpected post-resize user or child changes.
+
+### Scenario 2: provider error fixed
+
+The new no-provider-error assertion was RED before the fixture fix.
+The actual saved parent response had:
+
+```text
+stopReason: error
+errorMessage: session script at message 1, step 3: missing step
+```
+
+Log: `logs/task4-core-result-red.log`.
+The parent script now has an explicit `Immediate result received.` step after spawn, steer, and ready.
+The test waits for the actual saved assistant response after the result message.
+It requires `stopReason: stop` and zero parent assistant error messages.
+It also checks the visible response.
+Focused GREEN log: `logs/task4-core-result-green.log`.
+The final three complete logs contain no `missing step` message.
+
+### Timing defects found during the new full runs
+
+The required repeats exposed three test-readiness defects.
+Each was investigated before running a new full gate.
+No deadline was increased.
+No skip or automatic retry was added.
+
+#### Quoted script text was mistaken for rendered output
+
+`logs/task4-green-full-1.log` failed scenario 2's new UI assertion.
+The helper returned when the expected reply was present inside the submitted JSON script.
+The actual aligned reply had not rendered yet.
+
+A deterministic two-frame test reproduced this defect without relying on timing.
+The first frame contains only quoted script text.
+The second contains the actual aligned response.
+The old helper failed on the first frame.
+`logs/task4-ui-readiness-red.log` records that failure.
+
+The readiness predicate now requires the same aligned rendered line that the final oracle checks.
+The layout test's full-text readiness check uses the same principle.
+The full text and width checks remain intact.
+The deterministic test and real scenario then passed.
+Log: `logs/task4-ui-readiness-green.log`.
+
+#### The `/new` wait matched the old question
+
+`logs/task4-final-full-2.log` failed while waiting for the new parent session file.
+The old readiness check searched for `New session`.
+It matched the still-visible `New session question?` before `/new` completed.
+The answer prompt could be sent into the session while Pi was clearing it.
+The final capture showed a fresh empty session and the still-waiting child.
+
+A deterministic regression test supplies that question frame before the actual success notification.
+The old predicate returns the question and fails.
+Log: `logs/task4-new-session-red.log`.
+
+All three `/new` test paths now wait for the complete aligned `✓ New session started` notification.
+The pinned Pi displays this notification after `runtimeHost.newSession()` completes.
+The deterministic regression test and the real adoption scenario pass.
+Log: `logs/task4-new-session-green.log`.
+
+#### A denial assertion ran before its saved tool result
+
+`logs/task4-verified-full-2.log` failed scenario 19's nested guard test.
+`Guard checked.` was already visible inside the submitted script.
+The test then read the tool-result list before the denial existed.
+The failed value was `undefined`, not an incorrect success response.
+
+The guard now waits for the saved `subagent_message` tool result before asserting `isError` and the exact denial text.
+The two other denial assertions with the same ordering pattern now use their saved tool-result boundary.
+Their existing pane, registry, error-text, and UI assertions remain intact.
+Focused GREEN command:
+
+```sh
+node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 --test-name-pattern='19.3.19|19.3.21|19.3.24' test/e2e/lifecycle.test.ts
+```
+
+Result: four tests passed, zero failed.
+Log: `logs/task4-denial-readiness-green.log`.
+The three final full runs followed this last code change.
+
+Earlier discovery-run logs remain available.
+They are not counted as successful final repeats:
+
+- `task4-green-full-1.log`: UI readiness failure.
+- `task4-final-full-1.log`: pass before the next defect was found.
+- `task4-final-full-2.log`: `/new` readiness failure.
+- `task4-verified-full-1.log`: pass before the denial defect was found.
+- `task4-verified-full-2.log`: denial readiness failure, counted at the nested test and parent test levels.
+
+### Three fresh final full-suite runs
+
+These are three distinct commands on the final code after all fixes:
+
+```sh
+npm run test:e2e > .superpowers/sdd/2026-09-24-private-tmux-e2e/logs/task4-complete-full-1.log 2>&1
+npm run test:e2e > .superpowers/sdd/2026-09-24-private-tmux-e2e/logs/task4-complete-full-2.log 2>&1
+npm run test:e2e > .superpowers/sdd/2026-09-24-private-tmux-e2e/logs/task4-complete-full-3.log 2>&1
+```
+
+| Run | Tests | Pass | Fail | Skipped | Cancelled | Duration | Exit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 55 | 55 | 0 | 0 | 0 | 105729.58925 ms | 0 |
+| 2 | 55 | 55 | 0 | 0 | 0 | 105282.741875 ms | 0 |
+| 3 | 55 | 55 | 0 | 0 | 0 | 105104.892417 ms | 0 |
+
+All scenarios 25 through 29 pass in each final run.
+The two new deterministic readiness tests account for the increase from 53 to 55 tests.
+No final log contains a wait timeout, exhausted script, malformed geometry, or failed column invariant.
+
+Real-process samples from the final runs:
+
+| Run | Late-message child | Environment child | Killed test parent | Live orphan | Private server |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 67155 | 70554 | 73783 | 74157 | 85372 |
+| 2 | 39996 | 43433 | 46631 | 47029 | 58475 |
+| 3 | 12971 | 16408 | 19598 | 19996 | 31717 |
+
+The real-path probes used PIDs `96217`, `69159`, and `42079`.
+The explicit symlink, canonical path, strict result, and complete UI checks remain unchanged in substance.
+The late-message queue and orphan stopped-record checks also remain intact.
+
+### Grandchild exit and final capture review
+
+The prior grandchild timeout did not recur in the final runs.
+The existing 20-second deadline is unchanged.
+
+| Run | Worker PID | Grandchild PID | Scenario 11 duration |
+| --- | --- | --- | --- |
+| 1 | 28420 | 29149 | 1833.606584 ms |
+| 2 | 1480 | 2226 | 1847.651584 ms |
+| 3 | 74439 | 75175 | 1904.763334 ms |
+
+Each final log contains 44 full readable UI captures and 33 harness pane tails.
+All 231 blocks were included in the inspection pass.
+`logs/task4-complete-capture-review.txt` groups 84 distinct readable variants for review.
+The full original logs remain available.
+The new full captures show complete late-message results, restricted environment observations, orphan notices, recovery notices, three-child layouts, cleanup states, and canonical-path results.
+
+The remaining Pi `extended-keys` warning is expected on the private server.
+The load-failure, provider-error, and orphan cases show their intended diagnostic messages.
+No new test relies on a shortened cleanup tail as its full UI oracle.
+
+### Final verification, safety, and caveats
+
+`npm test` passed after the third final E2E run:
+
+- Pi version check passed.
+- Typecheck passed.
+- Biome check passed.
+- Unit tests: 385 passed, zero failed or skipped.
+- SDK tests: 80 passed, zero failed or skipped.
+
+Log: `logs/task4-complete-npm.log`, with `COMMAND_EXIT=0`.
+`git diff --check` passed.
+
+Self-review covered the exact targeted command sequence, saved server and pane ownership, geometry parsing, post-resize invariants, launch rollback, runtime cleanup, restricted probe output, and each readiness fix.
+Cleanup registration and private-resource ownership checks remain in place.
+The second user pane has its own cleanup registration before acquisition.
+No timeout increase, fallback, module-level mutable state, paid model, default-server tmux operation, global Pi change, subagent dispatch, merge, or push was added.
+
+Caveats:
+
+- The targeted adapter deliberately rejects a rearranged or subdivided set of child panes that no longer forms one owned uninterrupted column. It reports the error rather than changing unrelated panes. Existing nested E2E scenarios pass.
+- The three complete runs were on macOS with pinned Pi 0.87.1 and tmux 3.7c. This continuation does not claim a Linux run.
+- The historical grandchild timeout remains an earlier unconfirmed event. These repeats did not reproduce it.
+
+There are no remaining Task 4 blockers under the supplied rulings.

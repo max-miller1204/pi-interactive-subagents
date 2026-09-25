@@ -9,8 +9,8 @@ export default function lifecycleTools(pi: ExtensionAPI): void {
 		name: "lifecycle_probe",
 		label: "Lifecycle probe",
 		description: "Report the actual active tools and process arguments.",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		parameters: Type.Object({ environment: Type.Optional(Type.Boolean()) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const sessionFile = ctx.sessionManager.getSessionFile();
 			const runArgs = process.argv.filter((word) =>
 				word.startsWith("--subagent-run="),
@@ -24,6 +24,20 @@ export default function lifecycleTools(pi: ExtensionAPI): void {
 					"The lifecycle probe requires a saved child session and one run argument.",
 				);
 			const runDir = runArgs[0].slice("--subagent-run=".length);
+			if (params.environment) {
+				const details = {
+					pid: process.pid,
+					sessionFile,
+					runDir,
+					tmux: process.env.TMUX,
+					tmuxPane: process.env.TMUX_PANE,
+					stalePresent: Object.hasOwn(process.env, "STALE"),
+				};
+				return {
+					content: [{ type: "text", text: JSON.stringify(details) }],
+					details,
+				};
+			}
 			const details = {
 				active: pi.getActiveTools(),
 				argv: process.argv,

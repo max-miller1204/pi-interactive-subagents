@@ -787,10 +787,14 @@ test("19.3.21 and 22: fork copies the active branch without delegation or ancest
 			(entry) => entry.kind === "spawn" && entry.launch.name === "sibling",
 		),
 	);
-	const denied = toolResults(
-		grandchild.spec.launch.childSessionFile,
-		"subagent_message",
-	).at(-1);
+	const denied = await run.waitFor(
+		() =>
+			toolResults(
+				grandchild.spec.launch.childSessionFile,
+				"subagent_message",
+			).at(-1),
+		"saved ancestor resume denial",
+	);
 	assert.ok(denied?.isError);
 	assert.match(JSON.stringify(denied.content), /Unknown subagent/);
 	await visible(run, 'Unknown subagent "sibling"', grandchild.pane.paneId);
@@ -828,7 +832,11 @@ test("19.3.24: project agents stay unavailable until private project trust", asy
 		{ say: "Untrusted attempt complete." },
 	]);
 	await visible(run, "Untrusted attempt complete.");
-	assert.ok(toolResults(run.parentFile, "subagent")[0]?.isError);
+	const untrusted = await run.waitFor(
+		() => toolResults(run.parentFile, "subagent")[0],
+		"saved untrusted spawn denial",
+	);
+	assert.equal(untrusted.isError, true);
 	assert.equal(records(run.parentFile).length, 0);
 	assert.equal(new ProjectTrustStore(run.agentDir).get(run.cwd), null);
 	await run.sendKeys(run.parentPane, "/trust");
@@ -953,7 +961,10 @@ test("19.3.19: an open child session rejects resume without a second pane", asyn
 				{ say: "Guard checked." },
 			]);
 			await visible(run, "Guard checked.");
-			const denied = toolResults(run.parentFile, "subagent_message")[0];
+			const denied = await run.waitFor(
+				() => toolResults(run.parentFile, "subagent_message")[0],
+				"saved open-session resume denial",
+			);
 			assert.ok(denied?.isError);
 			assert.match(JSON.stringify(denied.content), /still open in pane/);
 			await visible(run, `still open in pane ${paneId}`);

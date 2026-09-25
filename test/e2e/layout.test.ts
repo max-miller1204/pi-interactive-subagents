@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	lstatSync,
@@ -74,9 +73,15 @@ async function visible(
 	expected: string,
 	pane = run.parentPane,
 ) {
+	const first = expected.split("\n")[0];
+	assert.ok(first);
+	const prefix = first.slice(0, Math.min(30, first.length));
 	const screen = await run.waitFor(async () => {
 		const text = await run.capture(pane);
-		return text.replace(/\s/g, "").includes(expected.replace(/\s/g, ""))
+		return text.replace(/\s/g, "").includes(expected.replace(/\s/g, "")) &&
+			text
+				.split("\n")
+				.some((line) => line.includes(prefix) && line.indexOf(prefix) <= 4)
 			? text
 			: undefined;
 	}, `complete UI text ${expected}`);
@@ -89,9 +94,6 @@ async function visible(
 		raw.split("\n").every((line) => visibleWidth(line) <= width),
 		"UI must fit the pane",
 	);
-	const first = expected.split("\n")[0];
-	assert.ok(first);
-	const prefix = first.slice(0, Math.min(30, first.length));
 	assert.ok(
 		screen
 			.split("\n")
@@ -252,7 +254,8 @@ test("19.3.25: a steer after the exit decision remains unread in the result", as
 
 test("19.3.26: stale server environment is excluded from the real child", async (t) => {
 	const run = await scenario(t, {
-		agents: { worker: agent("auto-exit: false\n") },
+		extensionPaths: [resolve("test/fixtures/lifecycle-tools.ts")],
+		agents: { worker: agent("auto-exit: false\n", ["lifecycle_probe"]) },
 		prompt: script([{ say: "Environment ready." }]),
 	});
 	await visible(t, run, "Environment ready.");
@@ -267,7 +270,12 @@ test("19.3.26: stale server environment is excluded from the real child", async 
 	await run.sendKeys(
 		run.parentPane,
 		script([
-			spawn(script([{ say: "Environment isolated." }])),
+			spawn(
+				script([
+					{ call: "lifecycle_probe", args: { environment: true } },
+					{ say: "Environment isolated." },
+				]),
+			),
 			{ say: "Environment child started." },
 			{ say: "Environment result received." },
 		]),
@@ -276,33 +284,50 @@ test("19.3.26: stale server environment is excluded from the real child", async 
 	await visible(t, run, "Environment isolated.", child.pane.paneId);
 	assert.equal((await verified(run, child)).dead, false);
 	assert.equal(processAlive(child.pane.process), true);
-	const environment =
-		process.platform === "linux"
-			? readFileSync(
-					`/proc/${child.pane.process.pid}/environ`,
-					"utf8",
-				).replaceAll("\0", "\n")
-			: execFileSync("ps", ["eww", "-p", String(child.pane.process.pid)], {
-					encoding: "utf8",
-				});
-	t.diagnostic(
-		`Required OS environment observation (${child.pane.process.pid}):\n${environment}`,
+	const probes = readBranch(child.spec.launch.childSessionFile).filter(
+		(entry) =>
+			entry.type === "message" &&
+			entry.message.role === "toolResult" &&
+			entry.message.toolName === "lifecycle_probe",
 	);
-	assert.doesNotMatch(environment, /(?:^|\s)STALE=/);
-	assert.match(
-		environment,
-		new RegExp(
-			`(?:^|\\s)TMUX=${run.socket.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},`,
+	assert.equal(probes.length, 1);
+	const probe = probes[0];
+	assert.ok(probe?.type === "message" && probe.message.role === "toolResult");
+	assert.equal(probe.message.isError, false);
+	const environment = parseStrict(
+		Type.Object(
+			{
+				pid: Type.Integer({ minimum: 1 }),
+				sessionFile: Type.String(),
+				runDir: Type.String(),
+				tmux: Type.String(),
+				tmuxPane: Type.String(),
+				stalePresent: Type.Boolean(),
+			},
+			{ additionalProperties: false },
 		),
+		probe.message.details,
+		"live child environment probe",
 	);
-	assert.match(
-		environment,
-		new RegExp(`(?:^|\\s)TMUX_PANE=${child.pane.paneId}(?:\\s|$)`),
-	);
+	const sessionId = await run.tmux([
+		"display-message",
+		"-p",
+		"-t",
+		child.pane.paneId,
+		"#{session_id}",
+	]);
+	assert.match(sessionId, /^\$[0-9]+$/);
+	assert.deepEqual(environment, {
+		pid: child.pane.process.pid,
+		sessionFile: child.spec.launch.childSessionFile,
+		runDir: child.path,
+		tmux: `${run.socket},${server.process.pid},${sessionId.slice(1)}`,
+		tmuxPane: child.pane.paneId,
+		stalePresent: false,
+	});
 	assert.deepEqual(processIdentity(child.pane.process.pid), child.pane.process);
-	t.diagnostic(
-		`Child environment (${child.pane.process.pid}):\n${environment}`,
-	);
+	assert.equal((await verified(run, child)).dead, false);
+	t.diagnostic(`Live child environment probe: ${JSON.stringify(environment)}`);
 	await run.sendKeys(child.pane.paneId, "/quit");
 	assert.equal((await result(t, run, child)).status, "completed");
 });
@@ -473,10 +498,48 @@ test("19.3.28: three child panes share one even column without resizing the user
 		),
 		session: state.session,
 	});
+	const secondResource = trackedResource(
+		t,
+		"second layout user pane",
+		async (saved: { pane: PaneFile; session: string }) => {
+			if (await verifiedPane(tmux, saved.pane, saved.session))
+				await tmux.run(["kill-pane", "-t", saved.pane.paneId]);
+		},
+		(reason) => run.retainFiles(reason),
+	);
+	secondResource.acquiring();
+	const secondUser = (
+		await run.tmux([
+			"split-window",
+			"-d",
+			"-v",
+			"-t",
+			userPane,
+			"-P",
+			"-F",
+			"#{pane_id}",
+			"printf 'Second user pane stays intact.\\n'; exec sleep 300",
+		])
+	).trim();
+	const secondState = (await tmux.listPanes()).get(secondUser);
+	assert.ok(secondState);
+	const secondIdentity = processIdentity(secondState.pid);
+	assert.ok(secondIdentity);
+	secondResource.identified({
+		pane: parseStrict(
+			PaneFile,
+			{ v: 1, paneId: secondUser, process: secondIdentity, server },
+			"second user pane",
+		),
+		session: secondState.session,
+	});
 	const before = await layout(run);
-	const user = before.find((row) => row.pane === userPane);
-	assert.ok(user);
+	const users = before.filter(
+		(row) => row.pane === userPane || row.pane === secondUser,
+	);
+	assert.equal(users.length, 2);
 	await visible(t, run, "User pane stays intact.", userPane);
+	await visible(t, run, "Second user pane stays intact.", secondUser);
 	t.diagnostic(`Layout before: ${JSON.stringify(before)}`);
 	const children: Awaited<ReturnType<typeof active>>[] = [];
 	for (const name of ["one", "two", "three"]) {
@@ -485,6 +548,9 @@ test("19.3.28: three child panes share one even column without resizing the user
 			script([
 				spawn(script([{ say: `Child ${name} complete.` }]), name),
 				{ say: `Parent started ${name}.` },
+				{ say: "First layout result received." },
+				{ say: "Second layout result received." },
+				{ say: "Third layout result received." },
 			]),
 		);
 		const child = await active(run, name);
@@ -492,8 +558,8 @@ test("19.3.28: three child panes share one even column without resizing the user
 		await visible(t, run, `Child ${name} complete.`, child.pane.paneId);
 		const after = await layout(run);
 		assert.deepEqual(
-			after.find((row) => row.pane === userPane),
-			user,
+			after.filter((row) => users.some((user) => row.pane === user.pane)),
+			users,
 		);
 		const column = after.filter((row) =>
 			children.some((item) => item.pane.paneId === row.pane),
@@ -524,6 +590,7 @@ test("19.3.28: three child panes share one even column without resizing the user
 		);
 		await visible(t, run, `Parent started ${name}.`);
 		await visible(t, run, "User pane stays intact.", userPane);
+		await visible(t, run, "Second user pane stays intact.", secondUser);
 	}
 	for (const child of children) {
 		await visible(
@@ -534,6 +601,69 @@ test("19.3.28: three child panes share one even column without resizing the user
 		);
 		assert.equal((await verified(run, child)).dead, false);
 	}
+	const remaining = [...children];
+	for (const index of [1, 0, 2]) {
+		const child = children[index];
+		assert.ok(child);
+		await verified(run, child);
+		await run.sendKeys(child.pane.paneId, "/quit");
+		const message = await run.waitFor(
+			() =>
+				messages(run.parentFile, "subagent_result").find(
+					(item) => item.details.runId === child.spec.runId,
+				),
+			"layout cleanup result",
+		);
+		const details = parseStrict(
+			ResultDetails,
+			message.details,
+			"layout cleanup result",
+		);
+		assert.equal(details.status, "completed");
+		assert.equal(details.childSessionFile, child.spec.launch.childSessionFile);
+		await run.waitFor(
+			() => !existsSync(child.path),
+			"layout cleanup acknowledgement",
+		);
+		assert.equal((await tmux.listPanes()).has(child.pane.paneId), false);
+		remaining.splice(remaining.indexOf(child), 1);
+		const after = await layout(run);
+		assert.deepEqual(
+			after.filter((row) => users.some((user) => user.pane === row.pane)),
+			users,
+		);
+		const column = after.filter((row) =>
+			remaining.some((item) => item.pane.paneId === row.pane),
+		);
+		assert.equal(column.length, remaining.length);
+		if (column.length > 0) {
+			assert.equal(new Set(column.map((row) => row.width)).size, 1);
+			assert.ok(
+				Math.max(...column.map((row) => row.height)) -
+					Math.min(...column.map((row) => row.height)) <=
+					1,
+			);
+		}
+		t.diagnostic(
+			`Layout after cleanup ${child.spec.launch.name}: ${JSON.stringify(after)}`,
+		);
+		await visible(t, run, `${child.spec.launch.name}  worker  completed`);
+		await visible(t, run, "User pane stays intact.", userPane);
+		await visible(t, run, "Second user pane stays intact.", secondUser);
+	}
+	await visible(t, run, "Third layout result received.");
+	assert.equal(
+		run
+			.readParent()
+			.filter(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.stopReason === "error",
+			).length,
+		0,
+	);
+	await secondResource.release();
 	await resource.release();
 });
 

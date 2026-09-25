@@ -23,7 +23,12 @@ import {
 	writeJsonAtomic,
 } from "./schema.ts";
 import { parentSessionPath, writeChildSession } from "./session-file.ts";
-import { type Tmux, verifiedPane } from "./tmux.ts";
+import {
+	balancePaneColumn,
+	type ColumnPane,
+	type Tmux,
+	verifiedPane,
+} from "./tmux.ts";
 
 export function piInvocation(
 	parent: Pick<NodeJS.Process, "argv" | "execPath" | "execArgv"> = process,
@@ -174,6 +179,7 @@ export interface LaunchContext {
 	// Remove the reserved run, including a run whose commit callback succeeded.
 	release(name: string): void;
 	newestLivePane(excludePaneId?: string): string | undefined;
+	liveColumnPanes(excludePaneId?: string): ColumnPane[];
 	// Store the run with phase live. No callback can return a promise.
 	commit(run: StartedRun): void;
 	appendRegistry(record: RegistryRecord): void;
@@ -456,7 +462,10 @@ export async function launchRun(
 			);
 		checkDisposed(context, name);
 		if (target !== undefined) {
-			await context.tmux.run(["select-layout", "-E", "-t", paneId]);
+			await balancePaneColumn(context.tmux, [
+				...context.liveColumnPanes(),
+				{ pane, session: launch.childSessionFile },
+			]);
 			checkDisposed(context, name);
 		}
 		writeJsonAtomic(join(runDir, "pane.json"), pane);
@@ -500,9 +509,7 @@ export async function launchRun(
 				safeToRemove =
 					current === null || current.start !== savedPane.process.start;
 				// Rollback continues even when the runtime has been disposed.
-				const remaining = context.newestLivePane(paneId);
-				if (remaining !== undefined && remaining !== paneId)
-					await context.tmux.run(["select-layout", "-E", "-t", remaining]);
+				await balancePaneColumn(context.tmux, context.liveColumnPanes(paneId));
 			} catch (cleanupError) {
 				errors.push(cleanupError);
 			}
