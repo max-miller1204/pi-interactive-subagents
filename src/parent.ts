@@ -1118,15 +1118,29 @@ export class Runtime {
 		const killed = new Set<ParentRun>();
 		const killFailed = new Set<ParentRun>();
 		const errors: string[] = [];
-		const panes = runs.length
-			? await this.deps.tmux.listPanes()
-			: new Map<string, PaneState>();
+		let panes: Map<string, PaneState> | undefined;
+		if (runs.length) {
+			try {
+				panes = await this.deps.tmux.listPanes();
+			} catch (error) {
+				const message = `Could not list panes during quit: ${errorText(error)}.`;
+				errors.push(message);
+				this.notify(message);
+			}
+		}
 		for (const run of runs) {
 			let missingPaneProcess = false;
 			try {
 				const live = this.alive(run.pane.process);
-				run.paneCleanup = panes.has(run.pane.paneId) ? "pending" : "complete";
-				missingPaneProcess = live && run.paneCleanup === "complete";
+				// An unavailable snapshot proves neither pane absence nor cleanup.
+				run.paneCleanup =
+					panes === undefined
+						? "unknown"
+						: panes.has(run.pane.paneId)
+							? "pending"
+							: "complete";
+				missingPaneProcess =
+					live && panes !== undefined && run.paneCleanup === "complete";
 				if (missingPaneProcess) {
 					// Recheck the recorded identity before signaling a process without a pane.
 					const stop =
@@ -1135,7 +1149,7 @@ export class Runtime {
 							process.kill(identity.pid, "SIGHUP");
 						});
 					if (this.alive(run.pane.process)) stop(run.pane.process);
-				} else if (run.paneCleanup === "pending") {
+				} else if (run.paneCleanup !== "complete") {
 					const error = await this.closePane(run);
 					if (error !== undefined) throw new Error(error);
 				}
@@ -1219,7 +1233,7 @@ export class Runtime {
 		if (notStarted.length)
 			line += ` These did not start: ${notStarted.join(", ")}.`;
 		for (const run of stillLive)
-			line += ` Subagent ${run.spec.launch.name} (pid ${run.pane.process.pid}) did not stop within 5 s.`;
+			line += ` Subagent ${run.spec.launch.name} (pid ${run.pane.process.pid}) ${this.now() >= deadline ? "did not stop within 5 s" : "is still running"}.`;
 		for (const error of errors) line += ` ${error}`;
 		const stderr =
 			this.deps.stderr ??

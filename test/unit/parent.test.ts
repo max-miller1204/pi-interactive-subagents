@@ -1136,6 +1136,115 @@ test("quit closes an interrupted capture pane or retains its finalized result on
 		}
 	}
 });
+test("quit reports a failed pane snapshot and still cleans known panes independently", async (t) => {
+	const f = fixture(t);
+	const stopped = f.prepare("stopped");
+	const retained = f.prepare("retained");
+	const finished = f.prepare("finished");
+	for (const run of [stopped, retained]) {
+		f.living.add(run.pane.process.pid);
+		f.panes.set(
+			run.pane.paneId,
+			dead({ paneId: run.pane.paneId, pid: run.pane.process.pid, dead: false }),
+		);
+	}
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	assert.equal(finished.result().status, "completed");
+	f.deps.tmux.listPanes = async () => {
+		throw new Error("snapshot unavailable");
+	};
+	const attempted: string[] = [];
+	const signals: ProcessIdentity[] = [];
+	f.deps.stopProcess = (identity) => {
+		signals.push(identity);
+	};
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") {
+			attempted.push(present(args[2]));
+			if (args[2] === retained.pane.paneId) throw new Error("cleanup denied");
+			if (args[2] === stopped.pane.paneId)
+				f.living.delete(stopped.pane.process.pid);
+		}
+		return "";
+	};
+	await f.runtime.onShutdown("quit");
+	assert.deepEqual(
+		attempted.sort(),
+		[stopped.pane.paneId, retained.pane.paneId, finished.pane.paneId].sort(),
+	);
+	assert.deepEqual(signals, []);
+	const records = join(f.deps.runsRoot, "undelivered", "parent");
+	assert.equal(
+		readJsonStrict(UndeliveredRecord, join(records, `${stopped.runId}.json`))
+			.kind,
+		"stopped",
+	);
+	assert.equal(
+		readJsonStrict(UndeliveredRecord, join(records, `${finished.runId}.json`))
+			.kind,
+		"result",
+	);
+	assert.equal(existsSync(stopped.runDir), false);
+	assert.equal(existsSync(finished.runDir), false);
+	assert.equal(existsSync(retained.runDir), true);
+	assert.equal(existsSync(join(records, `${retained.runId}.json`)), false);
+	assert.ok(
+		f.notifications.some((message) => message.includes("snapshot unavailable")),
+	);
+	const advice = present(f.stderr[0]);
+	assert.match(
+		advice,
+		/Could not list panes during quit: snapshot unavailable/,
+	);
+	assert.match(advice, /Could not close pane %3: cleanup denied/);
+	assert.match(advice, /stopped 1 running subagents: stopped/);
+	assert.match(advice, /It kept 1 result that was not delivered: finished/);
+	assert.match(advice, /Subagent retained \(pid 223\) is still running/);
+	assert.match(advice, /This session was not saved/);
+	assert.doesNotMatch(advice, /did not stop within 5 s/);
+});
+test("an unavailable quit snapshot never becomes missing-pane evidence for signaling", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1", true);
+	f.panes.clear();
+	f.living.add(run.pane.process.pid);
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	f.advance(30_000);
+	await f.runtime.tick();
+	const signals: ProcessIdentity[] = [];
+	const attempts: string[][] = [];
+	f.deps.stopProcess = (identity) => {
+		signals.push(identity);
+	};
+	f.deps.tmux.listPanes = async () => {
+		throw new Error("snapshot unavailable");
+	};
+	f.deps.tmux.run = async (args) => {
+		attempts.push(args);
+		throw new Error("pane not found");
+	};
+	await f.runtime.onShutdown("quit");
+	assert.deepEqual(signals, []);
+	assert.deepEqual(attempts, [["kill-pane", "-t", run.pane.paneId]]);
+	assert.equal(existsSync(run.runDir), true);
+	assert.equal(
+		existsSync(
+			join(f.deps.runsRoot, "undelivered", "parent", `${run.runId}.json`),
+		),
+		false,
+	);
+	const advice = present(f.stderr[0]);
+	assert.match(
+		advice,
+		/Could not list panes during quit: snapshot unavailable/,
+	);
+	assert.match(advice, /Could not close pane %2: pane not found/);
+	assert.match(advice, /is still running/);
+	assert.doesNotMatch(advice, /stopped 1|did not stop within 5 s/);
+});
+
 test("quit after reattach stops an unacknowledged timeout process and retains an unconfirmed exit", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1", true);
