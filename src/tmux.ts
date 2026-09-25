@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { processIdentity } from "./process.ts";
 import { type PaneFile, parseStrict, TmuxServerIdentity } from "./schema.ts";
+import { isolatedColumn, layoutPanes, parseTmuxLayout } from "./tmux-layout.ts";
 
 export type PaneState = {
 	paneId: string;
@@ -249,7 +250,48 @@ async function paneGeometry(
 
 export type ColumnPane = { pane: PaneFile; session: string };
 
-// Resize only the owned vertical column. Never spread the window's other cells.
+async function columnSnapshot(tmux: Tmux, owned: ColumnPane[], target: string) {
+	const server = await tmux.serverIdentity();
+	for (const item of owned) assertServerIdentity(item.pane.server, server);
+	const panes = await paneGeometry(tmux, target);
+	for (const item of owned) {
+		const current = panes.find((pane) => pane.paneId === item.pane.paneId);
+		if (current === undefined)
+			throw new Error("A child column pane is missing.");
+		if (
+			current.pid !== item.pane.process.pid ||
+			current.session !== item.session
+		)
+			throw new Error(`Child column pane ${current.paneId} identity mismatch.`);
+	}
+	const tree = parseTmuxLayout(
+		await tmux.run(["display-message", "-p", "-t", target, "#{window_layout}"]),
+	);
+	const leaves = layoutPanes(tree);
+	if (
+		leaves.length !== panes.length ||
+		panes.some((pane) => {
+			const leaf = leaves.find((cell) => cell.paneId === pane.paneId);
+			return (
+				leaf === undefined ||
+				leaf.width !== pane.width ||
+				leaf.height !== pane.height ||
+				leaf.left !== pane.left ||
+				leaf.top !== pane.top
+			);
+		})
+	)
+		throw new Error("Tmux layout tree does not match pane geometry.");
+	isolatedColumn(
+		tree,
+		owned.map((item) => item.pane.paneId),
+	);
+	assertServerIdentity(server, await tmux.serverIdentity());
+	panes.sort((a, b) => a.paneId.localeCompare(b.paneId));
+	return { panes, tree };
+}
+
+// Check the whole tree and all identities before each change to the owned subtree.
 export async function balancePaneColumn(
 	tmux: Tmux,
 	owned: ColumnPane[],
@@ -263,74 +305,54 @@ export async function balancePaneColumn(
 	if (paneIds.length < 2) return;
 	const target = paneIds[0];
 	if (target === undefined) throw new Error("Missing child column target.");
-	const server = await tmux.serverIdentity();
-	for (const item of owned) assertServerIdentity(item.pane.server, server);
-	const before = await paneGeometry(tmux, target);
-	for (const item of owned) {
-		const current = before.find((pane) => pane.paneId === item.pane.paneId);
-		if (current === undefined)
-			throw new Error("A child column pane is missing.");
-		if (
-			current.pid !== item.pane.process.pid ||
-			current.session !== item.session
-		)
-			throw new Error(`Child column pane ${current.paneId} identity mismatch.`);
-	}
-	assertServerIdentity(server, await tmux.serverIdentity());
-	const column = before
-		.filter((pane) => paneIds.includes(pane.paneId))
-		.sort((a, b) => a.top - b.top);
-	const first = column[0];
-	if (column.length !== paneIds.length || first === undefined)
-		throw new Error("A child column pane is missing.");
-	let top = first.top;
-	for (const pane of column) {
-		if (
-			pane.left !== first.left ||
-			pane.width !== first.width ||
-			pane.top !== top
-		)
-			throw new Error("Child panes do not form one uninterrupted column.");
-		top += pane.height + 1;
-	}
-	for (const pane of before) {
-		if (
-			!paneIds.includes(pane.paneId) &&
-			pane.left < first.left + first.width &&
-			pane.left + pane.width > first.left
-		)
-			throw new Error(
-				"The child column overlaps another pane. Keep its layout unchanged.",
-			);
-	}
-	const height = column.reduce((total, pane) => total + pane.height, 0);
+	const expected = await columnSnapshot(tmux, owned, target);
+	const column = isolatedColumn(expected.tree, paneIds);
+	const cells = column.children;
+	const height = cells.reduce((total, cell) => total + cell.height, 0);
 	if (!Number.isSafeInteger(height))
 		throw new Error("Invalid child column height.");
-	const base = Math.floor(height / column.length);
-	const extra = height % column.length;
-	top = first.top;
-	const expected = new Map(before.map((pane) => [pane.paneId, { ...pane }]));
-	for (const [index, pane] of column.entries()) {
+	const base = Math.floor(height / cells.length);
+	const extra = height % cells.length;
+	const verify = async () => {
+		const current = await columnSnapshot(tmux, owned, target);
+		if (JSON.stringify(current) !== JSON.stringify(expected))
+			throw new Error(
+				"Tmux did not preserve the requested child column layout and pane identities.",
+			);
+	};
+	for (let index = 0; index < cells.length - 1; index++) {
+		await verify();
+		const cell = cells[index];
+		const next = cells[index + 1];
+		if (cell?.kind !== "pane" || next === undefined)
+			throw new Error("Invalid child column leaf.");
 		const desired = base + (index < extra ? 1 : 0);
-		expected.set(pane.paneId, { ...pane, top, height: desired });
-		top += desired + 1;
-		if (index < column.length - 1) {
-			assertServerIdentity(server, await tmux.serverIdentity());
-			await tmux.run(["resize-pane", "-t", pane.paneId, "-y", String(desired)]);
+		let change = desired - cell.height;
+		cell.height = desired;
+		// tmux shrinks into the next sibling, or grows from following siblings.
+		if (change < 0) next.height -= change;
+		else {
+			for (const donor of cells.slice(index + 1)) {
+				const amount = Math.min(change, donor.height - 1);
+				donor.height -= amount;
+				change -= amount;
+			}
+			if (change !== 0)
+				throw new Error("Insufficient space in the child column.");
 		}
+		let top = column.top;
+		for (const child of cells) {
+			if (child.kind !== "pane") throw new Error("Invalid child column leaf.");
+			child.top = top;
+			top += child.height + 1;
+			const pane = expected.panes.find((pane) => pane.paneId === child.paneId);
+			if (pane === undefined) throw new Error("Missing child column geometry.");
+			pane.top = child.top;
+			pane.height = child.height;
+		}
+		await tmux.run(["resize-pane", "-t", cell.paneId, "-y", String(desired)]);
 	}
-	const after = await paneGeometry(tmux, target);
-	assertServerIdentity(server, await tmux.serverIdentity());
-	if (
-		after.length !== expected.size ||
-		after.some(
-			(pane) =>
-				JSON.stringify(pane) !== JSON.stringify(expected.get(pane.paneId)),
-		)
-	)
-		throw new Error(
-			"Tmux did not preserve the requested child column layout and pane identities.",
-		);
+	await verify();
 }
 
 export async function checkTmuxVersion(tmux: Tmux): Promise<void> {

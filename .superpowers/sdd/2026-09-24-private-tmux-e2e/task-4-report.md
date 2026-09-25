@@ -609,3 +609,25 @@ Caveats:
 - The historical grandchild timeout remains an earlier unconfirmed event. These repeats did not reproduce it.
 
 There are no remaining Task 4 blockers under the supplied rulings.
+
+## Fix round 1: layout ownership and pane-start snapshots
+
+This section describes uncommitted work left by the implementer before its provider usage limit. The controller continued it inline. The three 55/55 runs above predate this fix. Fresh final runs are listed below.
+
+### Review findings and RED evidence
+
+1. `test/e2e/column.test.ts` builds a real window with aligned child panes in separate row subtrees. The original balance changed unrelated user-pane heights. `logs/task4-fix1-tree-red-2.log` records the mismatch after launch. The new layout parser uses a checked tmux checksum and full cell tree. It accepts only a direct vertical subtree that contains exactly the owned children. It compares each leaf with the strict pane geometry before any resize. The real-process case verifies launch, rollback, and later cleanup leave user panes unchanged and do not issue a resize in the unsafe layout.
+2. `test/unit/column.test.ts` changes the next child's PID, session, or intermediate cell boundary after the first resize. `logs/task4-fix1-interleaving-red.log` shows three failing checks when the second resize still ran. The new adapter checks server identity, every owned pane identity, full geometry, and the isolated column tree before each resize. It checks the final layout after the last resize. These tests now pass.
+3. Scenario 25 used `parent_message` in two negative assertions, but the child writes `subagent_parent_message`. Both assertions now use the production message type. `logs/task4-fix1-message-before-red.log` and `logs/task4-fix1-message-after-red.log` show that an inserted matching child entry makes each assertion fail. The restored test passes while the strict result still reports the late unread message.
+4. Capture review found `Malformed tmux pane line: "%50\\t0\\t0\\t\\t\\t"` in one otherwise passing E2E run. `test/unit/parent.test.ts` reproduces a parent poll between the empty-pane split and respawn. `logs/task4-fix1-empty-pane-final-red.log` shows both injected interleavings failing. `gatePaneSnapshots` serializes pane-start intervals against pane snapshots, while other tmux operations remain usable. The gate releases snapshots after failed starts. The parent runtime uses it for polling, launch, recovery, and cleanup. The two regression cases and a post-start message check pass. An earlier transient failure in `tick calls never overlap` did not recur in a focused rerun or the fresh full unit suite. No parser validation was relaxed.
+
+### Fresh controller verification after the interrupted implementer
+
+- `npm run typecheck`: exit 0.
+- Focused `node --test --test-name-pattern='tick calls never overlap|empty launch pane' test/unit/parent.test.ts`: 3/3 passed.
+- `npm test`: 411 unit and 80 SDK tests passed, zero failures or skips. Lint has 34 pre-existing warnings and no errors. The first full attempt found one formatting error in the new parent test. It was corrected before this successful run.
+- Three separate `npm run test:e2e` commands on this worktree: 56/56 passed in 107941, 107795, and 107475 ms. Each had zero failures and zero skips. Full logs: `/tmp/pi-task4-recovery-e2e-1.log`, `-2.log`, and `-3.log`.
+- A search of all three fresh logs found no `Malformed tmux pane line`, exhausted script, or failed test. The private server's `extended-keys` warning and deliberate failure fixtures remain visible.
+- `git diff --check` and Biome checks on all six new files passed.
+
+No private-tmux E2E suite was skipped. The grandchild exit timeout did not recur in these three runs. This is macOS evidence only. The targeted layout adapter fails explicitly for a rearranged child column. The independent scoped re-review and final branch review remain pending.

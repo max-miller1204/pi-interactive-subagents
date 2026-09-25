@@ -39,6 +39,7 @@ import {
 	RunSpec,
 	readJsonStrict,
 } from "../../src/schema.ts";
+import { tmuxLayout } from "../fixtures/tmux-layout.ts";
 
 const runId = "9a32db26-97ef-4d95-8d91-fc4f9fe118bf";
 function temp(t: { after(fn: () => void): void }): string {
@@ -326,6 +327,7 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			events.push("release");
 			names.delete(name);
 		},
+		startPane: (action) => action(),
 		newestLivePane: () => (vertical ? "%8" : undefined),
 		liveColumnPanes: () =>
 			vertical
@@ -410,6 +412,8 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 				if (state.disposeAt === command) state.disposed = true;
 				if (state.fail === command) throw new Error(`${command} failed`);
 				if (command === "split-window") return state.pane;
+				if (command === "display-message" && args.at(-1) === "#{window_layout}")
+					return tmuxLayout("119x60,121,0[119x30,121,0,8,119x29,121,31,9]");
 				if (command === "display-message") return state.pid;
 				if (command === "list-panes")
 					return `%8\t122\t121\t0\t119\t30\t/previous\n%9\t123\t121\t31\t119\t29\t${readJsonStrict(RunSpec, join(runDir, "spec.json")).launch.childSessionFile}\n`;

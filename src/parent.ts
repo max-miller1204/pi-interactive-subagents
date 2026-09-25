@@ -23,6 +23,7 @@ import {
 import { Type } from "typebox";
 import { Deliverer, type Item, type Source } from "./delivery.ts";
 import { type LaunchPlan, launchRun, type StartedRun } from "./launch.ts";
+import { gatePaneSnapshots } from "./pane-snapshots.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import * as queue from "./queue.ts";
 import {
@@ -254,6 +255,8 @@ export class Runtime {
 	private readonly pi: ExtensionAPI;
 	private ctx: ExtensionContext;
 	private readonly deps: RuntimeDeps;
+	private readonly paneSnapshots: ReturnType<typeof gatePaneSnapshots>;
+	private readonly tmux: Tmux;
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly identify: (pid: number) => ProcessIdentity | null;
 	private readonly alive: (identity: ProcessIdentity) => boolean;
@@ -274,6 +277,8 @@ export class Runtime {
 		this.pi = pi;
 		this.ctx = ctx;
 		this.deps = deps;
+		this.paneSnapshots = gatePaneSnapshots(deps.tmux);
+		this.tmux = this.paneSnapshots.tmux;
 		this.env = deps.env ?? process.env;
 		this.identify = deps.identity ?? processIdentity;
 		this.alive = deps.alive ?? processAlive;
@@ -496,22 +501,19 @@ export class Runtime {
 		});
 	}
 	private async rebalance(excludePaneId: string): Promise<void> {
-		await balancePaneColumn(
-			this.deps.tmux,
-			this.liveColumnPanes(excludePaneId),
-		);
+		await balancePaneColumn(this.tmux, this.liveColumnPanes(excludePaneId));
 	}
 	private async closePane(run: ParentRun): Promise<string | undefined> {
 		run.paneCleanup = "unknown";
 		try {
 			const pane = await verifiedPane(
-				this.deps.tmux,
+				this.tmux,
 				run.pane,
 				run.spec.launch.childSessionFile,
 			);
 			if (pane !== undefined) {
 				run.paneCleanup = "pending";
-				await this.deps.tmux.run(["kill-pane", "-t", run.pane.paneId]);
+				await this.tmux.run(["kill-pane", "-t", run.pane.paneId]);
 			}
 		} catch (error) {
 			this.notify(error);
@@ -535,7 +537,7 @@ export class Runtime {
 		run.finishPane = pane;
 		let tail: string | undefined;
 		if (pane?.dead && (pane.signal !== null || pane.status !== 0)) {
-			tail = await this.deps.tmux.capture(pane.paneId);
+			tail = await this.tmux.capture(pane.paneId);
 			if (this.disposed) return;
 		}
 		this.finalizeSync(run, pane, tail);
@@ -552,9 +554,9 @@ export class Runtime {
 	private async tickOnce(): Promise<void> {
 		try {
 			for (const run of this.runs.values()) run.paneCleanup = "unknown";
-			const server = await this.deps.tmux.serverIdentity();
-			const panes = await this.deps.tmux.listPanes();
-			assertServerIdentity(server, await this.deps.tmux.serverIdentity());
+			const server = await this.tmux.serverIdentity();
+			const panes = await this.tmux.listPanes();
+			assertServerIdentity(server, await this.tmux.serverIdentity());
 			if (this.disposed) return;
 			for (const run of [...this.runs.values()].sort(
 				(a, b) => a.spec.startedAt - b.spec.startedAt,
@@ -833,7 +835,7 @@ export class Runtime {
 		});
 	}
 	private async launch(plan: LaunchPlan): Promise<StartedRun> {
-		this.versionCheck ??= checkTmuxVersion(this.deps.tmux);
+		this.versionCheck ??= checkTmuxVersion(this.tmux);
 		await this.versionCheck;
 		return launchRun(plan, {
 			runId: randomUUID(),
@@ -846,7 +848,8 @@ export class Runtime {
 			mode: this.ctx.mode,
 			ownExtensionPath: this.deps.ownExtensionPath,
 			env: this.env,
-			tmux: this.deps.tmux,
+			tmux: this.tmux,
+			startPane: (action) => this.paneSnapshots.startPane(action),
 			identity: this.identify,
 			...(this.deps.invocation === undefined
 				? {}
@@ -946,7 +949,7 @@ export class Runtime {
 			throw new Error(
 				`The session of "${name}" is already in use by a subagent.`,
 			);
-		const panes = await this.deps.tmux.listPanes();
+		const panes = await this.tmux.listPanes();
 		for (const pane of panes.values())
 			if (!pane.dead && pane.session === launch.childSessionFile)
 				throw new Error(
@@ -1052,13 +1055,13 @@ export class Runtime {
 						throw new Error(`Run identity does not match ${runDir}.`);
 					if (this.alive(pane.process)) continue;
 					const current = await verifiedPane(
-						this.deps.tmux,
+						this.tmux,
 						pane,
 						spec.launch.childSessionFile,
 					);
 					if (this.disposed) return;
 					if (current !== undefined) {
-						await this.deps.tmux.run(["kill-pane", "-t", pane.paneId]);
+						await this.tmux.run(["kill-pane", "-t", pane.paneId]);
 						if (this.disposed) return;
 					}
 					if (this.acknowledged({ runDir, spec, pane })) {
@@ -1200,9 +1203,9 @@ export class Runtime {
 		let server: PaneFile["server"] | undefined;
 		if (runs.length) {
 			try {
-				server = await this.deps.tmux.serverIdentity();
-				panes = await this.deps.tmux.listPanes();
-				assertServerIdentity(server, await this.deps.tmux.serverIdentity());
+				server = await this.tmux.serverIdentity();
+				panes = await this.tmux.listPanes();
+				assertServerIdentity(server, await this.tmux.serverIdentity());
 			} catch (error) {
 				panes = undefined;
 				server = undefined;

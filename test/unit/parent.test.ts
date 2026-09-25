@@ -37,7 +37,8 @@ import {
 	writeJsonAtomic,
 } from "../../src/schema.ts";
 import { readBranch } from "../../src/session-file.ts";
-import type { PaneState } from "../../src/tmux.ts";
+import { createTmux, type PaneState } from "../../src/tmux.ts";
+import { tmuxLayout } from "../fixtures/tmux-layout.ts";
 
 function present<T>(value: T | undefined): T {
 	assert.ok(value !== undefined);
@@ -624,17 +625,23 @@ test("tick calls never overlap", async (t) => {
 		release = resolve;
 	});
 	let calls = 0;
+	const entered = Promise.withResolvers<void>();
 	f.deps.tmux.listPanes = async () => {
 		calls++;
+		entered.resolve();
 		await gate;
 		return f.panes;
 	};
 	await f.runtime.start({ reason: "new" });
 	const a = f.runtime.tick();
 	const b = f.runtime.tick();
-	await Promise.resolve();
-	assert.equal(calls, 1);
-	release();
+	await entered.promise;
+	try {
+		assert.equal(a, b);
+		assert.equal(calls, 1);
+	} finally {
+		release();
+	}
 	await Promise.all([a, b]);
 	assert.equal(calls, 2);
 });
@@ -1478,6 +1485,196 @@ test("dead pane capture and a human-closed child keep final text", async (t) => 
 		/was closed in its pane by a human/,
 	);
 });
+for (const failRegistry of [false, true])
+	test(`empty launch pane cannot enter parent snapshots; registry failure=${failRegistry}`, async (t) => {
+		const f = fixture(t);
+		const survivor = f.prepare("survivor");
+		f.pi.appendEntry("subagent", {
+			v: 1,
+			kind: "spawn",
+			runId: survivor.runId,
+			launch: survivor.spec.launch,
+		});
+		const { childSessionFile: _child, ...draft } = survivor.spec.launch;
+		f.panes.set(
+			survivor.pane.paneId,
+			dead({
+				paneId: survivor.pane.paneId,
+				pid: survivor.pane.process.pid,
+				session: survivor.spec.launch.childSessionFile,
+				dead: false,
+			}),
+		);
+		f.living.add(survivor.pane.process.pid);
+		const empty = Promise.withResolvers<void>();
+		const respawn = Promise.withResolvers<void>();
+		let emptyReads = 0;
+		let snapshots = 0;
+		const strict = createTmux("/socket", async (_file, args) => {
+			assert.equal(args[2], "list-panes");
+			snapshots++;
+			if (f.panes.get("%99")?.pid === 0) emptyReads++;
+			return {
+				stdout: [...f.panes.values()]
+					.map(
+						(pane) =>
+							`${pane.paneId}\t${pane.pid}\t${Number(pane.dead)}\t${pane.status === null ? "" : pane.status}\t${pane.signal === null ? "" : pane.signal}\t${pane.session}`,
+					)
+					.join("\n"),
+				stderr: "",
+			};
+		});
+		const append = f.pi.appendEntry.bind(f.pi);
+		f.pi.appendEntry = (type, data) => {
+			if (
+				failRegistry &&
+				type === "subagent" &&
+				data !== null &&
+				typeof data === "object" &&
+				"kind" in data &&
+				data.kind === "spawn"
+			)
+				throw new Error("Injected registry failure");
+			append(type, data);
+		};
+		const runtime = new Runtime(f.pi, f.ctx, {
+			...f.deps,
+			identity: (pid) =>
+				pid === process.pid
+					? { pid, start: "owner start" }
+					: f.living.has(pid)
+						? { pid, start: "child start" }
+						: null,
+			stopProcess: (identity) => {
+				f.living.delete(identity.pid);
+			},
+			invocation: () => [process.execPath, "/fake/cli.js"],
+			tmux: {
+				...f.deps.tmux,
+				listPanes: () => strict.listPanes(),
+				run: async (args) => {
+					f.commands.push(args);
+					if (args[0] === "-V") return "tmux 3.7c";
+					if (args[0] === "split-window") {
+						f.panes.set(
+							"%99",
+							dead({
+								paneId: "%99",
+								pid: 0,
+								dead: false,
+								status: null,
+								session: "",
+							}),
+						);
+						empty.resolve();
+						await respawn.promise;
+						return "%99";
+					}
+					if (args[0] === "set-option") {
+						f.panes.set(
+							"%99",
+							dead({
+								paneId: "%99",
+								pid: 900,
+								dead: false,
+								status: null,
+								session: present(
+									args[args.indexOf("@pi_subagent_session") + 1],
+								),
+							}),
+						);
+						f.living.add(900);
+					}
+					if (args[0] === "kill-pane") {
+						const id = present(args[2]);
+						const pane = f.panes.get(id);
+						assert.ok(pane);
+						f.living.delete(pane.pid);
+						f.panes.delete(id);
+					}
+					if (args[0] === "list-panes")
+						return `${survivor.pane.paneId}\t${survivor.pane.process.pid}\t0\t0\t80\t12\t${survivor.spec.launch.childSessionFile}\n%99\t900\t0\t13\t80\t11\t${present(f.panes.get("%99")).session}`;
+					if (args.at(-1) === "#{window_layout}")
+						return tmuxLayout(
+							`80x24,0,0[80x12,0,0,${survivor.pane.paneId.slice(1)},80x11,0,13,99]`,
+						);
+					return args.at(-1) === "#{pane_pid}" ? "900" : "";
+				},
+			},
+		});
+		t.after(() => runtime.onShutdown("new"));
+		await runtime.start({ reason: "new" });
+		const launched = runtime.spawn({ ...draft, name: "new" }, "New task").then(
+			(value) => ({ value, error: undefined }),
+			(error) => ({ value: undefined, error }),
+		);
+		let poll: Promise<void> | undefined;
+		try {
+			await empty.promise;
+			await assert.rejects(strict.listPanes(), /Malformed tmux pane line/);
+			emptyReads = 0;
+			poll = runtime.tick();
+			assert.match(
+				await runtime.message("survivor", "Steer during another pane start."),
+				/Queued for "survivor"/,
+			);
+			assert.equal(
+				queue.list(join(survivor.runDir, "inbox"), "inbox").length,
+				1,
+			);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(
+				emptyReads,
+				0,
+				`Unexpected parent errors: ${JSON.stringify(f.notifications)}`,
+			);
+			assert.deepEqual(f.notifications, []);
+			respawn.resolve();
+			const outcome = await launched;
+			if (failRegistry) {
+				assert.match(String(outcome.error), /Injected registry failure/);
+				assert.equal(outcome.value, undefined);
+				assert.equal(f.panes.has("%99"), false);
+				assert.ok(
+					f.commands.some(
+						(args) => args[0] === "kill-pane" && args[2] === "%99",
+					),
+				);
+			} else {
+				assert.equal(outcome.error, undefined);
+				assert.equal(outcome.value?.pane.paneId, "%99");
+			}
+			await poll;
+			const count = snapshots;
+			f.living.delete(survivor.pane.process.pid);
+			f.panes.set(
+				survivor.pane.paneId,
+				dead({
+					paneId: survivor.pane.paneId,
+					pid: survivor.pane.process.pid,
+					session: survivor.spec.launch.childSessionFile,
+				}),
+			);
+			await runtime.tick();
+			assert.ok(
+				snapshots > count,
+				"polling resumes after pane creation or failed launch cleanup",
+			);
+			assert.equal(
+				f.sent.filter((message) => message.customType === "subagent_result")
+					.length,
+				1,
+			);
+			assert.match(present(f.sent[0]).content, /survivor/);
+			assert.deepEqual(f.notifications, []);
+		} finally {
+			respawn.resolve();
+			await launched;
+			await poll;
+			await runtime.onShutdown("new");
+		}
+	});
+
 test("concurrent spawn checks tmux once and commits fresh-parent launches", async (t) => {
 	const f = fixture(t);
 	const prepared = f.prepare("template");

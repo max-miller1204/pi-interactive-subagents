@@ -5,6 +5,7 @@ import {
 	type ColumnPane,
 	type Tmux,
 } from "../../src/tmux.ts";
+import { tmuxLayout } from "../fixtures/tmux-layout.ts";
 
 type TestTmux = Tmux & { owned: Map<string, ColumnPane> };
 function balancePaneColumn(tmux: TestTmux, ids: string[]) {
@@ -33,6 +34,16 @@ function fixture() {
 	];
 	const state = {
 		before: `${rows.join("\n")}\n`,
+		middle: `${[...rows.slice(0, 3), "%3\t103\t151\t0\t89\t20\t/one", "%4\t104\t151\t21\t89\t24\t/two", "%5\t105\t151\t46\t89\t14\t/three"].join("\n")}\n`,
+		layouts: [
+			"89x30,151,0,3,89x14,151,31,4,89x14,151,46,5",
+			"89x20,151,0,3,89x24,151,21,4,89x14,151,46,5",
+			"89x20,151,0,3,89x19,151,21,4,89x19,151,41,5",
+		].map((children) =>
+			tmuxLayout(
+				`240x60,0,0{60x60,0,0[60x30,0,0,1,60x29,0,31,2],89x60,61,0,0,89x60,151,0[${children}]}`,
+			),
+		),
 		after: `${[
 			...rows.slice(0, 3),
 			"%3\t103\t151\t0\t89\t20\t/one",
@@ -42,7 +53,7 @@ function fixture() {
 		fail: false,
 	};
 	const calls: string[][] = [];
-	let reads = 0;
+	let resizes = 0;
 	const tmux: TestTmux = {
 		owned: new Map(
 			["one", "two", "three"].map((name, index) => [
@@ -62,13 +73,24 @@ function fixture() {
 		run: async (args) => {
 			calls.push(args);
 			if (args[0] === "list-panes")
-				return ++reads === 1 ? state.before : state.after;
+				return resizes === 0
+					? state.before
+					: resizes === 1
+						? state.middle
+						: state.after;
+			if (args[0] === "display-message") {
+				assert.equal(args.at(-1), "#{window_layout}");
+				const layout = state.layouts[resizes];
+				assert.ok(layout);
+				return layout;
+			}
 			assert.equal(
 				args[0],
 				"resize-pane",
 				"no whole-window layout command is allowed",
 			);
 			if (state.fail) throw new Error("resize failed");
+			resizes++;
 			return "";
 		},
 		listPanes: async () => {
@@ -98,7 +120,14 @@ test("column balance changes only owned heights and preserves multiple user pane
 		"-F",
 		"#{pane_id}\t#{pane_pid}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{@pi_subagent_session}",
 	]);
-	assert.deepEqual(f.calls.at(-1), f.calls[0]);
+	assert.deepEqual(f.calls.at(-1), [
+		"display-message",
+		"-p",
+		"-t",
+		"%5",
+		"#{window_layout}",
+	]);
+	assert.equal(f.calls.filter((args) => args[0] === "list-panes").length, 4);
 });
 
 test("zero or one remaining child needs no layout command", async () => {
@@ -117,17 +146,17 @@ for (const [label, mutate, pattern] of [
 	[
 		"unequal columns",
 		(text: string) => text.replace("%4\t104\t151", "%4\t104\t150"),
-		/uninterrupted column/,
+		/tree does not match pane geometry/,
 	],
 	[
 		"gap",
 		(text: string) => text.replace("%4\t104\t151\t31", "%4\t104\t151\t32"),
-		/uninterrupted column/,
+		/tree does not match pane geometry/,
 	],
 	[
 		"unrelated overlapping pane",
 		(text: string) => `${text}%6\t106\t151\t61\t89\t10\t/human\n`,
-		/overlaps another pane/,
+		/tree does not match pane geometry/,
 	],
 	[
 		"bad number",
@@ -225,6 +254,58 @@ for (const [label, from, to] of [
 		f.state.after = f.state.after.replace(from, to);
 		await assert.rejects(
 			balancePaneColumn(f.tmux, ["%3", "%4", "%5"]),
-			/did not preserve/,
+			/identity mismatch|tree does not match pane geometry/,
 		);
 	});
+
+for (const [label, from, to] of [
+	["respawn", "%4\t104", "%4\t999"],
+	["session change", "/two", "/replacement"],
+] as const)
+	test(`column stops before the second resize after target ${label}`, async () => {
+		const f = fixture();
+		f.state.middle = f.state.middle.replace(from, to);
+		f.state.after = f.state.after.replace(from, to);
+		await assert.rejects(
+			balancePaneColumn(f.tmux, ["%3", "%4", "%5"]),
+			/identity mismatch/,
+		);
+		assert.deepEqual(
+			f.calls.filter((args) => args[0] === "resize-pane"),
+			[["resize-pane", "-t", "%3", "-y", "20"]],
+		);
+	});
+
+test("column growth predicts intermediate space taken from later siblings", async () => {
+	const f = fixture();
+	f.state.before = f.state.before
+		.replace("%3\t103\t151\t0\t89\t30", "%3\t103\t151\t0\t89\t1")
+		.replace("%4\t104\t151\t31\t89\t14", "%4\t104\t151\t2\t89\t1")
+		.replace("%5\t105\t151\t46\t89\t14", "%5\t105\t151\t4\t89\t56");
+	f.state.middle = f.state.middle
+		.replace("%4\t104\t151\t21\t89\t24", "%4\t104\t151\t21\t89\t1")
+		.replace("%5\t105\t151\t46\t89\t14", "%5\t105\t151\t23\t89\t37");
+	f.state.layouts[0] = tmuxLayout(
+		"240x60,0,0{60x60,0,0[60x30,0,0,1,60x29,0,31,2],89x60,61,0,0,89x60,151,0[89x1,151,0,3,89x1,151,2,4,89x56,151,4,5]}",
+	);
+	f.state.layouts[1] = tmuxLayout(
+		"240x60,0,0{60x60,0,0[60x30,0,0,1,60x29,0,31,2],89x60,61,0,0,89x60,151,0[89x20,151,0,3,89x1,151,21,4,89x37,151,23,5]}",
+	);
+	await balancePaneColumn(f.tmux, ["%3", "%4", "%5"]);
+	assert.equal(f.calls.filter((args) => args[0] === "resize-pane").length, 2);
+});
+
+test("column stops before the second resize if an intermediate boundary changes", async () => {
+	const f = fixture();
+	f.state.middle = f.state.middle
+		.replace("%4\t104\t151\t21\t89\t24", "%4\t104\t151\t21\t89\t23")
+		.replace("%5\t105\t151\t46\t89\t14", "%5\t105\t151\t45\t89\t15");
+	f.state.layouts[1] = tmuxLayout(
+		"240x60,0,0{60x60,0,0[60x30,0,0,1,60x29,0,31,2],89x60,61,0,0,89x60,151,0[89x20,151,0,3,89x23,151,21,4,89x15,151,45,5]}",
+	);
+	await assert.rejects(
+		balancePaneColumn(f.tmux, ["%3", "%4", "%5"]),
+		/did not preserve/,
+	);
+	assert.equal(f.calls.filter((args) => args[0] === "resize-pane").length, 1);
+});

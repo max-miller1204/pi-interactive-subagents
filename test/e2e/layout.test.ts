@@ -232,7 +232,8 @@ test("19.3.25: a steer after the exit decision remains unread in the result", as
 	}, "late steer in inbox");
 	assert.deepEqual(queued.item, { v: 1, kind: "message", text });
 	assert.equal(
-		messages(child.spec.launch.childSessionFile, "parent_message").length,
+		messages(child.spec.launch.childSessionFile, "subagent_parent_message")
+			.length,
 		0,
 	);
 	t.diagnostic(
@@ -244,8 +245,9 @@ test("19.3.25: a steer after the exit decision remains unread in the result", as
 	assert.deepEqual(details.undelivered, [text]);
 	assert.equal(details.text, "Exit decision reached.");
 	assert.equal(
-		messages(child.spec.launch.childSessionFile, "parent_message").map((item) =>
-			parseStrict(ParentMessageDetails, item.details, "late child message"),
+		messages(child.spec.launch.childSessionFile, "subagent_parent_message").map(
+			(item) =>
+				parseStrict(ParentMessageDetails, item.details, "late child message"),
 		).length,
 		0,
 	);
@@ -588,7 +590,10 @@ test("19.3.28: three child panes share one even column without resizing the user
 		t.diagnostic(
 			`Layout after ${name}: ${JSON.stringify(after)}; left=${JSON.stringify(positions)}`,
 		);
-		await visible(t, run, `Parent started ${name}.`);
+		assert.doesNotMatch(
+			await visible(t, run, `Parent started ${name}.`),
+			/Error:/,
+		);
 		await visible(t, run, "User pane stays intact.", userPane);
 		await visible(t, run, "Second user pane stays intact.", secondUser);
 	}
@@ -651,7 +656,10 @@ test("19.3.28: three child panes share one even column without resizing the user
 		await visible(t, run, "User pane stays intact.", userPane);
 		await visible(t, run, "Second user pane stays intact.", secondUser);
 	}
-	await visible(t, run, "Third layout result received.");
+	assert.doesNotMatch(
+		await visible(t, run, "Third layout result received."),
+		/Error:/,
+	);
 	assert.equal(
 		run
 			.readParent()
