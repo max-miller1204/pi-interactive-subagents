@@ -80,17 +80,21 @@ export async function createHarness(
 	);
 	const controlledFactory: ExtensionFactory = (pi) => {
 		if (options.controlBoundaries) {
+			let firstBoundaryHeld = false;
 			const hold = async (event: TurnEndEvent | AgentBeforeSettleEvent) => {
+				if (firstBoundaryHeld) return;
+				firstBoundaryHeld = true;
 				const released = new Promise<void>((resolve) => {
 					releaseBoundary = resolve;
 				});
-				reportBoundary?.(event);
+				assert.ok(reportBoundary, "The boundary observer must be ready.");
+				reportBoundary(event);
 				await released;
 			};
 			pi.on("turn_end", hold);
 			pi.on("agent_before_settle", hold);
 		}
-		factory(pi);
+		return factory(pi);
 	};
 	const services = await createAgentSessionServices({
 		cwd,

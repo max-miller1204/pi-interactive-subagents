@@ -160,6 +160,74 @@ test("three ready messages at idle start one turn and draft the remaining two in
 	}
 });
 
+test("a completed boundary with only quiet drafts does not continue", () => {
+	const f = fixture();
+	try {
+		f.add("1");
+		f.source.build = (item) => ({
+			kind: "message",
+			trigger: false,
+			message: {
+				customType: "subagent",
+				content: item.id,
+				display: true,
+				details: { deliveryId: item.id },
+			},
+		});
+		f.deliverer.onAgentStart();
+		const result = f.deliverer.onBoundary(completed);
+		assert.deepEqual(
+			result?.entries?.map((entry) => entry.type),
+			["custom_message"],
+		);
+		assert.equal(result?.continue, false);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("a completed boundary with only held triggers does not continue", () => {
+	const f = fixture();
+	try {
+		f.deliverer.onAgentStart();
+		f.entries.push({
+			type: "message",
+			message: { role: "assistant", stopReason: "aborted" },
+		});
+		f.add("1");
+		f.deliverer.onAgentSettled();
+		f.deliverer.onAgentStart();
+		const result = f.deliverer.onBoundary(completed);
+		assert.deepEqual(
+			result?.entries?.map((entry) => entry.type),
+			["custom_message"],
+		);
+		assert.equal(result?.continue, false);
+	} finally {
+		f.cleanup();
+	}
+});
+
+test("an offered boundary draft absent from session entries becomes ready at settlement", async () => {
+	const f = fixture();
+	try {
+		f.deliverer.onAgentStart();
+		f.add("1");
+		assert.equal(f.deliverer.onBoundary(completed)?.entries?.length, 1);
+		f.entries.push({
+			type: "message",
+			message: { role: "assistant", stopReason: "stop" },
+		});
+		f.setIdle(true);
+		f.deliverer.onAgentSettled();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(f.sent, [{ id: "run:outbox:1", trigger: true }]);
+		assert.equal(f.items.length, 1);
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("a quiet message is appended synchronously without starting a turn", () => {
 	const f = fixture();
 	try {
