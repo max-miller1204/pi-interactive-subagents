@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            install-tmux: sudo apt-get update && sudo apt-get install -y tmux
+          - os: macos-latest
+            install-tmux: brew install tmux
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install tmux
+        run: ${{ matrix.install-tmux }}
+
+      - name: Show tool versions
+        run: |
+          node --version
+          tmux -V
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the pinned Pi command
+        run: |
+          version="$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const pkg = JSON.parse(readFileSync("package.json", "utf8")); const pinned = pkg.devDependencies["@earendil-works/pi-coding-agent"]; if (pinned === undefined) throw new Error("package.json has no pinned @earendil-works/pi-coding-agent."); process.stdout.write(pinned);')"
+          npm install -g "@earendil-works/pi-coding-agent@${version}"
+          pi --version
+
+      - name: Run unit and SDK tests
+        run: npm test
+
+      - name: Run private tmux end-to-end tests
+        run: npm run test:e2e
