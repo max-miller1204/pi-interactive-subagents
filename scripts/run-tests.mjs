@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 
 const flag = "--isolated-tmux";
@@ -36,13 +36,19 @@ function startPrivateServer() {
 		"-F",
 		"#{pane_id} #{pid} #{session_id}",
 	]).split(" ");
-	const socketPath = tmux([
-		"display-message",
-		"-p",
-		"-t",
-		paneId,
-		"#{socket_path}",
-	]);
+	let socketPath;
+	try {
+		socketPath = tmux([
+			"display-message",
+			"-p",
+			"-t",
+			paneId,
+			"#{socket_path}",
+		]);
+	} catch (error) {
+		tmux(["kill-server"]);
+		throw error;
+	}
 	let stopped = false;
 	return {
 		environment: {
@@ -63,30 +69,34 @@ function startPrivateServer() {
 }
 
 const isolated = isolatedTmux ? startPrivateServer() : null;
-if (isolated) {
-	for (const signal of ["SIGINT", "SIGTERM"]) {
-		process.on(signal, () => {
-			isolated.stop();
-			process.exit(1);
-		});
-	}
-}
-
-let result;
+let child;
 try {
-	result = spawnSync(process.execPath, nodeArgs, {
+	child = spawn(process.execPath, nodeArgs, {
 		env: isolated ? isolated.environment : environment,
 		stdio: "inherit",
 	});
+	if (isolated) {
+		for (const signal of ["SIGINT", "SIGTERM"]) {
+			process.on(signal, () => {
+				child.kill(signal);
+				isolated.stop();
+				process.exit(1);
+			});
+		}
+	}
+	const result = await new Promise((resolve, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code, signal) => resolve({ code, signal }));
+	});
+	if (result.signal) {
+		console.error(`Tests stopped with signal ${result.signal}.`);
+		process.exitCode = 1;
+	} else {
+		process.exitCode = result.code;
+	}
+} catch (error) {
+	console.error(`Cannot start tests: ${error.message}`);
+	process.exitCode = 1;
 } finally {
 	isolated?.stop();
 }
-if (result.error) {
-	console.error(`Cannot start tests: ${result.error.message}`);
-	process.exit(1);
-}
-if (result.signal) {
-	console.error(`Tests stopped with signal ${result.signal}.`);
-	process.exit(1);
-}
-process.exit(result.status);
