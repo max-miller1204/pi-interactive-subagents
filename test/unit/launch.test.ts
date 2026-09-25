@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
 	chmodSync,
 	existsSync,
@@ -15,8 +16,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { resolveLaunch } from "../../src/catalog.ts";
 import {
 	type LaunchContext,
@@ -27,6 +29,7 @@ import {
 	renderLaunchScript,
 	type StartedRun,
 } from "../../src/launch.ts";
+import { processAlive, processIdentity } from "../../src/process.ts";
 import {
 	Catalog,
 	Launch,
@@ -283,6 +286,7 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 		pane: "%9\n",
 		identity: true,
 		killFails: false,
+		killed: false,
 		registryFails: false,
 	};
 	const runDir = join(ownerDir, runId);
@@ -346,6 +350,7 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			events.push("tick");
 		},
 		identity: (pid) => {
+			if (state.killed) return null;
 			events.push("identity");
 			assert.equal(pid, 123);
 			assert.equal(existsSync(join(runDir, "pane.json")), false);
@@ -359,10 +364,12 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 				events.push(command);
 				if (command === "kill-pane") {
 					if (state.killFails) throw new Error("kill failed");
+					state.killed = true;
 					return "";
 				}
 				assert.equal(existsSync(join(runDir, "pane.json")), false);
 				if (command === "split-window") {
+					state.killed = false;
 					assert.ok(names.has(plan.launch.name));
 					assert.deepEqual(readdirSync(runDir).sort(), [
 						"inbox",
@@ -384,7 +391,19 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 				return "";
 			},
 			async listPanes() {
-				throw new Error("Unexpected listPanes");
+				return new Map([
+					[
+						"%9",
+						{
+							paneId: "%9",
+							pid: 123,
+							dead: true,
+							status: 1,
+							signal: null,
+							session: "",
+						},
+					],
+				]);
 			},
 			async capture() {
 				throw new Error("Unexpected capture");
@@ -499,6 +518,40 @@ test("launch transaction prepares private files, preserves focus and commits pan
 	assert.equal(Object.hasOwn(f.plan.launch, "childSessionFile"), false);
 });
 
+for (const mode of ["standalone", "fork"] as const) {
+	test(`fresh parent session launches ${mode} without creating a parent file`, async (t) => {
+		const f = transaction(t);
+		const alias = join(f.dir, "session-alias");
+		symlinkSync(f.sessions, alias);
+		const parent = SessionManager.create(f.dir, alias);
+		parent.appendMessage({
+			role: "user",
+			content: "Delegate now.",
+			timestamp: 0,
+		});
+		const intended = parent.getSessionFile();
+		assert.ok(intended);
+		assert.equal(existsSync(intended), false);
+		f.context.spawnerSessionFile = intended;
+		f.context.spawnerSessionId = parent.getSessionId();
+		f.context.sessionDir = alias;
+		assert.equal(f.plan.kind, "spawn");
+		f.plan.launch.session = mode;
+		if (mode === "fork") f.plan.entries = parent.getBranch();
+		const result = await launchRun(f.plan, f.context);
+		const canonical = join(f.sessions, basename(intended));
+		assert.equal(result.spec.spawnerSessionFile, canonical);
+		const child = SessionManager.open(result.spec.launch.childSessionFile);
+		assert.equal(child.getHeader()?.parentSession, canonical);
+		assert.deepEqual(
+			child.getBranch(),
+			mode === "fork" ? parent.getBranch() : [],
+		);
+		assert.equal(existsSync(intended), false);
+		assert.equal(f.names.size, 1);
+	});
+}
+
 test("a newer child gets a vertical split and column-only layout", async (t) => {
 	const f = transaction(t, true);
 	await launchRun(f.plan, f.context);
@@ -549,19 +602,119 @@ for (const command of [
 	}
 }
 
-test("rollback preserves the primary and kill errors and removes files", async (t) => {
+for (const failure of [
+	"kill",
+	"live",
+	"before-pid",
+	"unknown-pid",
+	"exited",
+] as const) {
+	test(`rollback exit confirmation: ${failure}`, {
+		timeout: 20_000,
+	}, async (t) => {
+		const f = transaction(t);
+		const child = spawn(
+			process.execPath,
+			["-e", "process.send('ready'); setInterval(() => {}, 1000);"],
+			{
+				stdio: ["ignore", "ignore", "ignore", "ipc"],
+			},
+		);
+		t.after(async () => {
+			if (child.exitCode === null && child.signalCode === null) {
+				const exited = once(child, "exit");
+				child.kill("SIGKILL");
+				await exited;
+			}
+		});
+		await once(child, "message");
+		assert.ok(child.pid);
+		const identity = processIdentity(child.pid);
+		assert.ok(identity);
+		f.state.pid = String(child.pid);
+		f.context.identity = processIdentity;
+		if (failure === "before-pid" || failure === "unknown-pid")
+			f.state.fail = "display-message";
+		else f.state.registryFails = true;
+		const run = f.context.tmux.run;
+		f.context.tmux.run = async (args) => {
+			if (args[0] !== "kill-pane") return run(args);
+			if (failure === "kill") throw new Error("kill failed");
+			if (failure === "exited") {
+				const exited = once(child, "exit");
+				child.kill("SIGTERM");
+				await exited;
+			}
+			return "";
+		};
+		f.context.tmux.listPanes = async () => {
+			if (failure === "unknown-pid") throw new Error("cannot inspect pane");
+			return new Map([
+				[
+					"%9",
+					{
+						paneId: "%9",
+						pid: identity.pid,
+						dead: false,
+						status: null,
+						signal: null,
+						session: "",
+					},
+				],
+			]);
+		};
+		await assert.rejects(launchRun(f.plan, f.context), (error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /registry failed|display-message failed/);
+			if (failure !== "exited")
+				assert.match(
+					error.message,
+					/confirm child exit|still alive|kill failed/i,
+				);
+			return true;
+		});
+		if (failure === "exited") {
+			assert.equal(processAlive(identity), false);
+			assert.deepEqual(readdirSync(f.ownerDir), []);
+			assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
+			assert.equal(f.names.size, 0);
+		} else {
+			assert.equal(processAlive(identity), true);
+			assert.equal(existsSync(f.runDir), true);
+			const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
+			assert.equal(existsSync(spec.launch.childSessionFile), true);
+			assert.equal(f.names.has(f.plan.launch.name), true);
+			if (failure === "unknown-pid")
+				assert.equal(existsSync(join(f.runDir, "pane.json")), false);
+			else
+				assert.deepEqual(
+					readJsonStrict(PaneFile, join(f.runDir, "pane.json")),
+					{
+						v: 1,
+						paneId: "%9",
+						process: identity,
+					},
+				);
+			await assert.rejects(launchRun(f.plan, f.context), /already reserved/);
+		}
+	});
+}
+
+test("rollback preserves the primary and kill errors and keeps recovery files", async (t) => {
 	const f = transaction(t);
 	f.state.fail = "set-option";
 	f.state.killFails = true;
 	await assert.rejects(launchRun(f.plan, f.context), (error: unknown) => {
 		assert.ok(error instanceof AggregateError);
 		assert.match(error.message, /set-option failed.*kill failed/s);
-		assert.equal(error.errors.length, 2);
+		assert.equal(error.errors.length, 3);
+		assert.match(error.message, /Kept its name and recovery files/);
 		return true;
 	});
-	assert.deepEqual(readdirSync(f.ownerDir), []);
-	assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
-	assert.equal(f.names.size, 0);
+	assert.deepEqual(readdirSync(f.ownerDir), [runId]);
+	const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
+	assert.equal(existsSync(spec.launch.childSessionFile), true);
+	assert.equal(f.names.size, 1);
 });
 
 for (const [pane, pid, identity, pattern] of [

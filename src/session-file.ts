@@ -1,12 +1,13 @@
 import {
 	closeSync,
+	lstatSync,
 	openSync,
 	readFileSync,
 	realpathSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { type AssistantMessage, uuidv7 } from "@earendil-works/pi-ai";
 import {
 	CURRENT_SESSION_VERSION,
@@ -14,7 +15,19 @@ import {
 	type SessionHeader,
 	type SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { type Launch, parseStrict, RegistryRecord } from "./schema.ts";
+import {
+	ChildEntry,
+	type Launch,
+	parseStrict,
+	RegistryRecord,
+} from "./schema.ts";
+
+// Pi assigns the parent path before it writes the first assistant response.
+export function parentSessionPath(path: string): string {
+	if (lstatSync(path, { throwIfNoEntry: false }) === undefined)
+		return join(realpathSync(dirname(path)), basename(path));
+	return realpathSync(path);
+}
 
 export function writeChildSession(
 	dir: string,
@@ -34,7 +47,7 @@ export function writeChildSession(
 		id,
 		timestamp,
 		cwd: realpathSync(cwd),
-		parentSession: realpathSync(parentSession),
+		parentSession: parentSessionPath(parentSession),
 	};
 	const content = `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 	// A successful exclusive open establishes ownership before the first write.
@@ -113,6 +126,70 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function validateExtractionFields(
+	entry: Record<string, unknown>,
+	where: string,
+): void {
+	const require = (condition: boolean, field: string): void => {
+		if (!condition) throw new Error(`${where}: invalid ${field}.`);
+	};
+	const deliveryId = (details: unknown): void => {
+		if (isObject(details) && Object.hasOwn(details, "deliveryId"))
+			require(typeof details.deliveryId === "string", "details.deliveryId");
+	};
+	if (entry.type === "custom" || entry.type === "custom_message") {
+		require(typeof entry.customType === "string", "customType");
+		if (entry.type === "custom") {
+			if (entry.customType === "subagent")
+				parseStrict(RegistryRecord, entry.data, where);
+			if (entry.customType === "subagent_child")
+				parseStrict(ChildEntry, entry.data, where);
+		} else deliveryId(entry.details);
+	}
+	if (entry.type !== "message") return;
+	const message = entry.message;
+	if (!isObject(message) || typeof message.role !== "string")
+		throw new Error(`${where}: invalid message.role.`);
+	if (message.role === "toolResult") deliveryId(message.details);
+	if (message.role !== "assistant") return;
+	if (!Array.isArray(message.content))
+		throw new Error(`${where}: invalid assistant content.`);
+	for (const [index, content] of message.content.entries()) {
+		const field = `assistant content[${index}]`;
+		if (!isObject(content)) throw new Error(`${where}: invalid ${field}.`);
+		switch (content.type) {
+			case "text":
+				require(typeof content.text === "string", `${field}.text`);
+				break;
+			case "thinking":
+				require(typeof content.thinking === "string", `${field}.thinking`);
+				break;
+			case "toolCall":
+				require(typeof content.id === "string", `${field}.id`);
+				require(typeof content.name === "string", `${field}.name`);
+				require(isObject(content.arguments), `${field}.arguments`);
+				break;
+			default:
+				throw new Error(`${where}: invalid ${field}.type.`);
+		}
+	}
+	require(isObject(message.usage) &&
+		typeof message.usage.totalTokens === "number" &&
+		Number.isFinite(message.usage.totalTokens), "assistant usage.totalTokens");
+	require(typeof message.stopReason === "string" &&
+		[
+			"pending",
+			"stop",
+			"length",
+			"toolUse",
+			"error",
+			"aborted",
+			"deferred",
+		].includes(message.stopReason), "assistant stopReason");
+	require(message.errorMessage === undefined ||
+		typeof message.errorMessage === "string", "assistant errorMessage");
+}
+
 export function readBranch(path: string): SessionEntry[] {
 	const file = realpathSync(path);
 	const text = readFileSync(file, "utf8");
@@ -171,6 +248,7 @@ export function readBranch(path: string): SessionEntry[] {
 		) {
 			throw new Error(`${file}: line ${index + 1} is not a Pi session entry.`);
 		}
+		validateExtractionFields(value, `${file}: line ${index + 1}`);
 		if (byId.has(value.id)) {
 			throw new Error(`${file}: duplicate entry id ${value.id}.`);
 		}

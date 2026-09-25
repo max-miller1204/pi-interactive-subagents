@@ -21,7 +21,7 @@ import {
 	RunSpec,
 	writeJsonAtomic,
 } from "./schema.ts";
-import { writeChildSession } from "./session-file.ts";
+import { parentSessionPath, writeChildSession } from "./session-file.ts";
 import type { Tmux } from "./tmux.ts";
 
 export function piInvocation(
@@ -254,6 +254,9 @@ export async function launchRun(
 	let runDir: string | undefined;
 	let newSession: string | undefined;
 	let paneId: string | undefined;
+	let childMayHaveStarted = false;
+	let childProcess: ProcessIdentity | null | undefined;
+	const identify = context.identity ?? processIdentity;
 	try {
 		checkDisposed(context, name);
 		const runId = parseStrict(
@@ -265,7 +268,7 @@ export async function launchRun(
 		const draft = canonicalLaunch(plan, ownExtensionPath);
 		const directory = join(realpathSync(context.ownerDir), runId);
 		const sessionDir = realpathSync(context.sessionDir);
-		const parentSession = realpathSync(context.spawnerSessionFile);
+		const parentSession = parentSessionPath(context.spawnerSessionFile);
 		// The writer uses an ISO timestamp and a UUID. This path has the same byte size.
 		const candidateSessionFile =
 			plan.kind === "spawn"
@@ -378,6 +381,7 @@ export async function launchRun(
 		checkDisposed(context, name);
 		if (paneId === undefined)
 			throw new Error(`Invalid tmux pane id: ${JSON.stringify(paneOutput)}.`);
+		childMayHaveStarted = true;
 		await context.tmux.run([
 			"set-option",
 			"-p",
@@ -429,9 +433,11 @@ export async function launchRun(
 		const pid = Number(pidText);
 		if (!/^[1-9][0-9]*$/.test(pidText) || !Number.isSafeInteger(pid))
 			throw new Error(`Invalid tmux pane pid: ${JSON.stringify(pidText)}.`);
-		const identity = (context.identity ?? processIdentity)(pid);
-		if (identity === null)
+		const identity = identify(pid);
+		if (identity === null) {
+			childProcess = null;
 			throw new Error(`Subagent "${name}" exited before it could start.`);
+		}
 		const pane = parseStrict(
 			PaneFile,
 			{ v: 1, paneId, process: identity },
@@ -439,6 +445,7 @@ export async function launchRun(
 		);
 		if (identity.pid !== pid)
 			throw new Error(`Process identity does not match pane pid ${pid}.`);
+		childProcess = pane.process;
 		if (target !== undefined) {
 			await context.tmux.run(["select-layout", "-E", "-t", paneId]);
 			checkDisposed(context, name);
@@ -459,27 +466,80 @@ export async function launchRun(
 		return result;
 	} catch (error) {
 		const errors: unknown[] = [error];
+		let safeToRemove = paneId === undefined;
 		if (paneId !== undefined) {
+			// A failed respawn command can still have started the child.
+			// Read its identity before killing the pane removes that evidence.
+			if (childMayHaveStarted && childProcess === undefined) {
+				try {
+					const state = (await context.tmux.listPanes()).get(paneId);
+					if (state === undefined)
+						throw new Error(
+							`Cannot identify the child of missing pane ${paneId}.`,
+						);
+					const identity = state.dead ? null : identify(state.pid);
+					if (identity !== null) {
+						parseStrict(
+							PaneFile,
+							{ v: 1, paneId, process: identity },
+							"rollback pane",
+						);
+						if (identity.pid !== state.pid)
+							throw new Error(
+								`Process identity does not match pane pid ${state.pid}.`,
+							);
+					}
+					childProcess = identity;
+				} catch (cleanupError) {
+					errors.push(cleanupError);
+				}
+			}
 			try {
 				await context.tmux.run(["kill-pane", "-t", paneId]);
-				// Cleanup must finish even when the runtime has been disposed.
+				if (!childMayHaveStarted || childProcess === null) safeToRemove = true;
+				else if (childProcess !== undefined) {
+					const current = identify(childProcess.pid);
+					safeToRemove =
+						current === null || current.start !== childProcess.start;
+				}
+				// Rollback continues even when the runtime has been disposed.
 				const remaining = context.newestLivePane(paneId);
 				if (remaining !== undefined && remaining !== paneId)
 					await context.tmux.run(["select-layout", "-E", "-t", remaining]);
 			} catch (cleanupError) {
 				errors.push(cleanupError);
 			}
+			if (!safeToRemove) {
+				if (runDir !== undefined && childProcess != null) {
+					try {
+						writeJsonAtomic(join(runDir, "pane.json"), {
+							v: 1,
+							paneId,
+							process: childProcess,
+						});
+					} catch (cleanupError) {
+						errors.push(cleanupError);
+					}
+				}
+				errors.push(
+					new Error(
+						`Cannot confirm child exit and pane cleanup for subagent "${name}". Kept its name and recovery files in ${runDir}.`,
+					),
+				);
+			}
 		}
-		for (const cleanup of [
-			() => {
-				if (runDir !== undefined)
-					rmSync(runDir, { recursive: true, force: true });
-			},
-			() => {
-				if (newSession !== undefined) rmSync(newSession, { force: true });
-			},
-			() => context.release(name),
-		]) {
+		for (const cleanup of safeToRemove
+			? [
+					() => {
+						if (runDir !== undefined)
+							rmSync(runDir, { recursive: true, force: true });
+					},
+					() => {
+						if (newSession !== undefined) rmSync(newSession, { force: true });
+					},
+					() => context.release(name),
+				]
+			: []) {
 			try {
 				cleanup();
 			} catch (cleanupError) {

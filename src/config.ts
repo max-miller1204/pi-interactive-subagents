@@ -78,16 +78,13 @@ export function trustFlag(
 	return trusted ? "--approve" : "--no-approve";
 }
 
-function agentFiles(directory: string, inspectSymlinks = true): string[] {
+function agentFiles(directory: string): string[] {
 	if (!existsSync(directory)) return [];
 	return readdirSync(directory, { withFileTypes: true })
 		.filter(
 			(entry) =>
 				entry.name.endsWith(".md") &&
-				(entry.isFile() ||
-					(entry.isSymbolicLink() &&
-						(!inspectSymlinks ||
-							statSync(join(directory, entry.name)).isFile()))),
+				(entry.isFile() || entry.isSymbolicLink()),
 		)
 		.map((entry) => entry.name)
 		.sort();
@@ -111,8 +108,10 @@ export function discoverAgents(
 	for (const [scope, directory] of directories) {
 		for (const filename of agentFiles(directory)) {
 			const name = filename.slice(0, -3);
-			const file = realpathSync(join(directory, filename));
+			let file = join(realpathSync(directory), filename);
 			try {
+				if (!statSync(file).isFile()) continue;
+				file = realpathSync(file);
 				if (!AGENT_FILE.test(filename))
 					throw new Error(
 						"an agent file name must be 1 to 32 lowercase letters, digits or dashes, and end in .md.",
@@ -175,7 +174,7 @@ export function discoverAgents(
 		agents,
 		ignoredProjectAgents: allowed
 			? []
-			: agentFiles(projectDir, false).map((file) => file.slice(0, -3)),
+			: agentFiles(projectDir).map((file) => file.slice(0, -3)),
 		projectFilesIgnored:
 			!allowed &&
 			(existsSync(projectDir) ||

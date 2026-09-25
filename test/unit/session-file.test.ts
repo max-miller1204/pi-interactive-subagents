@@ -318,9 +318,22 @@ test("child writer preserves fork entries and fails for missing real paths", (t)
 		/ENOENT/,
 	);
 	assert.throws(
-		() => writeChildSession(f.dir, f.cwd, join(f.root, "missing"), []),
+		() =>
+			writeChildSession(f.dir, f.cwd, join(f.root, "missing/parent.jsonl"), []),
 		/ENOENT/,
 	);
+});
+
+test("child writer rejects a broken parent symlink and resolves an existing file symlink", (t) => {
+	const f = fixture(t);
+	const link = join(f.dir, "parent-link.jsonl");
+	symlinkSync(join(f.dir, "absent.jsonl"), link);
+	assert.throws(() => writeChildSession(f.dir, f.cwd, link, []), /ENOENT/);
+	assert.deepEqual(readdirSync(f.dir), ["parent-link.jsonl", "parent.jsonl"]);
+	rmSync(link);
+	symlinkSync(f.parent, link);
+	const child = writeChildSession(f.dir, f.cwd, link, []);
+	assert.equal(SessionManager.open(child).getHeader()?.parentSession, f.parent);
 });
 
 test("tool fork excludes the delegation assistant, sibling calls and later results", () => {
@@ -458,6 +471,152 @@ test("reader rejects missing parents, duplicate ids and cycles on all branches",
 			/parent|duplicate|cycle/i,
 		);
 	}
+});
+
+for (const [label, changes] of [
+	["missing content", { content: undefined }],
+	["string content", { content: "lost text" }],
+	["null block", { content: [null] }],
+	["missing text", { content: [{ type: "text" }] }],
+	["numeric text", { content: [{ type: "text", text: 42 }] }],
+	["unknown block", { content: [{ type: "unknown", text: "lost" }] }],
+	["invalid thinking", { content: [{ type: "thinking", thinking: false }] }],
+	[
+		"invalid tool call",
+		{ content: [{ type: "toolCall", id: 1, name: "read", arguments: {} }] },
+	],
+	[
+		"invalid tool arguments",
+		{
+			content: [{ type: "toolCall", id: "call", name: "read", arguments: [] }],
+		},
+	],
+	["missing usage", { usage: undefined }],
+	["invalid total tokens", { usage: { totalTokens: "17" } }],
+	["missing stop reason", { stopReason: undefined }],
+	["invalid stop reason", { stopReason: "done" }],
+	["invalid error message", { errorMessage: 42 }],
+] as const) {
+	test(`transcript extraction rejects ${label} with file and line`, (t) => {
+		const f = fixture(t);
+		const reply = assistant("reply", "marker", [
+			{ type: "text", text: "answer" },
+		]);
+		const file = f.put([
+			f.header,
+			marker("marker", null, "run", "child"),
+			{ ...reply, message: { ...reply.message, ...changes } },
+		]);
+		assert.throws(
+			() =>
+				finalText(lastAssistant(afterMarker(readBranch(file), "run") ?? [])),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.ok(error.message.startsWith(`${file}: line 3`), error.message);
+				return true;
+			},
+		);
+	});
+}
+
+test("transcript extraction rejects malformed message envelopes and owned records", (t) => {
+	const f = fixture(t);
+	for (const entry of [
+		{ ...custom("bad", null), type: "message" },
+		{ ...custom("bad", null), type: "message", message: { role: 1 } },
+		custom("bad", null, "subagent_child", { kind: "run", runId: "run" }),
+		custom("bad", null, "subagent_child", {
+			v: 1,
+			kind: "leaf",
+			runId: "run",
+			extra: true,
+		}),
+		custom("bad", null, "subagent", {
+			v: 1,
+			kind: "resume",
+			runId: "run",
+			name: 42,
+		}),
+		{
+			...custom("bad", null),
+			type: "custom_message",
+			details: { deliveryId: 42 },
+		},
+		{
+			...custom("bad", null),
+			type: "message",
+			message: { role: "toolResult", details: { deliveryId: 42 } },
+		},
+	]) {
+		const file = f.put([f.header, entry]);
+		assert.throws(
+			() => {
+				const branch = readBranch(file);
+				persistedIds(branch);
+				foldRegistry(branch, "child");
+				return finalText(lastAssistant(branch));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.ok(error.message.startsWith(`${file}: line 2`), error.message);
+				return true;
+			},
+		);
+	}
+});
+
+test("transcript validation covers inactive branches and accepts Pi assistant shapes", (t) => {
+	const f = fixture(t);
+	const file = writeChildSession(f.dir, f.cwd, f.parent, []);
+	const manager = SessionManager.open(file);
+	manager.appendCustomEntry("subagent_child", {
+		v: 1,
+		kind: "run",
+		runId: "run",
+		sessionId: manager.getSessionId(),
+		name: "worker",
+	});
+	for (const stopReason of [
+		"pending",
+		"stop",
+		"length",
+		"toolUse",
+		"error",
+		"aborted",
+		"deferred",
+	] as const) {
+		const reply = assistant("reply", null, [
+			{
+				type: "thinking",
+				thinking: "private",
+				thinkingSignature: "opaque",
+				redacted: true,
+			},
+			{ type: "text", text: "answer", textSignature: "signature" },
+			{
+				type: "toolCall",
+				id: "call",
+				name: "read",
+				arguments: { path: "file" },
+			},
+		]);
+		reply.message.stopReason = stopReason;
+		manager.appendMessage(reply.message);
+		const extracted = lastAssistant(afterMarker(readBranch(file), "run") ?? []);
+		assert.equal(finalText(extracted), "answer");
+		assert.equal(extracted?.usage.totalTokens, 17);
+		assert.equal(extracted?.stopReason, stopReason);
+	}
+	const corrupt = f.put([
+		f.header,
+		custom("bad", null, "subagent", { invalid: true }),
+		custom("active", null),
+	]);
+	assert.throws(
+		() => readBranch(corrupt),
+		(error: unknown) =>
+			error instanceof Error && error.message.startsWith(`${corrupt}: line 2`),
+	);
 });
 
 test("marker slicing matches run entries and excludes prior runs", () => {
@@ -641,7 +800,12 @@ test("registry fold rejects invalid records after its cut with entry context", (
 test("registry fold sees only records on the reader's active branch", (t) => {
 	const f = fixture(t);
 	const root = custom("root", null);
-	const inactive = custom("inactive", "root", "subagent", { invalid: true });
+	const inactive = custom("inactive", "root", "subagent", {
+		v: 1,
+		kind: "resume",
+		runId: "inactive-run",
+		name: "worker",
+	});
 	const active = custom("active", "root", "subagent", {
 		v: 1,
 		kind: "resume",

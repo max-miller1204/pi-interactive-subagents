@@ -15,6 +15,11 @@ import {
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
 import {
+	buildLiveCatalog,
+	catalogSummary,
+	resolveLaunch,
+} from "../../src/catalog.ts";
+import {
 	type ConfigContext,
 	discoverAgents,
 	loadProfiles,
@@ -94,6 +99,56 @@ const profile = (changes = {}) => ({
 		},
 	},
 });
+
+for (const scope of ["user", "project"] as const) {
+	test(`broken ${scope} agent symlink stays isolated through catalog resolution`, (t) => {
+		const f = fixture(t);
+		new ProjectTrustStore(f.agentDir).set(f.cwd, true);
+		f.profiles(profile());
+		f.agent(
+			"package",
+			"scout.md",
+			markdown("description: Lower scout\ntools: []"),
+		);
+		const worker = f.agent(
+			scope,
+			"worker.md",
+			markdown("description: Worker\ntools: []"),
+		);
+		const broken = join(dirname(worker), "scout.md");
+		symlinkSync(join(f.root, "missing.md"), broken);
+		const alias = join(f.root, "user-alias");
+		symlinkSync(f.agentDir, alias);
+		const live = buildLiveCatalog(
+			{ getAllTools: () => [], getCommands: () => [] },
+			f.ctx,
+			f.own,
+			alias,
+		);
+		assert.equal(live.errors.length, 1);
+		assert.equal(live.errors[0]?.file, broken);
+		assert.equal(live.errors[0]?.scope, scope);
+		assert.match(live.errors[0]?.error ?? "", /scout\.md.*ENOENT/);
+		assert.ok(catalogSummary(live).includes(`Error: ${broken}:`));
+		const options = {
+			catalog: live,
+			name: "worker-1",
+			agent: "worker",
+			profile: "quick",
+			spawnerDepth: 0,
+			spawnerAllowlist: ["worker", "scout"],
+			parentCwd: f.cwd,
+			cwd: f.cwd,
+			modelInvocation: true,
+		};
+		assert.equal(resolveLaunch(options).agent, "worker");
+		assert.throws(
+			() => resolveLaunch({ ...options, agent: "scout" }),
+			/scout\.md.*ENOENT/,
+		);
+		assert.equal(live.catalog.agents.scout, undefined);
+	});
+}
 
 for (const [label, text, expected] of [
 	[
