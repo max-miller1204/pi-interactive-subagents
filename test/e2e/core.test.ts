@@ -3,9 +3,14 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import * as queue from "../../src/queue.ts";
 import {
+	ChildStatus,
+	OpenQuestion,
 	parseStrict,
 	ResultDetails,
+	RunSpec,
 	readJsonStrict,
 	UndeliveredRecord,
 } from "../../src/schema.ts";
@@ -79,6 +84,59 @@ async function childFile(run: Scenario) {
 	return (entry.data as { launch: { childSessionFile: string } }).launch
 		.childSessionFile;
 }
+async function liveRun(run: Scenario) {
+	return run.waitFor(() => {
+		const paths = run.childRuns();
+		const path = paths.length === 1 ? paths[0] : undefined;
+		return path !== undefined && existsSync(join(path, "spec.json"))
+			? { path, spec: readJsonStrict(RunSpec, join(path, "spec.json")) }
+			: undefined;
+	}, "run spec on disk");
+}
+function checkedResult(entries: SessionEntry[], runId: string, child: string) {
+	const deliveryId = `${runId}:result`;
+	const matching = messages(entries, "subagent_result").filter(
+		(entry) => entry.details.deliveryId === deliveryId,
+	);
+	assert.equal(matching.length, 1);
+	const details = parseStrict(
+		ResultDetails,
+		matching[0]?.details,
+		"E2E result",
+	);
+	assert.equal(details.runId, runId);
+	assert.equal(details.childSessionFile, child);
+	return details;
+}
+function checkedNotice(entries: SessionEntry[], runIds: string[]) {
+	const deliveryId = `notice:${[...runIds].sort().join(",")}`;
+	const matching = messages(entries, "subagent_notice").filter(
+		(entry) => entry.details.deliveryId === deliveryId,
+	);
+	assert.equal(matching.length, 1);
+	assert.equal(messages(entries, "subagent_notice").length, 1);
+	assert.ok(matching[0]);
+	return matching[0];
+}
+async function rendered(run: Scenario, pane: string, expected: string) {
+	const screen = await run.waitFor(async () => {
+		const text = await run.capture(pane);
+		return text.includes(expected) ? text : undefined;
+	}, `visible ${expected}`);
+	const width = Number(
+		await run.tmux(["display-message", "-p", "-t", pane, "#{pane_width}"]),
+	);
+	assert.ok(Number.isSafeInteger(width) && width >= 40);
+	assert.ok(
+		screen.split("\n").every((line) => visibleWidth(line) <= width),
+		`pane text exceeds ${width} columns`,
+	);
+	const line = screen
+		.split("\n")
+		.find((row) => row.includes(expected) && row.indexOf(expected) <= 4);
+	assert.ok(line, `renderer cut or misaligned ${expected}`);
+	return screen;
+}
 async function childPane(run: Scenario) {
 	return run.waitFor(() => {
 		const paths = run.childRuns();
@@ -102,6 +160,7 @@ test("autonomous result is durable once and done row expires", async (t) => {
 		]),
 	});
 	const entry = await spawned(run);
+	const active = await liveRun(run);
 	assert.equal(entry.type, "custom");
 	assert.equal(
 		run
@@ -116,7 +175,12 @@ test("autonomous result is durable once and done row expires", async (t) => {
 	);
 	const details = await result(run);
 	assert.equal(details.status, "completed");
-	assert.equal(run.childRuns().length, 0);
+	checkedResult(
+		run.readParent(),
+		active.spec.runId,
+		active.spec.launch.childSessionFile,
+	);
+	await run.waitFor(() => !existsSync(active.path), "autonomous run cleanup");
 	assert.equal(
 		details.childSessionFile,
 		(entry.data as { launch: { childSessionFile: string } }).launch
@@ -173,6 +237,19 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 		]),
 	});
 	const file = await childFile(run);
+	const active = await liveRun(run);
+	const queued = await run.waitFor(
+		() =>
+			queue
+				.list(join(active.path, "inbox"), "inbox")
+				.find(
+					(item) =>
+						item.item.kind === "message" &&
+						item.item.text === "Immediate steer.",
+				),
+		"immediate steer file",
+	);
+	const deliveryId = queue.itemId(active.spec.runId, "inbox", queued.seq);
 	await run.waitFor(
 		async () => (await parentMessages(file)).length === 1,
 		"child steer",
@@ -195,17 +272,33 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 	);
 	const parentMessage = (await parentMessages(file))[0];
 	assert.ok(parentMessage);
-	assert.equal(parentMessage.details.kind, "message");
+	assert.deepEqual(parentMessage.details, {
+		deliveryId,
+		kind: "message",
+		text: "Immediate steer.",
+	});
+	assert.equal(
+		(await parentMessages(file)).filter(
+			(item) => item.details.deliveryId === deliveryId,
+		).length,
+		1,
+	);
+	const pane = await childPane(run);
 	assert.match(
-		await run.waitFor(async () => {
-			const text = await run.capture(await childPane(run));
-			return text.includes("Parent message:") ? text : undefined;
-		}, "parent message renderer"),
+		await rendered(run, pane, "Parent message: message"),
 		/Parent message: message/,
 	);
-	await run.sendKeys(await childPane(run), "/quit");
-	const details = await result(run);
-	assert.equal(details.deliveryId, `${details.runId}:result`);
+	await run.tmux(["send-keys", "-t", pane, "C-o"]);
+	assert.match(
+		await rendered(run, pane, "Immediate steer."),
+		/Parent message: message/,
+	);
+	await run.sendKeys(pane, "/quit");
+	await result(run);
+	assert.equal(
+		checkedResult(run.readParent(), active.spec.runId, file).status,
+		"completed",
+	);
 });
 
 test("three steers persist in sequence in an interactive child", async (t) => {
@@ -214,6 +307,8 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 		prompt: script([spawn("Open session."), { say: "Spawned." }]),
 	});
 	const file = await childFile(run);
+	const active = await liveRun(run);
+	assert.equal(active.spec.launch.childSessionFile, file);
 	await run.waitFor(
 		() =>
 			existsSync(file) &&
@@ -228,15 +323,64 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 		"Second steer",
 		"Third steer",
 	].entries()) {
+		await run.waitFor(
+			() => {
+				const statusFile = join(active.path, "status.json");
+				if (!existsSync(statusFile)) return false;
+				const status = readJsonStrict(ChildStatus, statusFile);
+				return (
+					status.state === "waiting" &&
+					!status.question &&
+					queue.list(join(active.path, "inbox"), "inbox").length === 0
+				);
+			},
+			`child idle before steer ${index + 1}`,
+		);
+		const before = readBranch(file).length;
+		const queued = run.waitFor(
+			() =>
+				queue
+					.list(join(active.path, "inbox"), "inbox")
+					.find(
+						(item) => item.item.kind === "message" && item.item.text === text,
+					),
+			`steer file ${index + 1}`,
+		);
 		await prompt(run, [
 			steer(text),
 			{ say: `Sent ${index}.` },
 			{ say: "Result received." },
 		]);
+		const item = await queued;
+		assert.deepEqual(item.item, { v: 1, kind: "message", text });
+		const deliveryId = queue.itemId(active.spec.runId, "inbox", item.seq);
 		await run.waitFor(
-			async () => (await parentMessages(file)).length === index + 1,
-			`steer ${index + 1}`,
+			() => {
+				const branch = readBranch(file);
+				const item = messages(branch, "subagent_parent_message")[index];
+				return (
+					item?.details.text === text &&
+					branch
+						.slice(before)
+						.some(
+							(entry) =>
+								entry.type === "message" && entry.message.role === "assistant",
+						) &&
+					readJsonStrict(ChildStatus, join(active.path, "status.json"))
+						.state === "waiting"
+				);
+			},
+			`child settles after steer ${index + 1}`,
 		);
+		const matching = (await parentMessages(file)).filter(
+			(entry) => entry.details.deliveryId === deliveryId,
+		);
+		assert.equal(matching.length, 1);
+		assert.deepEqual(matching[0]?.details, {
+			deliveryId,
+			kind: "message",
+			text,
+		});
 	}
 	const steers = await parentMessages(file);
 	assert.deepEqual(
@@ -249,6 +393,7 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 	);
 	await run.sendKeys(await childPane(run), "/quit");
 	await result(run);
+	checkedResult(run.readParent(), active.spec.runId, file);
 });
 
 test("parallel questions pair reverse-order answers by qid", async (t) => {
@@ -263,46 +408,80 @@ test("parallel questions pair reverse-order answers by qid", async (t) => {
 	]);
 	const run = await scenario(t, {
 		agents: { worker: agent() },
-		prompt: script([
-			spawn(task),
-			{ say: "Questions pending." },
-			{ say: "Questions received." },
-			{ say: "Child finished." },
-		]),
+		prompt: script([spawn(task), { hang: true }, { say: "Unexpected turn." }]),
 	});
 	const file = await childFile(run);
+	const active = await liveRun(run);
+	const queued = await run.waitFor(() => {
+		const found = queue.list(join(active.path, "outbox"), "outbox");
+		return found.length === 2 ? found : undefined;
+	}, "two outbox question files");
+	assert.ok(queued.every((item) => item.item.kind === "question"));
+	const qids = queued.map((item) => item.item.qid);
+	assert.equal(new Set(qids).size, 2);
+	for (const item of queued) {
+		assert.equal(item.item.kind, "question");
+		const questionFile = join(
+			active.path,
+			"questions",
+			`${item.item.qid}.json`,
+		);
+		assert.equal(
+			readJsonStrict(OpenQuestion, questionFile).text,
+			item.item.text,
+		);
+	}
+	await run.tmux(["send-keys", "-t", run.parentPane, "Escape"]);
 	const questions = await run.waitFor(() => {
-		const found = existsSync(run.parentFile)
-			? messages(run.readParent(), "subagent_question")
-			: [];
+		const found = messages(run.readParent(), "subagent_question");
 		return found.length === 2 ? found : undefined;
 	}, "two question deliveries");
-	const qids = questions.map((question) => question.details.qid);
-	assert.equal(new Set(qids).size, 2);
-	for (const question of questions) {
-		assert.equal(typeof question.details.deliveryId, "string");
+	await run.waitFor(
+		() => queue.list(join(active.path, "outbox"), "outbox").length === 0,
+		"questions confirmed on disk",
+	);
+	for (const [index, item] of queued.entries()) {
+		assert.equal(item.item.kind, "question");
+		const expectedId = queue.itemId(active.spec.runId, "outbox", item.seq);
+		assert.equal(questions[index]?.details.deliveryId, expectedId);
+		assert.equal(questions[index]?.details.qid, item.item.qid);
+		assert.equal(questions[index]?.details.question, item.item.text);
 		assert.equal(
-			messages(run.readParent(), "subagent_question").filter(
-				(item) => item.details.deliveryId === question.details.deliveryId,
-			).length,
+			questions.filter((question) => question.details.deliveryId === expectedId)
+				.length,
 			1,
 		);
 	}
-	const screen = await run.capture();
-	assert.match(screen, /First question\?/);
+	const screen = await rendered(run, run.parentPane, "First question?");
 	assert.match(screen, /Second question\?/);
-	await prompt(run, [
-		steer("Answer second", "worker", String(qids[1])),
-		{ say: "Second sent." },
-		{ say: "Result noted." },
-	]);
-	await prompt(run, [
-		steer("Answer first", "worker", String(qids[0])),
-		{ say: "First sent." },
-		{ say: "Result noted." },
-	]);
+	const expectedAnswers = new Map<string, string>();
+	for (const [qid, answer] of [
+		[qids[1], "Answer second"],
+		[qids[0], "Answer first"],
+	] as const) {
+		assert.ok(qid);
+		const inboxFile = run.waitFor(
+			() =>
+				queue
+					.list(join(active.path, "inbox"), "inbox")
+					.find((item) => item.item.kind === "answer" && item.item.qid === qid),
+			`answer file ${qid}`,
+		);
+		await prompt(run, [
+			steer(answer, "worker", qid),
+			{ say: "Answer sent." },
+			{ say: "Result noted." },
+		]);
+		const item = await inboxFile;
+		assert.deepEqual(item.item, { v: 1, kind: "answer", qid, text: answer });
+		expectedAnswers.set(
+			qid,
+			queue.itemId(active.spec.runId, "inbox", item.seq),
+		);
+	}
 	const details = await result(run);
 	assert.equal(details.status, "completed");
+	assert.equal(details.runId, active.spec.runId);
 	const child = readBranch(file).filter(
 		(entry) => entry.type === "message" && entry.message.role === "toolResult",
 	);
@@ -315,13 +494,14 @@ test("parallel questions pair reverse-order answers by qid", async (t) => {
 	});
 	assert.equal(new Set(answered.map((item) => item.deliveryId)).size, 2);
 	assert.deepEqual(new Set(answered.map((item) => item.qid)), new Set(qids));
-	assert.ok(answered.every((item) => item.deliveryId.includes(":inbox:")));
+	for (const item of answered)
+		assert.equal(item.deliveryId, expectedAnswers.get(item.qid));
 	const firstAnswer = answered.find((item) => item.qid === qids[0]);
 	const secondAnswer = answered.find((item) => item.qid === qids[1]);
 	assert.ok(firstAnswer && secondAnswer);
 	assert.match(firstAnswer.content, /Answer first/);
 	assert.match(secondAnswer.content, /Answer second/);
-	assert.equal(run.childRuns().length, 0);
+	await run.waitFor(() => !existsSync(active.path), "question run cleanup");
 });
 
 test("an answer passes an earlier queued instruction without losing it", async (t) => {
@@ -340,6 +520,7 @@ test("an answer passes an earlier queued instruction without losing it", async (
 		]),
 	});
 	const file = await childFile(run);
+	const active = await liveRun(run);
 	const question = await run.waitFor(
 		() =>
 			existsSync(run.parentFile)
@@ -348,35 +529,101 @@ test("an answer passes an earlier queued instruction without losing it", async (
 		"question",
 	);
 	const qid = String(question.details.qid);
+	await run.waitFor(
+		() => queue.list(join(active.path, "outbox"), "outbox").length === 0,
+		"question confirmed before answer",
+	);
+	assert.equal(
+		readJsonStrict(OpenQuestion, join(active.path, "questions", `${qid}.json`))
+			.qid,
+		qid,
+	);
+	const blocked = queue.list(join(active.path, "inbox"), "inbox");
+	assert.equal(blocked.length, 1);
+	assert.ok(blocked[0]);
+	assert.deepEqual(blocked[0].item, {
+		v: 1,
+		kind: "message",
+		text: "Queued instruction",
+	});
+	assert.equal(messages(readBranch(file), "subagent_parent_message").length, 0);
+	const instructionId = queue.itemId(
+		active.spec.runId,
+		"inbox",
+		blocked[0].seq,
+	);
+	const pendingAnswer = run.waitFor(
+		() =>
+			queue
+				.list(join(active.path, "inbox"), "inbox")
+				.find((item) => item.item.kind === "answer" && item.item.qid === qid),
+		"answer behind instruction on disk",
+	);
 	await prompt(run, [
 		steer("Answer now", "worker", qid),
 		{ say: "Answer queued." },
 		{ say: "Result seen." },
 	]);
-	await run.waitFor(
+	const answerFile = await pendingAnswer;
+	assert.deepEqual(answerFile.item, {
+		v: 1,
+		kind: "answer",
+		qid,
+		text: "Answer now",
+	});
+	assert.ok(blocked[0] && blocked[0].seq < answerFile.seq);
+	const answerId = queue.itemId(active.spec.runId, "inbox", answerFile.seq);
+	const toolResult = await run.waitFor(
 		() =>
-			readBranch(file).some(
+			readBranch(file).find(
 				(entry) =>
 					entry.type === "message" &&
 					entry.message.role === "toolResult" &&
-					typeof entry.message.details === "object" &&
-					entry.message.details !== null &&
-					"deliveryId" in entry.message.details,
+					(entry.message.details as { deliveryId?: string } | undefined)
+						?.deliveryId === answerId,
 			),
-		"question answer tool result",
+		"exact answer tool result",
+	);
+	assert.equal(toolResult.type, "message");
+	assert.equal(toolResult.message.role, "toolResult");
+	assert.deepEqual(toolResult.message.details, { deliveryId: answerId, qid });
+	assert.deepEqual(toolResult.message.content, [
+		{ type: "text", text: "Answer now" },
+	]);
+	assert.equal(
+		readBranch(file).filter(
+			(entry) =>
+				entry.type === "message" &&
+				entry.message.role === "toolResult" &&
+				(entry.message.details as { deliveryId?: string } | undefined)
+					?.deliveryId === answerId,
+		).length,
+		1,
 	);
 	const delivered = await run.waitFor(async () => {
 		const found = await parentMessages(file);
 		return found.length === 1 ? found : undefined;
 	}, "queued instruction delivery");
 	assert.ok(delivered[0]);
-	assert.equal(delivered[0].details.text, "Queued instruction");
-	assert.equal(messages(readBranch(file), "subagent_parent_message").length, 1);
+	assert.deepEqual(delivered[0].details, {
+		deliveryId: instructionId,
+		kind: "message",
+		text: "Queued instruction",
+	});
+	assert.equal(
+		messages(readBranch(file), "subagent_parent_message").filter(
+			(item) => item.details.deliveryId === instructionId,
+		).length,
+		1,
+	);
+	const pane = await childPane(run);
 	assert.match(
-		await run.waitFor(async () => {
-			const text = await run.capture(await childPane(run));
-			return text.includes("Parent message:") ? text : undefined;
-		}, "visible parent message"),
+		await rendered(run, pane, "Parent message: message"),
+		/Parent message: message/,
+	);
+	await run.tmux(["send-keys", "-t", pane, "C-o"]);
+	assert.match(
+		await rendered(run, pane, "Queued instruction"),
 		/Parent message: message/,
 	);
 	await run.sendKeys(await childPane(run), "/quit");
@@ -429,14 +676,6 @@ function otherSessions(run: Scenario, child: string): string[] {
 		.map((name) => join(run.root, name))
 		.filter((file) => file !== run.parentFile && file !== child);
 }
-function readyResult(run: Scenario): boolean {
-	const paths = run.childRuns();
-	return (
-		paths.length === 1 &&
-		paths[0] !== undefined &&
-		existsSync(join(paths[0], "result.json"))
-	);
-}
 function findRecord(dir: string): string | undefined {
 	return existsSync(dir)
 		? readdirSync(dir).find((name) => name.endsWith(".json"))
@@ -468,6 +707,7 @@ test("new session adopts a child result without starting a turn", async (t) => {
 		]),
 	});
 	const child = await childFile(run);
+	const active = await liveRun(run);
 	const oldId = sessionId(run.parentFile);
 	const question = await run.waitFor(
 		() => messages(run.readParent(), "subagent_question")[0],
@@ -481,6 +721,7 @@ test("new session adopts a child result without starting a turn", async (t) => {
 	await prompt(run, [
 		steer("New session answer", "worker", String(question.details.qid)),
 		{ say: "Answer sent." },
+		{ say: "INVALID RESULT TURN" },
 	]);
 	const file = await run.waitFor(
 		() =>
@@ -490,16 +731,22 @@ test("new session adopts a child result without starting a turn", async (t) => {
 		"new parent session",
 	);
 	assert.notEqual(sessionId(file), oldId);
-	const found = await run.waitFor(
+	await run.waitFor(
+		() =>
+			readBranch(file).some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					JSON.stringify(entry.message.content).includes("Answer sent."),
+			),
+		"parent reply before new result",
+	);
+	await run.waitFor(
 		() => messages(readBranch(file), "subagent_result")[0],
 		"new session child result",
 	);
-	const details = parseStrict(
-		ResultDetails,
-		found.details,
-		"new session result",
-	);
-	assert.equal(details.deliveryId, `${details.runId}:result`);
+	const details = checkedResult(readBranch(file), active.spec.runId, child);
+	assert.equal(details.status, "completed");
 	assert.equal(messages(readBranch(file), "subagent_result").length, 1);
 	assert.equal(messages(run.readParent(), "subagent_result").length, 0);
 	assert.ok(
@@ -525,9 +772,33 @@ test("new session adopts a child result without starting a turn", async (t) => {
 			).length,
 		0,
 	);
+	await run.waitFor(() => !existsSync(active.path), "cleaned new session run");
+	await rendered(run, run.parentPane, "worker  worker  done");
 	await run.waitFor(
-		() => run.childRuns().length === 0,
-		"cleaned new session run",
+		async () =>
+			!(
+				await run.tmux(["capture-pane", "-p", "-J", "-t", run.parentPane])
+			).includes("worker  worker  done"),
+		"new result done row expires",
+		15000,
+	);
+	assert.equal(
+		readBranch(file).filter(
+			(entry) =>
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				JSON.stringify(entry.message.content).includes("INVALID RESULT TURN"),
+		).length,
+		0,
+	);
+	assert.equal(
+		readBranch(file)
+			.slice(resultIndex + 1)
+			.filter(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "assistant",
+			).length,
+		0,
 	);
 	await prompt(run, [
 		steer("Resume by name"),
@@ -544,7 +815,7 @@ test("new session adopts a child result without starting a turn", async (t) => {
 			)[0],
 		"name reuse after adopt",
 	);
-	assert.ok(resumed);
+	assert.ok(resumed?.type === "custom");
 	const resumedResults = await run.waitFor(
 		() => {
 			const found = messages(readBranch(file), "subagent_result");
@@ -557,10 +828,12 @@ test("new session adopts a child result without starting a turn", async (t) => {
 		new Set(resumedResults.map((item) => item.details.deliveryId)).size,
 		2,
 	);
-	assert.ok(resumedResults[1]);
 	assert.equal(
-		parseStrict(ResultDetails, resumedResults[1].details, "resumed result")
-			.status,
+		checkedResult(
+			readBranch(file),
+			(resumed.data as { runId: string }).runId,
+			child,
+		).status,
 		"completed",
 	);
 });
@@ -579,6 +852,7 @@ test("fork delivers one result to the fork branch with a turn", async (t) => {
 		]),
 	});
 	const child = await childFile(run);
+	const active = await liveRun(run);
 	const oldId = sessionId(run.parentFile);
 	const question = await run.waitFor(
 		() => messages(run.readParent(), "subagent_question")[0],
@@ -619,13 +893,22 @@ test("fork delivers one result to the fork branch with a turn", async (t) => {
 		"fork parent session",
 	);
 	assert.notEqual(sessionId(file), oldId);
-	const found = await run.waitFor(
+	await run.waitFor(
+		() =>
+			readBranch(file).some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					JSON.stringify(entry.message.content).includes("Fork answer sent."),
+			),
+		"parent reply before fork result",
+	);
+	await run.waitFor(
 		() => messages(readBranch(file), "subagent_result")[0],
 		"fork result",
 	);
-	const details = parseStrict(ResultDetails, found.details, "fork result");
+	const details = checkedResult(readBranch(file), active.spec.runId, child);
 	assert.equal(details.status, "completed");
-	assert.equal(details.deliveryId, `${details.runId}:result`);
 	assert.equal(messages(readBranch(file), "subagent_result").length, 1);
 	assert.equal(messages(run.readParent(), "subagent_result").length, 0);
 	const branch = readBranch(file);
@@ -633,36 +916,78 @@ test("fork delivers one result to the fork branch with a turn", async (t) => {
 		(entry) =>
 			entry.type === "custom_message" && entry.customType === "subagent_result",
 	);
-	assert.ok(
-		branch
-			.slice(index + 1)
-			.some(
-				(entry) =>
-					entry.type === "message" && entry.message.role === "assistant",
-			),
+	await run.waitFor(
+		() =>
+			readBranch(file)
+				.slice(index + 1)
+				.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						JSON.stringify(entry.message.content).includes("Result processed."),
+				),
+		"result-triggered fork model reply",
 	);
+	const after = readBranch(file)
+		.slice(index + 1)
+		.filter(
+			(entry) => entry.type === "message" && entry.message.role === "assistant",
+		);
+	assert.equal(after.length, 1);
+	assert.match(JSON.stringify(after[0]), /Result processed\./);
 });
 
 test("Esc appends a ready result without another model run", async (t) => {
 	const run = await scenario(t, {
-		agents: { worker: agent() },
+		agents: { worker: agent(false) },
 		prompt: script([
 			spawn("Esc child result."),
 			{ hang: true },
 			{ say: "Unexpected new run." },
 		]),
 	});
-	await childFile(run);
-	await run.waitFor(() => readyResult(run), "ready result behind parent hang");
+	const child = await childFile(run);
+	const active = await liveRun(run);
+	const pane = await childPane(run);
+	await run.waitFor(
+		() =>
+			readBranch(child).some(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "assistant",
+			),
+		"Esc child first reply",
+	);
+	await run.waitFor(
+		async () => (await run.capture()).includes("Working"),
+		"parent hangs before Esc",
+	);
+	await run.sendKeys(pane, "/quit");
+	await run.waitFor(
+		() => existsSync(join(active.path, "result.json")),
+		"ready result behind parent hang",
+	);
 	const before = run
 		.readParent()
 		.filter(
 			(entry) => entry.type === "message" && entry.message.role === "assistant",
 		).length;
 	await run.tmux(["send-keys", "-t", run.parentPane, "Escape"]);
-	const details = await result(run);
-	assert.equal(details.status, "completed");
-	await run.waitFor(() => run.childRuns().length === 0, "Esc run cleanup");
+	await rendered(run, run.parentPane, "Operation aborted");
+	await result(run);
+	assert.equal(
+		checkedResult(run.readParent(), active.spec.runId, child).status,
+		"completed",
+	);
+	await run.waitFor(() => !existsSync(active.path), "Esc run cleanup");
+	await rendered(run, run.parentPane, "worker  worker  done");
+	await run.waitFor(
+		async () =>
+			!(
+				await run.tmux(["capture-pane", "-p", "-J", "-t", run.parentPane])
+			).includes("worker  worker  done"),
+		"Esc result done row expires",
+		15000,
+	);
 	const after = run
 		.readParent()
 		.filter(
@@ -719,12 +1044,33 @@ test("quit saves a stopped child, reports stderr, and reopens one notice", async
 			.split("\n")
 			.includes(pane),
 	);
+	await run.waitFor(
+		async () =>
+			(await run.tmux([
+				"display-message",
+				"-p",
+				"-t",
+				run.parentPane,
+				"#{pane_dead}",
+			])) === "1" &&
+			readFileSync(run.stderrFile, "utf8").includes(
+				"Their sessions are saved.",
+			),
+		"final quit report and dead pane",
+	);
 	await run.reopen(run.parentFile);
 	await run.waitFor(
 		() => messages(run.readParent(), "subagent_notice")[0],
 		"reopened notice",
 	);
-	assert.equal(messages(run.readParent(), "subagent_notice").length, 1);
+	const notice = checkedNotice(run.readParent(), [saved.runId]);
+	assert.match(notice.content, /Stopped: worker/);
+	assert.match(
+		await rendered(run, run.parentPane, "Subagent delivery notice: worker"),
+		/Subagent delivery notice: worker/,
+	);
+	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
+	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
 	assert.equal(
 		run
 			.readParent()
@@ -808,10 +1154,9 @@ test("quit after new stores the notice for the new session", async (t) => {
 		() => findRecord(dir),
 		"new session stopped record",
 	);
-	assert.equal(
-		readJsonStrict(UndeliveredRecord, join(dir, record)).kind,
-		"stopped",
-	);
+	const saved = readJsonStrict(UndeliveredRecord, join(dir, record));
+	assert.equal(saved.kind, "stopped");
+	assert.equal(saved.launch.childSessionFile, child);
 	assert.equal(
 		existsSync(join(run.agentDir, "subagent-runs", "undelivered", oldId)),
 		false,
@@ -820,12 +1165,29 @@ test("quit after new stores the notice for the new session", async (t) => {
 		readFileSync(run.stderrFile, "utf8"),
 		/Pi quit, so it stopped 1 running subagents: worker/,
 	);
+	await run.waitFor(
+		async () =>
+			(await run.tmux([
+				"display-message",
+				"-p",
+				"-t",
+				run.parentPane,
+				"#{pane_dead}",
+			])) === "1" &&
+			readFileSync(run.stderrFile, "utf8").includes(
+				"Their sessions are saved.",
+			),
+		"new session quit complete",
+	);
 	await run.reopen(file);
 	await run.waitFor(
 		() => messages(readBranch(file), "subagent_notice")[0],
 		"notice in new session",
 	);
-	assert.equal(messages(readBranch(file), "subagent_notice").length, 1);
+	checkedNotice(readBranch(file), [saved.runId]);
+	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
+	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
+	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
 	await prompt(run, [
 		steer("Resume after new quit"),
 		{ say: "Resume sent." },
@@ -841,9 +1203,24 @@ test("quit after new stores the notice for the new session", async (t) => {
 			),
 		"resume by name in new session",
 	);
-	await run.waitFor(
+	const resumedResult = await run.waitFor(
 		() => messages(readBranch(file), "subagent_result")[0],
 		"resumed result in new session",
+	);
+	const resume = readBranch(file).find(
+		(entry) =>
+			entry.type === "custom" &&
+			entry.customType === "subagent" &&
+			(entry.data as { kind?: string }).kind === "resume",
+	);
+	assert.ok(resume?.type === "custom");
+	assert.equal(
+		checkedResult(
+			readBranch(file),
+			(resume.data as { runId: string }).runId,
+			child,
+		).deliveryId,
+		resumedResult.details.deliveryId,
 	);
 });
 
@@ -878,20 +1255,34 @@ test("quit after an unsaved new session preserves recovery under the saved spawn
 		() => findRecord(dir),
 		"old session recovery record",
 	);
-	assert.equal(
-		readJsonStrict(UndeliveredRecord, join(dir, record)).kind,
-		"stopped",
-	);
+	const saved = readJsonStrict(UndeliveredRecord, join(dir, record));
+	assert.equal(saved.kind, "stopped");
+	assert.equal(saved.launch.childSessionFile, child);
 	assert.equal(
 		readdirSync(join(run.agentDir, "subagent-runs", "undelivered")).length,
 		1,
+	);
+	await run.waitFor(
+		async () =>
+			(await run.tmux([
+				"display-message",
+				"-p",
+				"-t",
+				run.parentPane,
+				"#{pane_dead}",
+			])) === "1" &&
+			readFileSync(run.stderrFile, "utf8").includes(
+				"This session was not saved",
+			),
+		"unsaved quit complete",
 	);
 	await run.reopen(run.parentFile);
 	await run.waitFor(
 		() => messages(run.readParent(), "subagent_notice")[0],
 		"old session notice",
 	);
-	assert.equal(messages(run.readParent(), "subagent_notice").length, 1);
+	checkedNotice(run.readParent(), [saved.runId]);
+	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
 	await prompt(run, [
 		steer("Resume from saved spawner"),
 		{ say: "Resume sent." },
@@ -914,7 +1305,7 @@ test("quit after an unsaved new session preserves recovery under the saved spawn
 
 test("quit behind a hanging parent saves one finished result notice", async (t) => {
 	const run = await scenario(t, {
-		agents: { worker: agent() },
+		agents: { worker: agent(false) },
 		prompt: script([
 			spawn("Finished behind hang."),
 			{ hang: true },
@@ -922,8 +1313,26 @@ test("quit behind a hanging parent saves one finished result notice", async (t) 
 		]),
 	});
 	const child = await childFile(run);
+	const active = await liveRun(run);
+	const pane = await childPane(run);
 	const id = sessionId(run.parentFile);
-	await run.waitFor(() => readyResult(run), "finished result held behind hang");
+	await run.waitFor(
+		() =>
+			readBranch(child).some(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "assistant",
+			),
+		"interactive child first reply",
+	);
+	await run.waitFor(
+		async () => (await run.capture()).includes("Working"),
+		"parent hangs after spawn",
+	);
+	await run.sendKeys(pane, "/quit");
+	await run.waitFor(
+		() => existsSync(join(active.path, "result.json")),
+		"finished result held behind hang",
+	);
 	assert.equal(messages(run.readParent(), "subagent_result").length, 0);
 	await run.sendKeys(run.parentPane, "/quit");
 	const dir = join(run.agentDir, "subagent-runs", "undelivered", id);
@@ -934,18 +1343,38 @@ test("quit behind a hanging parent saves one finished result notice", async (t) 
 	const saved = readJsonStrict(UndeliveredRecord, join(dir, file));
 	assert.equal(saved.kind, "result");
 	assert.equal(saved.launch.childSessionFile, child);
+	assert.equal(
+		parseStrict(ResultDetails, saved.details, "undelivered result").deliveryId,
+		`${saved.runId}:result`,
+	);
 	assert.match(saved.content, /Finished behind hang/);
 	assert.match(
 		readFileSync(run.stderrFile, "utf8"),
 		/It kept 1 result that was not delivered: worker/,
 	);
-	assert.equal(run.childRuns().length, 0);
+	await run.waitFor(() => !existsSync(active.path), "quit result run cleanup");
+	await run.waitFor(
+		async () =>
+			(await run.tmux([
+				"display-message",
+				"-p",
+				"-t",
+				run.parentPane,
+				"#{pane_dead}",
+			])) === "1" &&
+			readFileSync(run.stderrFile, "utf8").includes("It kept 1 result"),
+		"finished result quit complete",
+	);
 	await run.reopen(run.parentFile);
 	const notice = await run.waitFor(
 		() => messages(run.readParent(), "subagent_notice")[0],
 		"finished result notice",
 	);
 	assert.match(notice.content, /Finished behind hang/);
-	assert.equal(messages(run.readParent(), "subagent_notice").length, 1);
+	const confirmed = checkedNotice(run.readParent(), [saved.runId]);
+	assert.equal(confirmed.details.deliveryId, notice.details.deliveryId);
 	assert.equal(messages(run.readParent(), "subagent_result").length, 0);
+	await rendered(run, run.parentPane, "Subagent delivery notice:");
+	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
+	await rendered(run, run.parentPane, "ack: Finished behind hang.");
 });
