@@ -315,7 +315,12 @@ function fixture(
 		},
 		ui: { notify: (message: string) => notifications.push(message) },
 	} as unknown as ExtensionContext;
+	const server = {
+		socket: "/socket",
+		process: { pid: 99, start: "server start" },
+	};
 	const tmux = {
+		serverIdentity: async () => structuredClone(server),
 		run: async (args: string[]) => {
 			commands.push(args);
 			return args[0] === "-V" ? "tmux 3.4" : "";
@@ -386,6 +391,7 @@ function fixture(
 		const pane = {
 			v: 1 as const,
 			paneId: `%${panes.size + 2}`,
+			server: structuredClone(server),
 			process: { pid: 222 + panes.size, start: "child start" },
 		};
 		writeJsonAtomic(join(runDir, "spec.json"), spec);
@@ -457,7 +463,7 @@ test("result stores auto-exit provenance and done rows retain agent, duration an
 	await f.runtime.tick();
 	assert.equal(f.runtime.done.length, 0);
 });
-test("a corrupt run fails while a healthy run still finishes with one pane scan", async (t) => {
+test("a corrupt run fails while a healthy run still finishes with verified cleanup", async (t) => {
 	const f = fixture(t);
 	const bad = f.prepare("bad", true);
 	const good = f.prepare("good");
@@ -467,7 +473,7 @@ test("a corrupt run fails while a healthy run still finishes with one pane scan"
 	assert.match(present(bad.result().errorMessage), /valid JSON/);
 	assert.equal(good.result().status, "completed");
 	assert.equal(good.result().text, "Result text");
-	assert.equal(f.lists(), 1);
+	assert.equal(f.lists(), 2);
 });
 test("missing pane waits 30 seconds and never reads a still-live transcript", async (t) => {
 	const f = fixture(t);
@@ -535,7 +541,10 @@ test("result contains unread inbox, open questions, transcript and truncation", 
 test("session replacement reattaches and adopts without a turn or killing live children", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	await f.runtime.start({ reason: "new" });
 	await f.runtime.onShutdown("new");
 	assert.equal(
@@ -544,7 +553,10 @@ test("session replacement reattaches and adopts without a turn or killing live c
 	);
 	const next = new Runtime(f.pi, f.ctx, f.deps);
 	t.after(() => next.onShutdown("new"));
-	f.panes.set(run.pane.paneId, dead());
+	f.panes.set(
+		run.pane.paneId,
+		dead({ session: run.spec.launch.childSessionFile }),
+	);
 	await next.start({ reason: "new" });
 	await next.tick();
 	assert.equal(present(f.sent[0]).trigger, false);
@@ -567,7 +579,10 @@ test("session replacement reattaches and adopts without a turn or killing live c
 test("own runs trigger and unknown live questions adopt before withdrawal", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	queue.put(join(run.runDir, "outbox"), "outbox", {
 		v: 1,
 		kind: "question",
@@ -617,16 +632,20 @@ test("tick calls never overlap", async (t) => {
 	await f.runtime.start({ reason: "new" });
 	const a = f.runtime.tick();
 	const b = f.runtime.tick();
+	await Promise.resolve();
 	assert.equal(calls, 1);
 	release();
 	await Promise.all([a, b]);
-	assert.equal(calls, 1);
+	assert.equal(calls, 2);
 });
 
 test("quit stops children and stores notices until durable confirmation", async (t) => {
 	const f = fixture(t, { disk: true });
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	f.living.add(run.pane.process.pid);
 	const original = f.deps.tmux.run;
 	f.deps.tmux.run = async (args) => {
@@ -698,7 +717,10 @@ test("quit waits no more than five seconds and keeps files for live children", a
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
 	f.living.add(run.pane.process.pid);
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	let waited = 0;
 	f.deps.delay = async (ms) => {
 		waited += ms;
@@ -722,7 +744,10 @@ test("quit waits no more than five seconds and keeps files for live children", a
 test("a failed pane kill is reported and its run files stay", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	f.deps.tmux.run = async () => {
 		throw new Error("permission denied");
 	};
@@ -772,6 +797,57 @@ test("startup recovers dead-owner records in one sorted notice and keeps live or
 	assert.equal(existsSync(oldFinished.runDir), false);
 	assert.equal(readdirSync(oldOwner).length, 1);
 });
+for (const mismatch of ["pid", "session", "server", "unknown"] as const)
+	for (const path of ["recovery", "tick", "quit"] as const)
+		test(`${path} retains recovery files and does not kill a pane with ${mismatch} identity`, async (t) => {
+			const f = fixture(t, { disk: true });
+			const oldOwner = join(
+				f.deps.runsRoot,
+				"owners",
+				`999999-${"a".repeat(64)}`,
+			);
+			const run = f.prepare(
+				"protected",
+				false,
+				path === "recovery" ? oldOwner : undefined,
+			);
+			const state = present(f.panes.get(run.pane.paneId));
+			if (mismatch === "pid") state.pid++;
+			if (mismatch === "session") state.session = "/unrelated-session";
+			if (mismatch === "server")
+				f.deps.tmux.serverIdentity = async () => ({
+					socket: "/socket",
+					process: { pid: 99, start: "restarted server" },
+				});
+			if (mismatch === "unknown")
+				f.deps.tmux.serverIdentity = async () => {
+					throw new Error("server identity unavailable");
+				};
+			await f.runtime.start({
+				reason: path === "recovery" ? "startup" : "new",
+			});
+			if (path === "tick") {
+				await f.runtime.tick();
+				await f.runtime.tick();
+			}
+			if (path === "quit") await f.runtime.onShutdown("quit");
+			assert.equal(
+				f.commands.some((args) => args[0] === "kill-pane"),
+				false,
+			);
+			assert.equal(existsSync(join(run.runDir, "spec.json")), true);
+			assert.equal(existsSync(join(run.runDir, "pane.json")), true);
+			assert.equal(existsSync(run.spec.launch.childSessionFile), true);
+			assert.match(
+				[
+					...f.notifications,
+					...f.stderr,
+					...f.sent.map((message) => message.content),
+				].join("\n"),
+				/identity/,
+			);
+		});
+
 test("owner directory is private and fresh parent paths are enabled", async (t) => {
 	const f = fixture(t);
 	await f.runtime.start({ reason: "new" });
@@ -950,7 +1026,10 @@ test("messages select one open question and reject stale or ambiguous answers", 
 test("a reconciliation error does not prevent quit from stopping children", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
 	await f.runtime.start({ reason: "new" });
 	assert.ok(f.runtime.deliverer);
 	f.runtime.deliverer.reconcile = () => {
@@ -970,7 +1049,10 @@ test("a reconciliation error does not prevent quit from stopping children", asyn
 test("quit owns an in-flight finalization and keeps its crashed result", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ status: 2 }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ status: 2, session: run.spec.launch.childSessionFile }),
+	);
 	let release!: () => void;
 	let captured!: () => void;
 	const atCapture = new Promise<void>((resolve) => {
@@ -1074,6 +1156,31 @@ test("dead-owner recovery retains acknowledged runs until pane cleanup succeeds"
 		false,
 	);
 });
+test("an acknowledged result still reports a later pane identity mismatch", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	const execute = f.deps.tmux.run;
+	f.deps.tmux.run = async () => {
+		throw new Error("cleanup denied");
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	await f.runtime.tick();
+	assert.equal(existsSync(join(run.runDir, "delivery-ack.json")), true);
+	f.deps.tmux.run = execute;
+	present(f.panes.get(run.pane.paneId)).pid++;
+	await f.runtime.tick();
+	assert.equal(
+		f.commands.some((args) => args[0] === "kill-pane"),
+		false,
+	);
+	assert.equal(existsSync(run.runDir), true);
+	assert.equal(f.sent.length, 1);
+	assert.ok(
+		f.notifications.some((message) => message.includes("identity mismatch")),
+	);
+});
+
 test("quit completes retained pane cleanup without another result or notice", async (t) => {
 	const f = fixture(t, { disk: true });
 	const run = f.prepare("worker-1");
@@ -1128,7 +1235,10 @@ test("quit closes an interrupted capture pane or retains its finalized result on
 	for (const fail of [false, true]) {
 		const f = fixture(t);
 		const run = f.prepare("worker-1");
-		f.panes.set(run.pane.paneId, dead({ status: 2 }));
+		f.panes.set(
+			run.pane.paneId,
+			dead({ status: 2, session: run.spec.launch.childSessionFile }),
+		);
 		const gate = Promise.withResolvers<void>();
 		const capture = Promise.withResolvers<void>();
 		f.deps.tmux.capture = async () => {
@@ -1162,7 +1272,7 @@ test("quit closes an interrupted capture pane or retains its finalized result on
 		}
 	}
 });
-test("quit reports a failed pane snapshot and still cleans known panes independently", async (t) => {
+test("quit retains every run when its pane snapshot fails", async (t) => {
 	const f = fixture(t);
 	const stopped = f.prepare("stopped");
 	const retained = f.prepare("retained");
@@ -1171,7 +1281,12 @@ test("quit reports a failed pane snapshot and still cleans known panes independe
 		f.living.add(run.pane.process.pid);
 		f.panes.set(
 			run.pane.paneId,
-			dead({ paneId: run.pane.paneId, pid: run.pane.process.pid, dead: false }),
+			dead({
+				paneId: run.pane.paneId,
+				pid: run.pane.process.pid,
+				dead: false,
+				session: run.spec.launch.childSessionFile,
+			}),
 		);
 	}
 	await f.runtime.start({ reason: "new" });
@@ -1195,26 +1310,13 @@ test("quit reports a failed pane snapshot and still cleans known panes independe
 		return "";
 	};
 	await f.runtime.onShutdown("quit");
-	assert.deepEqual(
-		attempted.sort(),
-		[stopped.pane.paneId, retained.pane.paneId, finished.pane.paneId].sort(),
-	);
+	assert.deepEqual(attempted, []);
 	assert.deepEqual(signals, []);
 	const records = join(f.deps.runsRoot, "undelivered", "parent");
-	assert.equal(
-		readJsonStrict(UndeliveredRecord, join(records, `${stopped.runId}.json`))
-			.kind,
-		"stopped",
-	);
-	assert.equal(
-		readJsonStrict(UndeliveredRecord, join(records, `${finished.runId}.json`))
-			.kind,
-		"result",
-	);
-	assert.equal(existsSync(stopped.runDir), false);
-	assert.equal(existsSync(finished.runDir), false);
-	assert.equal(existsSync(retained.runDir), true);
-	assert.equal(existsSync(join(records, `${retained.runId}.json`)), false);
+	for (const run of [stopped, retained, finished]) {
+		assert.equal(existsSync(run.runDir), true);
+		assert.equal(existsSync(join(records, `${run.runId}.json`)), false);
+	}
 	assert.ok(
 		f.notifications.some((message) => message.includes("snapshot unavailable")),
 	);
@@ -1223,9 +1325,8 @@ test("quit reports a failed pane snapshot and still cleans known panes independe
 		advice,
 		/Could not list panes during quit: snapshot unavailable/,
 	);
-	assert.match(advice, /Could not close pane %3: cleanup denied/);
-	assert.match(advice, /stopped 1 running subagents: stopped/);
-	assert.match(advice, /It kept 1 result that was not delivered: finished/);
+	assert.match(advice, /Could not close pane %3: Pane identity is unknown/);
+	assert.doesNotMatch(advice, /stopped 1 running subagents|It kept 1 result/);
 	assert.match(advice, /Subagent retained \(pid 223\) is still running/);
 	assert.match(advice, /This session was not saved/);
 	assert.doesNotMatch(advice, /did not stop within 5 s/);
@@ -1253,7 +1354,7 @@ test("an unavailable quit snapshot never becomes missing-pane evidence for signa
 	};
 	await f.runtime.onShutdown("quit");
 	assert.deepEqual(signals, []);
-	assert.deepEqual(attempts, [["kill-pane", "-t", run.pane.paneId]]);
+	assert.deepEqual(attempts, []);
 	assert.equal(existsSync(run.runDir), true);
 	assert.equal(
 		existsSync(
@@ -1266,7 +1367,7 @@ test("an unavailable quit snapshot never becomes missing-pane evidence for signa
 		advice,
 		/Could not list panes during quit: snapshot unavailable/,
 	);
-	assert.match(advice, /Could not close pane %2: pane not found/);
+	assert.match(advice, /Could not close pane %2: Pane identity is unknown/);
 	assert.match(advice, /is still running/);
 	assert.doesNotMatch(advice, /stopped 1|did not stop within 5 s/);
 });
@@ -1355,7 +1456,10 @@ test("the result contains an open question before its stale outbox question is d
 test("dead pane capture and a human-closed child keep final text", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
-	f.panes.set(run.pane.paneId, dead({ status: 7 }));
+	f.panes.set(
+		run.pane.paneId,
+		dead({ status: 7, session: run.spec.launch.childSessionFile }),
+	);
 	await f.runtime.start({ reason: "new" });
 	await f.runtime.tick();
 	assert.equal(run.result().paneTail, "crash tail");
@@ -1398,6 +1502,13 @@ test("concurrent spawn checks tmux once and commits fresh-parent launches", asyn
 					return "tmux 3.4";
 				}
 				if (args[0] === "split-window") return `%${++pane}`;
+				if (args[0] === "set-option") {
+					const id = present(args[3]);
+					const session = present(
+						args[args.indexOf("@pi_subagent_session") + 1],
+					);
+					f.panes.set(id, dead({ paneId: id, pid: 900, session, dead: false }));
+				}
 				if (args[0] === "display-message") return "900";
 				return "";
 			},
@@ -1441,14 +1552,21 @@ test("resume uses the saved launch and appends a resume record", async (t) => {
 		invocation: () => [process.execPath, "/fake/cli.js"],
 		tmux: {
 			...f.deps.tmux,
-			run: async (args) =>
-				args[0] === "-V"
-					? "tmux 3.4"
-					: args[0] === "split-window"
-						? "%99"
-						: args[0] === "display-message"
-							? "333"
-							: "",
+			run: async (args) => {
+				if (args[0] === "-V") return "tmux 3.4";
+				if (args[0] === "split-window") return "%99";
+				if (args[0] === "set-option")
+					f.panes.set(
+						"%99",
+						dead({
+							paneId: "%99",
+							pid: 333,
+							session: run.spec.launch.childSessionFile,
+							dead: false,
+						}),
+					);
+				return args[0] === "display-message" ? "333" : "";
+			},
 		},
 	});
 	t.after(() => runtime.onShutdown("new"));

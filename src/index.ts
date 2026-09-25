@@ -28,6 +28,7 @@ export function defaultDeps(): RuntimeDeps {
 	const agentDir = getAgentDir();
 	return {
 		tmux: {
+			serverIdentity: () => createTmux().serverIdentity(),
 			run: (args) => createTmux().run(args),
 			listPanes: () => createTmux().listPanes(),
 			capture: (pane) => createTmux().capture(pane),

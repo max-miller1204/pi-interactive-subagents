@@ -50,6 +50,10 @@ export async function until(
 	}
 }
 export class FakeTmux implements Tmux {
+	server = { socket: "/fake", process: { pid: 90, start: "server start" } };
+	async serverIdentity() {
+		return structuredClone(this.server);
+	}
 	panes = new Map<string, PaneState>();
 	killedLiveChildren: string[] = [];
 	commands: string[][] = [];

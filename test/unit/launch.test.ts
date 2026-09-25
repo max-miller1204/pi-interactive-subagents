@@ -357,6 +357,12 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			return state.identity ? { pid, start: "child-start" } : null;
 		},
 		tmux: {
+			async serverIdentity() {
+				return {
+					socket: "/socket",
+					process: { pid: 99, start: "server start" },
+				};
+			},
 			async run(args) {
 				calls.push(args);
 				const command = args[0];
@@ -400,7 +406,8 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 							dead: true,
 							status: 1,
 							signal: null,
-							session: "",
+							session: readJsonStrict(RunSpec, join(runDir, "spec.json")).launch
+								.childSessionFile,
 						},
 					],
 				]);
@@ -431,7 +438,7 @@ test("launch transaction prepares private files, preserves focus and commits pan
 	const f = transaction(t);
 	const pending = launchRun(f.plan, f.context);
 	assert.ok(f.names.has("scout-1"));
-	assert.equal(f.calls.length, 1);
+	assert.equal(f.calls.length, 0);
 	const result = await pending;
 	assert.deepEqual(f.calls, [
 		[
@@ -586,16 +593,20 @@ for (const command of [
 					? new RegExp(`${command} failed`)
 					: /Pi replaced the session.*It was not started/,
 			);
-			const killed = cause === "disposed" || command !== "split-window";
+			const killed =
+				command === "select-layout" ||
+				(command === "display-message" && cause === "disposed");
+			const retained =
+				!killed && !(command === "split-window" && cause === "failure");
 			assert.equal(
 				f.calls.some((args) => args[0] === "kill-pane"),
 				killed,
 			);
 			if (killed)
 				assert.deepEqual(f.calls.at(-1), ["select-layout", "-E", "-t", "%8"]);
-			assert.deepEqual(readdirSync(f.ownerDir), []);
-			assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
-			assert.equal(f.names.size, 0);
+			assert.deepEqual(readdirSync(f.ownerDir), retained ? [runId] : []);
+			assert.equal(readdirSync(f.sessions).length, retained ? 2 : 1);
+			assert.equal(f.names.size, retained ? 1 : 0);
 			assert.ok(!f.events.includes("live"));
 			assert.ok(!f.events.includes("registry"));
 		});
@@ -658,7 +669,8 @@ for (const failure of [
 						dead: false,
 						status: null,
 						signal: null,
-						session: "",
+						session: readJsonStrict(RunSpec, join(f.runDir, "spec.json")).launch
+							.childSessionFile,
 					},
 				],
 			]);
@@ -684,7 +696,7 @@ for (const failure of [
 			const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
 			assert.equal(existsSync(spec.launch.childSessionFile), true);
 			assert.equal(f.names.has(f.plan.launch.name), true);
-			if (failure === "unknown-pid")
+			if (failure === "unknown-pid" || failure === "before-pid")
 				assert.equal(existsSync(join(f.runDir, "pane.json")), false);
 			else
 				assert.deepEqual(
@@ -693,6 +705,7 @@ for (const failure of [
 						v: 1,
 						paneId: "%9",
 						process: identity,
+						server: await f.context.tmux.serverIdentity(),
 					},
 				);
 			await assert.rejects(launchRun(f.plan, f.context), /already reserved/);
@@ -700,13 +713,87 @@ for (const failure of [
 	});
 }
 
+test("unverified pre-PID rollback retains files, session and reserved name", async (t) => {
+	const f = transaction(t);
+	f.state.fail = "display-message";
+	await assert.rejects(launchRun(f.plan, f.context), (error: unknown) => {
+		assert.ok(error instanceof Error);
+		assert.match(error.message, /identity.*unknown|unknown.*identity/);
+		assert.ok(error.message.includes(f.runDir));
+		return true;
+	});
+	assert.equal(
+		f.calls.some((args) => args[0] === "kill-pane"),
+		false,
+	);
+	assert.equal(existsSync(f.runDir), true);
+	const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
+	assert.equal(existsSync(spec.launch.childSessionFile), true);
+	assert.equal(f.names.has(f.plan.launch.name), true);
+});
+
+for (const mismatch of ["pid", "session", "server", "unknown"] as const)
+	test(`verified launch rollback retains a pane after ${mismatch} identity changes`, async (t) => {
+		const f = transaction(t);
+		const list = f.context.tmux.listPanes;
+		const server = f.context.tmux.serverIdentity;
+		f.context.appendRegistry = () => {
+			if (mismatch === "server")
+				f.context.tmux.serverIdentity = async () => ({
+					socket: "/socket",
+					process: { pid: 99, start: "restarted server" },
+				});
+			else if (mismatch === "unknown")
+				f.context.tmux.serverIdentity = async () => {
+					throw new Error("server identity unavailable");
+				};
+			else
+				f.context.tmux.listPanes = async () => {
+					const panes = await list();
+					const pane = panes.get("%9");
+					assert.ok(pane);
+					if (mismatch === "pid") pane.pid++;
+					else pane.session = "/unrelated";
+					return panes;
+				};
+			throw new Error("registry failed");
+		};
+		await assert.rejects(
+			launchRun(f.plan, f.context),
+			/registry failed.*identity.*Kept/s,
+		);
+		assert.equal(
+			f.calls.some((args) => args[0] === "kill-pane"),
+			false,
+		);
+		assert.equal(f.names.size, 1);
+		assert.deepEqual(
+			readJsonStrict(PaneFile, join(f.runDir, "pane.json")).server,
+			await server(),
+		);
+		const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
+		assert.equal(existsSync(spec.launch.childSessionFile), true);
+	});
+
+test("verified early rollback checks pane ownership and cleans files", async (t) => {
+	const f = transaction(t, true);
+	f.state.fail = "select-layout";
+	await assert.rejects(launchRun(f.plan, f.context), /select-layout failed/);
+	assert.equal(
+		f.calls.some((args) => args[0] === "kill-pane"),
+		true,
+	);
+	assert.equal(existsSync(f.runDir), false);
+	assert.equal(f.names.size, 0);
+});
+
 test("rollback preserves the primary and kill errors and keeps recovery files", async (t) => {
 	const f = transaction(t);
-	f.state.fail = "set-option";
+	f.state.registryFails = true;
 	f.state.killFails = true;
 	await assert.rejects(launchRun(f.plan, f.context), (error: unknown) => {
 		assert.ok(error instanceof AggregateError);
-		assert.match(error.message, /set-option failed.*kill failed/s);
+		assert.match(error.message, /registry failed.*kill failed/s);
 		assert.equal(error.errors.length, 3);
 		assert.match(error.message, /Kept its name and recovery files/);
 		return true;
@@ -730,10 +817,10 @@ for (const [pane, pid, identity, pattern] of [
 		await assert.rejects(launchRun(f.plan, f.context), pattern);
 		assert.equal(
 			f.calls.some((args) => args[0] === "kill-pane"),
-			pane === "%9",
+			false,
 		);
-		assert.equal(f.names.size, 0);
-		assert.deepEqual(readdirSync(f.ownerDir), []);
+		assert.equal(f.names.size, 1);
+		assert.deepEqual(readdirSync(f.ownerDir), [runId]);
 	});
 }
 
@@ -745,13 +832,13 @@ test("resume keeps its session on rollback and appends a resume record on succes
 		initialPrompt: "Message from the parent agent:\n\nContinue.",
 	};
 	writeFileSync(f.plan.launch.childSessionFile, "existing session");
-	f.state.fail = "set-option";
-	await assert.rejects(launchRun(f.plan, f.context), /set-option failed/);
+	f.state.registryFails = true;
+	await assert.rejects(launchRun(f.plan, f.context), /registry failed/);
 	assert.equal(
 		readFileSync(f.plan.launch.childSessionFile, "utf8"),
 		"existing session",
 	);
-	f.state.fail = "";
+	f.state.registryFails = false;
 	const result = await launchRun(f.plan, f.context);
 	assert.equal(
 		result.spec.launch.childSessionFile,
@@ -1060,7 +1147,7 @@ test("trust is recomputed for each launch, including resume", async (t) => {
 	writeFileSync(f.plan.launch.childSessionFile, "existing");
 	let trust = true;
 	f.context.trusted = () => trust;
-	f.state.fail = "set-option";
+	f.state.registryFails = true;
 	const run = f.context.tmux.run;
 	f.context.tmux.run = async (args) => {
 		if (args[0] === "split-window") {
@@ -1069,8 +1156,8 @@ test("trust is recomputed for each launch, including resume", async (t) => {
 		}
 		return run(args);
 	};
-	await assert.rejects(launchRun(f.plan, f.context), /set-option failed/);
+	await assert.rejects(launchRun(f.plan, f.context), /registry failed/);
 	trust = false;
-	f.state.fail = "";
+	f.state.registryFails = false;
 	await launchRun(f.plan, f.context);
 });

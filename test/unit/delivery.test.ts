@@ -252,6 +252,51 @@ test("three ready messages at idle start one turn and draft the remaining two in
 	}
 });
 
+test("an active waiter answer passes blocked messages without confirming before its durable tool result", () => {
+	const f = fixture();
+	try {
+		f.deliverer.onAgentStart();
+		f.setIdle(false);
+		for (const id of ["first", "answer", "last"]) f.add(id);
+		const build = f.source.build;
+		const answers: string[] = [];
+		f.source.build = (item) =>
+			item.id.endsWith(":answer")
+				? {
+						kind: "answer",
+						text: "decision",
+						resolve: (id) => {
+							answers.push(id);
+						},
+					}
+				: build(item);
+		f.deliverer.pump();
+		f.deliverer.pump();
+		assert.deepEqual(answers, ["run:outbox:answer"]);
+		assert.deepEqual(f.sent, []);
+		assert.deepEqual(f.confirmed, []);
+		f.entries.push({
+			type: "message",
+			message: { role: "toolResult", details: { deliveryId: answers[0] } },
+		});
+		f.deliverer.reconcile();
+		assert.deepEqual(f.confirmed, []);
+		writeFileSync(f.sessionFile, "session header\n");
+		f.deliverer.reconcile();
+		assert.deepEqual(f.confirmed, answers);
+		const boundary = f.deliverer.onBoundary(completed);
+		assert.deepEqual(
+			boundary?.entries?.map((entry) =>
+				entry.type === "custom_message" ? entry.details : undefined,
+			),
+			[{ deliveryId: "run:outbox:first" }, { deliveryId: "run:outbox:last" }],
+		);
+		assert.equal(f.deliverer.onBoundary(completed), undefined);
+	} finally {
+		f.cleanup();
+	}
+});
+
 test("a completed boundary with only quiet drafts does not continue", () => {
 	const f = fixture();
 	try {

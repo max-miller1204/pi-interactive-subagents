@@ -29,6 +29,40 @@ test("socket is the first field of TMUX and rejects missing sockets", () => {
 	);
 });
 
+test("server identity uses the actual server pid and start, not a reused socket", async () => {
+	let start = "original start";
+	const calls: string[][] = [];
+	const tmux = createTmux(
+		"/socket",
+		async (_file, args) => {
+			calls.push(args);
+			return { stdout: "123\n", stderr: "" };
+		},
+		(pid) => ({ pid, start }),
+	);
+	const saved = await tmux.serverIdentity();
+	assert.deepEqual(saved, { socket: "/socket", process: { pid: 123, start } });
+	start = "restarted server";
+	assert.notDeepEqual(await tmux.serverIdentity(), saved);
+	assert.deepEqual(calls[0], [
+		"-S",
+		"/socket",
+		"display-message",
+		"-p",
+		"#{pid}",
+	]);
+});
+
+for (const output of ["", "0", "abc", "9007199254740992", "123"])
+	test(`unknown tmux server identity fails loudly: ${JSON.stringify(output)}`, async () => {
+		const tmux = createTmux(
+			"/socket",
+			async () => ({ stdout: output, stderr: "" }),
+			() => null,
+		);
+		await assert.rejects(tmux.serverIdentity(), /server/);
+	});
+
 test("each command uses the isolated socket and capture is diagnostics text", async () => {
 	const calls: string[][] = [];
 	const tmux = fake("human text\n", calls);

@@ -16,6 +16,7 @@ import {
 	ChildStatus,
 	Fatal,
 	OpenQuestion,
+	ParentMessageDetails,
 	parseStrict,
 	RunSpec,
 	readJsonStrict,
@@ -311,11 +312,16 @@ class ChildRole {
 							message.kind === "answer"
 								? `Answer from the parent agent to question ${message.qid}, which you withdrew:\n\n${message.text}`
 								: `Message from the parent agent:\n\n${message.text}`,
-						details: {
-							deliveryId: item.id,
-							kind: message.kind,
-							...(message.kind === "answer" ? { qid: message.qid } : {}),
-						},
+						details: parseStrict(
+							ParentMessageDetails,
+							{
+								deliveryId: item.id,
+								kind: message.kind,
+								text: message.text,
+								...(message.kind === "answer" ? { qid: message.qid } : {}),
+							},
+							"parent message details",
+						),
 					},
 				};
 			},

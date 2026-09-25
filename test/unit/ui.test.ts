@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	MessageRenderer,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
@@ -264,6 +265,59 @@ test("closed human results show success while auto-exit closure remains a warnin
 	);
 	assert.doesNotMatch(resultContent(noText), /by a human/);
 });
+
+for (const kind of ["message", "answer"] as const)
+	test(`parent ${kind} renderer shows strict instruction details when expanded`, () => {
+		const renderers = new Map<string, MessageRenderer>();
+		registerRenderers({
+			registerMessageRenderer: (name: string, fn: MessageRenderer) =>
+				renderers.set(name, fn),
+		} as unknown as ExtensionAPI);
+		const render = renderers.get("subagent_parent_message");
+		assert.ok(render);
+		const theme = { fg: (_color: string, text: string) => text } as Theme;
+		const message = {
+			role: "custom" as const,
+			customType: "subagent_parent_message",
+			content: "DO NOT PARSE CONTENT",
+			display: true,
+			timestamp: 0,
+		};
+		const details = {
+			deliveryId: "run:inbox:1",
+			kind,
+			text: "Read the required file.\nKeep this instruction.",
+			...(kind === "answer" ? { qid: "q-abcdef12" } : {}),
+		};
+		for (const expanded of [false, true]) {
+			const component = render(
+				{ ...message, details },
+				{ expanded, outputPad: 0 },
+				theme,
+			);
+			assert.ok(component);
+			const output = component.render(100).join("\n");
+			assert.match(output, new RegExp(`Parent message: ${kind}`));
+			assert.doesNotMatch(output, /DO NOT PARSE CONTENT/);
+			if (expanded)
+				assert.match(
+					output,
+					/Read the required file\.\s+Keep this instruction\./,
+				);
+			else assert.doesNotMatch(output, /Read the required file/);
+		}
+		const { text: _text, ...oldDetails } = details;
+		for (const expanded of [false, true])
+			assert.throws(
+				() =>
+					render(
+						{ ...message, details: oldDetails },
+						{ expanded, outputPad: 0 },
+						theme,
+					),
+				/parent message details/,
+			);
+	});
 
 test("message renderers use details and reveal extended result fields", () => {
 	const renderers = new Map<string, any>();

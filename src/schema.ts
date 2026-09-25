@@ -117,10 +117,15 @@ export const RunSpec = Obj({
 	initialPrompt: Type.String({ minLength: 1 }),
 	launch: Launch,
 });
+export const TmuxServerIdentity = Obj({
+	socket: AbsPath,
+	process: ProcessIdentity,
+});
 export const PaneFile = Obj({
 	v: Type.Literal(1),
 	paneId: Type.String({ pattern: "^%[0-9]+$" }),
 	process: ProcessIdentity,
+	server: TmuxServerIdentity,
 });
 export const InboxItem = Type.Union([
 	Obj({
@@ -130,6 +135,19 @@ export const InboxItem = Type.Union([
 	}),
 	Obj({
 		v: Type.Literal(1),
+		kind: Type.Literal("answer"),
+		qid: Qid,
+		text: Type.String({ minLength: 1 }),
+	}),
+]);
+export const ParentMessageDetails = Type.Union([
+	Obj({
+		deliveryId: Type.String({ minLength: 1 }),
+		kind: Type.Literal("message"),
+		text: Type.String({ minLength: 1 }),
+	}),
+	Obj({
+		deliveryId: Type.String({ minLength: 1 }),
 		kind: Type.Literal("answer"),
 		qid: Qid,
 		text: Type.String({ minLength: 1 }),
@@ -310,7 +328,9 @@ export type LaunchDraft = Static<typeof LaunchDraft>;
 export type Launch = Static<typeof Launch>;
 export type RunSpec = Static<typeof RunSpec>;
 export type PaneFile = Static<typeof PaneFile>;
+export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;
+export type ParentMessageDetails = Static<typeof ParentMessageDetails>;
 export type OutboxItem = Static<typeof OutboxItem>;
 export type OpenQuestion = Static<typeof OpenQuestion>;
 export type ChildStatus = Static<typeof ChildStatus>;

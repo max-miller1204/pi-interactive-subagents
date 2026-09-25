@@ -11,7 +11,12 @@ import {
 } from "@earendil-works/pi-tui";
 import type { Deliverer } from "./delivery.ts";
 import type { Runtime } from "./parent.ts";
-import type { ChildStatus, ResultDetails } from "./schema.ts";
+import {
+	type ChildStatus,
+	ParentMessageDetails,
+	parseStrict,
+	type ResultDetails,
+} from "./schema.ts";
 
 export function formatDuration(ms: number): string {
 	const seconds = Math.max(0, Math.floor(ms / 1000));
@@ -265,13 +270,17 @@ export function registerRenderers(
 	);
 	pi.registerMessageRenderer(
 		"subagent_parent_message",
-		(message, _options, theme) => {
-			const d = detailsOf<{ kind: string; qid?: string }>(message.details);
+		(message, { expanded }, theme) => {
+			const d = parseStrict(
+				ParentMessageDetails,
+				message.details,
+				"parent message details",
+			);
 			return new Text(
 				theme.fg(
 					"accent",
-					`Parent message: ${d.kind}${d.qid ? ` ${d.qid}` : ""}`,
-				),
+					`Parent message: ${d.kind}${d.kind === "answer" ? ` ${d.qid}` : ""}`,
+				) + (expanded ? `\n${d.text}` : ""),
 				0,
 				0,
 			);

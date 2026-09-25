@@ -13,6 +13,29 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import * as schemas from "../../src/schema.ts";
 
+test("pane files require strict server provenance without a legacy route", () => {
+	const pane = {
+		v: 1,
+		paneId: "%2",
+		process: { pid: 123, start: "child" },
+		server: { socket: "/socket", process: { pid: 99, start: "server" } },
+	};
+	assert.deepEqual(
+		schemas.parseStrict(schemas.PaneFile, pane, "pane.json"),
+		pane,
+	);
+	const { server: _server, ...legacy } = pane;
+	for (const value of [
+		legacy,
+		{ ...pane, server: { socket: "/socket" } },
+		{ ...pane, server: { ...pane.server, extra: true } },
+	])
+		assert.throws(
+			() => schemas.parseStrict(schemas.PaneFile, value, "pane.json"),
+			/pane.json/,
+		);
+});
+
 test("result details require the auto-exit provenance flag", () => {
 	assert.ok("autoExit" in schemas.ResultDetails.properties);
 	const flag = schemas.ResultDetails.properties.autoExit;

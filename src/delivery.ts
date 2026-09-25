@@ -149,7 +149,9 @@ export class Deliverer {
 					out.resolve(item.id, out.text);
 					continue;
 				}
-				if (mode !== "idle" || started) break;
+				// A waiting tool must receive its answer before this run can reach a boundary.
+				// Keep ordinary messages queued in order while scanning for active waiters.
+				if (mode !== "idle" || started) continue;
 				for (const draft of source.prelude?.(item) ?? [])
 					this.pi.appendEntry(draft.customType, draft.data);
 				this.offered.add(item.id);

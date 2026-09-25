@@ -5,6 +5,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import { setImmediate as nextImmediate } from "node:timers/promises";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { checkPiVersion, createSubagentsExtension } from "../../src/index.ts";
+import { processIdentity } from "../../src/process.ts";
 import * as queue from "../../src/queue.ts";
 import {
 	Fatal,
@@ -62,6 +64,7 @@ const prepareRun: NonNullable<
 		v: 1,
 		paneId: "%2",
 		process: { pid: 999999, start: "fixture" },
+		server: structuredClone(tmux.server),
 	});
 	const child = SessionManager.open(spec.launch.childSessionFile);
 	child.appendCustomEntry("subagent_child", {
@@ -87,6 +90,54 @@ const prepareRun: NonNullable<
 		session: spec.launch.childSessionFile,
 	});
 };
+
+for (const identity of [
+	"matching",
+	"pid",
+	"session",
+	"server",
+	"unknown",
+] as const)
+	test(`SDK dead-owner recovery checks ${identity} identity before cleanup`, async (t) => {
+		let retained = "";
+		const h = await createRuntimeHarness(t, {
+			identity: (pid) => (pid === 999998 ? null : processIdentity(pid)),
+			prepare: (context) => {
+				prepareRun(context);
+				const ownerDir = join(
+					context.runDir,
+					"..",
+					"..",
+					`999998-${"a".repeat(64)}`,
+				);
+				mkdirSync(ownerDir, { recursive: true });
+				retained = join(ownerDir, context.spec.runId);
+				renameSync(context.runDir, retained);
+				const pane = context.tmux.panes.get("%2");
+				assert.ok(pane);
+				if (identity === "pid") pane.pid = 123456;
+				if (identity === "session") pane.session = "/unrelated-session";
+				if (identity === "server")
+					context.tmux.server.process.start = "restarted server";
+				if (identity === "unknown")
+					context.tmux.serverIdentity = async () => {
+						throw new Error("server identity unavailable");
+					};
+			},
+		});
+		const matching = identity === "matching";
+		assert.equal(
+			h.tmux.commands.some((args) => args[0] === "kill-pane"),
+			matching,
+		);
+		assert.equal(existsSync(join(retained, "pane.json")), !matching);
+		assert.equal(existsSync(join(retained, "spec.json")), !matching);
+		assert.equal(existsSync(h.spec.launch.childSessionFile), true);
+		if (!matching)
+			assert.ok(
+				h.notices.some((notice) => notice.message.includes("identity")),
+			);
+	});
 
 test("factory rejects unsupported Pi versions", () => {
 	for (const version of ["1.87.1", "0.86.9", "0.88.0"])
@@ -449,6 +500,72 @@ test("two parallel questions receive answers by id with durable delivery ids", {
 	assert.equal(h.shutdowns, 1);
 });
 
+test("an inbox instruction queued before a question cannot block its later answer", {
+	timeout: 5000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t, { child: true });
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	h.faux.setResponses([
+		async () => {
+			entered.resolve();
+			await release.promise;
+			return fauxAssistantMessage(
+				{
+					type: "toolCall",
+					id: "blocked",
+					name: "ask_question",
+					arguments: { question: "Which file?" },
+				},
+				{ stopReason: "toolUse" },
+			);
+		},
+		fauxAssistantMessage("Instruction and answer read."),
+	]);
+	const prompt = h.session.prompt(h.spec.initialPrompt);
+	await entered.promise;
+	const instruction = inbox(h, "Keep the earlier instruction");
+	release.resolve();
+	await until(() => questions(h).length === 1, "Question did not open.");
+	const question = questions(h)[0];
+	assert.ok(question);
+	const seq = answer(h, question.qid, "README.md");
+	await prompt;
+	h.assertNoErrors();
+	const results = h.session.messages.filter(
+		(message) => message.role === "toolResult",
+	);
+	assert.equal(results.length, 1);
+	assert.deepEqual(results[0]?.details, {
+		deliveryId: queue.itemId(h.spec.runId, "inbox", seq),
+		qid: question.qid,
+	});
+	const messages = h.messages("subagent_parent_message");
+	assert.equal(messages.length, 1);
+	const instructionMessage = messages[0];
+	assert.ok(instructionMessage?.type === "custom_message");
+	assert.deepEqual(instructionMessage.details, {
+		deliveryId: queue.itemId(h.spec.runId, "inbox", instruction),
+		kind: "message",
+		text: "Keep the earlier instruction",
+	});
+	assert.equal(queue.count(join(h.runDir, "inbox")), 0);
+	const persisted = SessionManager.open(h.spec.launch.childSessionFile)
+		.getEntries()
+		.filter(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "subagent_parent_message",
+		);
+	assert.deepEqual(persisted, messages);
+	assert.match(
+		readFileSync(h.spec.launch.childSessionFile, "utf8"),
+		/README.md/,
+	);
+	assert.deepEqual(h.session.getSteeringMessages(), []);
+	assert.deepEqual(h.session.getFollowUpMessages(), []);
+});
+
 for (const answered of [true, false])
 	test(`${answered ? "answer then abort" : "abort then answer"} closes a question once`, {
 		timeout: 20_000,
@@ -495,9 +612,27 @@ for (const answered of [true, false])
 		);
 		if (!answered) {
 			h.faux.setResponses([fauxAssistantMessage("Late answer read.")]);
-			answer(h, question.qid, "Late README.md");
+			const seq = answer(h, question.qid, "Late README.md");
 			await idle(h, 2);
 			assert.equal(h.messages("subagent_parent_message").length, 1);
+			const lateAnswer = h.messages("subagent_parent_message")[0];
+			assert.ok(lateAnswer?.type === "custom_message");
+			assert.deepEqual(lateAnswer.details, {
+				deliveryId: queue.itemId(h.spec.runId, "inbox", seq),
+				kind: "answer",
+				qid: question.qid,
+				text: "Late README.md",
+			});
+			assert.deepEqual(
+				SessionManager.open(h.spec.launch.childSessionFile)
+					.getEntries()
+					.filter(
+						(entry) =>
+							entry.type === "custom_message" &&
+							entry.customType === "subagent_parent_message",
+					),
+				h.messages("subagent_parent_message"),
+			);
 			assert.match(
 				JSON.stringify(h.messages("subagent_parent_message")),
 				/which you withdrew/,
@@ -610,6 +745,7 @@ for (const starts of [2, 3])
 		writeJsonAtomic(join(deadDir, "pane.json"), {
 			v: 1,
 			paneId: "%2",
+			server: structuredClone(h.tmux.server),
 			process: { pid: 999999, start: "dead" },
 		});
 		const entered = Promise.withResolvers<void>();
@@ -691,6 +827,7 @@ test("a prompt settled during suspended recovery does not block ready notices", 
 	writeJsonAtomic(join(deadDir, "pane.json"), {
 		v: 1,
 		paneId: "%3",
+		server: structuredClone(h.tmux.server),
 		process: { pid: 999999, start: "dead" },
 	});
 	const noticeDir = join(
@@ -771,6 +908,7 @@ test("same factory retries recovery after a rejected suspended startup", {
 	writeJsonAtomic(join(deadDir, "pane.json"), {
 		v: 1,
 		paneId: "%3",
+		server: structuredClone(h.tmux.server),
 		process: { pid: 999999, start: "dead" },
 	});
 	const entered = Promise.withResolvers<void>();
@@ -829,6 +967,7 @@ for (const killFails of [false, true])
 		writeJsonAtomic(join(deadDir, "pane.json"), {
 			v: 1,
 			paneId: "%3",
+			server: structuredClone(h.tmux.server),
 			process: { pid: 999999, start: "dead" },
 		});
 		const entered = Promise.withResolvers<void>();
@@ -936,6 +1075,7 @@ test("failed parent startup reconciles a durable result before quit cleanup", {
 	writeJsonAtomic(join(deadDir, "pane.json"), {
 		v: 1,
 		paneId: "%3",
+		server: structuredClone(h.tmux.server),
 		process: { pid: 999999, start: "dead" },
 	});
 	const entered = Promise.withResolvers<void>();

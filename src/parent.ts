@@ -52,7 +52,14 @@ import {
 	persistedIds,
 	readBranch,
 } from "./session-file.ts";
-import { checkTmuxVersion, type PaneState, type Tmux } from "./tmux.ts";
+import {
+	assertPaneIdentity,
+	assertServerIdentity,
+	checkTmuxVersion,
+	type PaneState,
+	type Tmux,
+	verifiedPane,
+} from "./tmux.ts";
 
 export function classifyResult(evidence: {
 	branch: SessionEntry[];
@@ -492,9 +499,17 @@ export class Runtime {
 			await this.deps.tmux.run(["select-layout", "-E", "-t", target]);
 	}
 	private async closePane(run: ParentRun): Promise<string | undefined> {
-		run.paneCleanup = "pending";
+		run.paneCleanup = "unknown";
 		try {
-			await this.deps.tmux.run(["kill-pane", "-t", run.pane.paneId]);
+			const pane = await verifiedPane(
+				this.deps.tmux,
+				run.pane,
+				run.spec.launch.childSessionFile,
+			);
+			if (pane !== undefined) {
+				run.paneCleanup = "pending";
+				await this.deps.tmux.run(["kill-pane", "-t", run.pane.paneId]);
+			}
 		} catch (error) {
 			this.notify(error);
 			return errorText(error);
@@ -533,13 +548,18 @@ export class Runtime {
 	}
 	private async tickOnce(): Promise<void> {
 		try {
+			for (const run of this.runs.values()) run.paneCleanup = "unknown";
+			const server = await this.deps.tmux.serverIdentity();
 			const panes = await this.deps.tmux.listPanes();
+			assertServerIdentity(server, await this.deps.tmux.serverIdentity());
 			if (this.disposed) return;
 			for (const run of [...this.runs.values()].sort(
 				(a, b) => a.spec.startedAt - b.spec.startedAt,
 			)) {
 				try {
+					assertServerIdentity(run.pane.server, server);
 					const pane = panes.get(run.pane.paneId);
+					assertPaneIdentity(run.pane, run.spec.launch.childSessionFile, pane);
 					run.paneCleanup = pane === undefined ? "complete" : "pending";
 					if (this.acknowledged(run)) {
 						if (pane !== undefined) await this.closePane(run);
@@ -571,6 +591,7 @@ export class Runtime {
 						if (this.disposed) return;
 					}
 				} catch (error) {
+					this.notify(error);
 					this.finalizeFailed(run, error);
 				}
 			}
@@ -994,7 +1015,6 @@ export class Runtime {
 		if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
 	}
 	private async recoverDeadOwners(): Promise<void> {
-		let panes: Map<string, PaneState> | undefined;
 		const owners = join(this.runsRoot, "owners");
 		for (const name of readdirSync(owners)
 			.filter((name) => !name.startsWith("."))
@@ -1017,12 +1037,15 @@ export class Runtime {
 					if (spec.runId !== id)
 						throw new Error(`Run identity does not match ${runDir}.`);
 					if (this.alive(pane.process)) continue;
-					panes ??= await this.deps.tmux.listPanes();
+					const current = await verifiedPane(
+						this.deps.tmux,
+						pane,
+						spec.launch.childSessionFile,
+					);
 					if (this.disposed) return;
-					if (panes.has(pane.paneId)) {
+					if (current !== undefined) {
 						await this.deps.tmux.run(["kill-pane", "-t", pane.paneId]);
 						if (this.disposed) return;
-						panes.delete(pane.paneId);
 					}
 					if (this.acknowledged({ runDir, spec, pane })) {
 						rmSync(runDir, { recursive: true });
@@ -1157,10 +1180,15 @@ export class Runtime {
 		const killFailed = new Set<ParentRun>();
 		const errors: string[] = [];
 		let panes: Map<string, PaneState> | undefined;
+		let server: PaneFile["server"] | undefined;
 		if (runs.length) {
 			try {
+				server = await this.deps.tmux.serverIdentity();
 				panes = await this.deps.tmux.listPanes();
+				assertServerIdentity(server, await this.deps.tmux.serverIdentity());
 			} catch (error) {
+				panes = undefined;
+				server = undefined;
 				const message = `Could not list panes during quit: ${errorText(error)}.`;
 				errors.push(message);
 				this.notify(message);
@@ -1169,14 +1197,19 @@ export class Runtime {
 		for (const run of runs) {
 			let missingPaneProcess = false;
 			try {
+				run.paneCleanup = "unknown";
+				if (panes === undefined || server === undefined)
+					throw new Error(
+						`Pane identity is unknown. Kept recovery files in ${run.runDir}.`,
+					);
+				assertServerIdentity(run.pane.server, server);
+				assertPaneIdentity(
+					run.pane,
+					run.spec.launch.childSessionFile,
+					panes.get(run.pane.paneId),
+				);
 				const live = this.alive(run.pane.process);
-				// An unavailable snapshot proves neither pane absence nor cleanup.
-				run.paneCleanup =
-					panes === undefined
-						? "unknown"
-						: panes.has(run.pane.paneId)
-							? "pending"
-							: "complete";
+				run.paneCleanup = panes.has(run.pane.paneId) ? "pending" : "complete";
 				missingPaneProcess =
 					live && panes !== undefined && run.paneCleanup === "complete";
 				if (missingPaneProcess) {

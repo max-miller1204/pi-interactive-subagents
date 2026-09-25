@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { processIdentity } from "./process.ts";
+import { type PaneFile, parseStrict, TmuxServerIdentity } from "./schema.ts";
 
 export type PaneState = {
 	paneId: string;
@@ -10,6 +12,7 @@ export type PaneState = {
 };
 
 export interface Tmux {
+	serverIdentity(): Promise<TmuxServerIdentity>;
 	run(args: string[]): Promise<string>;
 	listPanes(): Promise<Map<string, PaneState>>;
 	capture(paneId: string): Promise<string>;
@@ -76,9 +79,24 @@ function parsePane(line: string): PaneState {
 export function createTmux(
 	socket: string = tmuxSocket(),
 	execute: TmuxExec = exec,
+	identify: typeof processIdentity = processIdentity,
 ): Tmux {
 	if (!socket) throw new Error("Subagents need Pi to run inside tmux.");
 	return {
+		async serverIdentity() {
+			const text = (await this.run(["display-message", "-p", "#{pid}"])).trim();
+			const pid = Number(text);
+			if (!/^[1-9][0-9]*$/.test(text) || !Number.isSafeInteger(pid))
+				throw new Error(`Invalid tmux server pid: ${JSON.stringify(text)}.`);
+			const process = identify(pid);
+			if (process === null || process.pid !== pid)
+				throw new Error(`Cannot identify tmux server process ${pid}.`);
+			return parseStrict(
+				TmuxServerIdentity,
+				{ socket, process },
+				"tmux server identity",
+			);
+		},
 		async run(args) {
 			if (args.length === 0) throw new Error("A tmux command is required.");
 			try {
@@ -127,6 +145,48 @@ export function createTmux(
 			return this.run(["capture-pane", "-p", "-J", "-S", "-40", "-t", paneId]);
 		},
 	};
+}
+
+export function assertServerIdentity(
+	saved: TmuxServerIdentity,
+	current: TmuxServerIdentity,
+): void {
+	if (
+		saved.socket !== current.socket ||
+		saved.process.pid !== current.process.pid ||
+		saved.process.start !== current.process.start
+	)
+		throw new Error(
+			`Tmux server identity mismatch for ${saved.socket}. Keep the recovery files and inspect the original server.`,
+		);
+}
+
+export function assertPaneIdentity(
+	saved: PaneFile,
+	session: string,
+	current: PaneState | undefined,
+): void {
+	if (
+		current !== undefined &&
+		(current.paneId !== saved.paneId ||
+			current.pid !== saved.process.pid ||
+			current.session !== session)
+	)
+		throw new Error(
+			`Tmux pane ${saved.paneId} identity mismatch. Keep the recovery files and inspect the pane.`,
+		);
+}
+
+export async function verifiedPane(
+	tmux: Tmux,
+	saved: PaneFile,
+	session: string,
+): Promise<PaneState | undefined> {
+	assertServerIdentity(saved.server, await tmux.serverIdentity());
+	const pane = (await tmux.listPanes()).get(saved.paneId);
+	assertServerIdentity(saved.server, await tmux.serverIdentity());
+	assertPaneIdentity(saved, session, pane);
+	return pane;
 }
 
 export async function checkTmuxVersion(tmux: Tmux): Promise<void> {

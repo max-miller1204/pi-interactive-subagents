@@ -19,10 +19,11 @@ import {
 	parseStrict,
 	RegistryRecord,
 	RunSpec,
+	readJsonStrict,
 	writeJsonAtomic,
 } from "./schema.ts";
 import { parentSessionPath, writeChildSession } from "./session-file.ts";
-import type { Tmux } from "./tmux.ts";
+import { type Tmux, verifiedPane } from "./tmux.ts";
 
 export function piInvocation(
 	parent: Pick<NodeJS.Process, "argv" | "execPath" | "execArgv"> = process,
@@ -254,8 +255,8 @@ export async function launchRun(
 	let runDir: string | undefined;
 	let newSession: string | undefined;
 	let paneId: string | undefined;
-	let childMayHaveStarted = false;
-	let childProcess: ProcessIdentity | null | undefined;
+	let paneCreated = false;
+	let savedPane: PaneFile | undefined;
 	const identify = context.identity ?? processIdentity;
 	try {
 		checkDisposed(context, name);
@@ -364,6 +365,8 @@ export async function launchRun(
 			}),
 			{ flag: "wx", mode: 0o700 },
 		);
+		const server = await context.tmux.serverIdentity();
+		checkDisposed(context, name);
 		const paneOutput = (
 			await context.tmux.run([
 				"split-window",
@@ -377,11 +380,11 @@ export async function launchRun(
 				"",
 			])
 		).trim();
+		paneCreated = true;
 		if (/^%[0-9]+$/.test(paneOutput)) paneId = paneOutput;
 		checkDisposed(context, name);
 		if (paneId === undefined)
 			throw new Error(`Invalid tmux pane id: ${JSON.stringify(paneOutput)}.`);
-		childMayHaveStarted = true;
 		await context.tmux.run([
 			"set-option",
 			"-p",
@@ -429,23 +432,29 @@ export async function launchRun(
 				"#{pane_pid}",
 			])
 		).trim();
-		checkDisposed(context, name);
 		const pid = Number(pidText);
 		if (!/^[1-9][0-9]*$/.test(pidText) || !Number.isSafeInteger(pid))
 			throw new Error(`Invalid tmux pane pid: ${JSON.stringify(pidText)}.`);
 		const identity = identify(pid);
-		if (identity === null) {
-			childProcess = null;
+		if (identity === null)
 			throw new Error(`Subagent "${name}" exited before it could start.`);
-		}
 		const pane = parseStrict(
 			PaneFile,
-			{ v: 1, paneId, process: identity },
+			{ v: 1, paneId, process: identity, server },
 			"pane file",
 		);
 		if (identity.pid !== pid)
 			throw new Error(`Process identity does not match pane pid ${pid}.`);
-		childProcess = pane.process;
+		savedPane = pane;
+		checkDisposed(context, name);
+		if (
+			(await verifiedPane(context.tmux, pane, launch.childSessionFile)) ===
+			undefined
+		)
+			throw new Error(
+				`Subagent pane ${paneId} disappeared before launch completed.`,
+			);
+		checkDisposed(context, name);
 		if (target !== undefined) {
 			await context.tmux.run(["select-layout", "-E", "-t", paneId]);
 			checkDisposed(context, name);
@@ -466,42 +475,30 @@ export async function launchRun(
 		return result;
 	} catch (error) {
 		const errors: unknown[] = [error];
-		let safeToRemove = paneId === undefined;
+		let safeToRemove = !paneCreated;
+		if (paneCreated && paneId === undefined)
+			errors.push(
+				new Error(
+					`The new pane identity is unknown. Kept its name and recovery files in ${runDir}. Inspect the tmux server before manual cleanup.`,
+				),
+			);
 		if (paneId !== undefined) {
-			// A failed respawn command can still have started the child.
-			// Read its identity before killing the pane removes that evidence.
-			if (childMayHaveStarted && childProcess === undefined) {
-				try {
-					const state = (await context.tmux.listPanes()).get(paneId);
-					if (state === undefined)
-						throw new Error(
-							`Cannot identify the child of missing pane ${paneId}.`,
-						);
-					const identity = state.dead ? null : identify(state.pid);
-					if (identity !== null) {
-						parseStrict(
-							PaneFile,
-							{ v: 1, paneId, process: identity },
-							"rollback pane",
-						);
-						if (identity.pid !== state.pid)
-							throw new Error(
-								`Process identity does not match pane pid ${state.pid}.`,
-							);
-					}
-					childProcess = identity;
-				} catch (cleanupError) {
-					errors.push(cleanupError);
-				}
-			}
 			try {
-				await context.tmux.run(["kill-pane", "-t", paneId]);
-				if (!childMayHaveStarted || childProcess === null) safeToRemove = true;
-				else if (childProcess !== undefined) {
-					const current = identify(childProcess.pid);
-					safeToRemove =
-						current === null || current.start !== childProcess.start;
-				}
+				if (savedPane === undefined || runDir === undefined)
+					throw new Error(
+						`Pane ${paneId} ownership is unknown because its child process identity was not recorded. Inspect recovery files in ${runDir}.`,
+					);
+				const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
+				const state = await verifiedPane(
+					context.tmux,
+					savedPane,
+					spec.launch.childSessionFile,
+				);
+				if (state !== undefined)
+					await context.tmux.run(["kill-pane", "-t", paneId]);
+				const current = identify(savedPane.process.pid);
+				safeToRemove =
+					current === null || current.start !== savedPane.process.start;
 				// Rollback continues even when the runtime has been disposed.
 				const remaining = context.newestLivePane(paneId);
 				if (remaining !== undefined && remaining !== paneId)
@@ -510,13 +507,9 @@ export async function launchRun(
 				errors.push(cleanupError);
 			}
 			if (!safeToRemove) {
-				if (runDir !== undefined && childProcess != null) {
+				if (runDir !== undefined && savedPane !== undefined) {
 					try {
-						writeJsonAtomic(join(runDir, "pane.json"), {
-							v: 1,
-							paneId,
-							process: childProcess,
-						});
+						writeJsonAtomic(join(runDir, "pane.json"), savedPane);
 					} catch (cleanupError) {
 						errors.push(cleanupError);
 					}
