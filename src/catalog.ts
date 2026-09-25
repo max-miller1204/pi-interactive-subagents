@@ -14,7 +14,7 @@ import {
 import {
 	type AgentDef,
 	Catalog,
-	Launch,
+	LaunchDraft,
 	MAX_DEPTH,
 	type ProfileDef,
 	parseStrict,
@@ -208,11 +208,10 @@ export interface ResolveLaunchOptions {
 	spawnerAllowlist: readonly string[];
 	parentCwd: string;
 	cwd: string;
-	childSessionFile: string;
 	modelInvocation: boolean;
 }
 
-export function resolveLaunch(options: ResolveLaunchOptions): Launch {
+export function resolveLaunch(options: ResolveLaunchOptions): LaunchDraft {
 	const { catalog: input, spawnerDepth, spawnerAllowlist } = options;
 	const catalog = isLive(input) ? input.catalog : input;
 	const agent = getAgent(input, options.agent);
@@ -290,13 +289,12 @@ export function resolveLaunch(options: ResolveLaunchOptions): Launch {
 		throw new Error("A fork subagent runs in the parent's directory.");
 	return structuredClone(
 		parseStrict(
-			Launch,
+			LaunchDraft,
 			{
 				name: options.name,
 				agent: options.agent,
 				profile: options.profile,
 				cwd,
-				childSessionFile: realpathSync(options.childSessionFile),
 				session: agent.session,
 				autoExit: agent.autoExit,
 				model: profile.model,
@@ -314,7 +312,7 @@ export function resolveLaunch(options: ResolveLaunchOptions): Launch {
 				depth,
 				nested,
 			},
-			"Launch",
+			"LaunchDraft",
 		),
 	);
 }

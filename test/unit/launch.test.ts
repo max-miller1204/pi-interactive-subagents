@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { resolveLaunch } from "../../src/catalog.ts";
 import {
 	type LaunchContext,
 	type LaunchPlan,
@@ -26,7 +27,9 @@ import {
 	type StartedRun,
 } from "../../src/launch.ts";
 import {
+	Catalog,
 	Launch,
+	LaunchDraft,
 	PaneFile,
 	parseStrict,
 	RunSpec,
@@ -39,15 +42,14 @@ function temp(t: { after(fn: () => void): void }): string {
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	return dir;
 }
-function launch(dir: string): Launch {
+function launch(dir: string): LaunchDraft {
 	return parseStrict(
-		Launch,
+		LaunchDraft,
 		{
 			name: "scout-1",
 			agent: "scout",
 			profile: "quick",
 			cwd: dir,
-			childSessionFile: join(dir, "child.jsonl"),
 			session: "standalone",
 			autoExit: true,
 			model: { provider: "provider", id: "model/id" },
@@ -206,7 +208,10 @@ test("script rejects invalid words and byte limits before the caller writes a fi
 
 test("piArgs has exact sandbox, model, trust and prompt argument order", (t) => {
 	const dir = temp(t);
-	const value = launch(dir);
+	const value: Launch = {
+		...launch(dir),
+		childSessionFile: join(dir, "child.jsonl"),
+	};
 	value.extensions = [join(dir, "tools.ts"), join(dir, "provider.ts")];
 	value.skills = [join(dir, "SKILL.md")];
 	const options = {
@@ -328,7 +333,10 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 		appendRegistry: (record) => {
 			events.push("registry");
 			if (state.registryFails) throw new Error("registry failed");
-			assert.equal(record.kind, plan.kind);
+			assert.equal(
+				record.kind,
+				readJsonStrict(RunSpec, join(runDir, "spec.json")).kind,
+			);
 			assert.equal(record.runId, runId);
 			if (record.kind === "spawn")
 				assert.deepEqual(record.launch, committed[0]?.spec.launch);
@@ -388,7 +396,7 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 		ownerDir,
 		parent,
 		own,
-		plan,
+		plan: plan as LaunchPlan,
 		context,
 		state,
 		events,
@@ -487,7 +495,7 @@ test("launch transaction prepares private files, preserves focus and commits pan
 					word.includes("secret-launch-value") || word.includes("Do work."),
 			),
 	);
-	assert.equal(f.plan.launch.childSessionFile, join(f.dir, "child.jsonl"));
+	assert.equal(Object.hasOwn(f.plan.launch, "childSessionFile"), false);
 });
 
 test("a newer child gets a vertical split and column-only layout", async (t) => {
@@ -577,7 +585,11 @@ for (const [pane, pid, identity, pattern] of [
 
 test("resume keeps its session on rollback and appends a resume record on success", async (t) => {
 	const f = transaction(t);
-	f.plan.kind = "resume";
+	f.plan = {
+		kind: "resume",
+		launch: { ...f.plan.launch, childSessionFile: join(f.dir, "child.jsonl") },
+		initialPrompt: "Message from the parent agent:\n\nContinue.",
+	};
 	writeFileSync(f.plan.launch.childSessionFile, "existing session");
 	f.state.fail = "set-option";
 	await assert.rejects(launchRun(f.plan, f.context), /set-option failed/);
@@ -625,6 +637,60 @@ test("preflight rejects invalid command words before any filesystem change", asy
 		assert.equal(f.calls.length, 0);
 		assert.equal(f.names.size, 0);
 	}
+});
+
+test("draft preflight keeps the exact total byte limit before the session exists", async (t) => {
+	const f = transaction(t);
+	const candidate = join(
+		f.sessions,
+		"2000-01-01T00-00-00-000Z_00000000-0000-0000-0000-000000000000.jsonl",
+	);
+	assert.ok(f.context.invocation);
+	const words = [
+		...Object.entries(f.context.env).map(([name, value]) => `${name}=${value}`),
+		...f.context.invocation(),
+		...piArgs(
+			{ ...f.plan.launch, childSessionFile: candidate },
+			{
+				runDir: f.runDir,
+				ownExtensionPath: f.own,
+				trusted: true,
+				initialPrompt: f.plan.initialPrompt,
+			},
+		),
+	];
+	let remaining =
+		786432 - words.reduce((sum, word) => sum + Buffer.byteLength(word), 0);
+	let last = "";
+	for (let i = 0; remaining > 0; i++) {
+		last = `PAD${i}`;
+		const size = Math.min(131071, remaining);
+		f.context.env[last] = "x".repeat(size - Buffer.byteLength(`${last}=`));
+		remaining -= size;
+	}
+	const padding = f.context.env[last];
+	assert.ok(padding);
+	f.context.env[last] = `${padding}x`;
+	const changes: string[] = [];
+	const watchers = [f.ownerDir, f.sessions].map((dir) =>
+		watch(dir, (event, name) => changes.push(`${event}:${name}`)),
+	);
+	try {
+		await assert.rejects(launchRun(f.plan, f.context), /too long/);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(changes, []);
+	} finally {
+		for (const watcher of watchers) watcher.close();
+	}
+	assert.equal(f.calls.length, 0);
+	f.context.env[last] = padding;
+	const result = await launchRun(f.plan, f.context);
+	assert.equal(
+		Buffer.byteLength(result.spec.launch.childSessionFile),
+		Buffer.byteLength(candidate),
+	);
+	assert.notEqual(result.spec.launch.childSessionFile, candidate);
+	assert.equal(existsSync(candidate), false);
 });
 
 test("reservations prevent concurrent launches of one name", async (t) => {
@@ -683,6 +749,7 @@ test("missing tmux and an already disposed context cannot start a pane", async (
 
 test("fork copies only the supplied entries and adds the human guidance", async (t) => {
 	const f = transaction(t);
+	assert.equal(f.plan.kind, "spawn");
 	f.plan.launch.session = "fork";
 	f.plan.launch.autoExit = false;
 	f.plan.entries = [
@@ -736,9 +803,95 @@ test("canonical paths are stored and extension aliases fail before writes", asyn
 	assert.deepEqual(result.spec.launch.skills, [f.own]);
 });
 
+test("a path-free catalog draft starts a fresh session and its stored launch resumes", async (t) => {
+	const f = transaction(t);
+	const catalog = parseStrict(
+		Catalog,
+		{
+			agents: {
+				scout: {
+					name: "scout",
+					file: f.own,
+					scope: "user",
+					description: "Read files",
+					tools: ["read"],
+					skills: "none",
+					spawns: [],
+					session: "standalone",
+					autoExit: true,
+					modelInvocable: true,
+					systemPrompt: { mode: "append", text: "Read files." },
+				},
+			},
+			profiles: {
+				quick: {
+					model: { provider: "provider", id: "model/id" },
+					thinking: "low",
+					guidance: "Short tasks",
+					extensions: [],
+				},
+			},
+			toolSources: { read: { kind: "builtin" } },
+			skills: {},
+		},
+		"catalog",
+	);
+	const draft = resolveLaunch({
+		catalog,
+		name: "scout-1",
+		agent: "scout",
+		profile: "quick",
+		spawnerDepth: 0,
+		spawnerAllowlist: ["scout"],
+		parentCwd: f.dir,
+		cwd: f.dir,
+		modelInvocation: true,
+	});
+	assert.equal(Object.hasOwn(draft, "childSessionFile"), false);
+	assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
+	assert.deepEqual(readdirSync(f.ownerDir), []);
+	const spawned = await launchRun(
+		{ kind: "spawn", launch: draft, initialPrompt: f.plan.initialPrompt },
+		f.context,
+	);
+	assert.deepEqual(
+		parseStrict(Launch, spawned.spec.launch, "stored launch"),
+		spawned.spec.launch,
+	);
+	assert.equal(
+		spawned.spec.launch.childSessionFile,
+		realpathSync(spawned.spec.launch.childSessionFile),
+	);
+	assert.equal(Object.hasOwn(draft, "childSessionFile"), false);
+	const before = readFileSync(spawned.spec.launch.childSessionFile, "utf8");
+	const resume = transaction(t);
+	resume.context.trusted = (cwd) => {
+		assert.equal(cwd, f.dir);
+		return false;
+	};
+	const resumed = await launchRun(
+		{
+			kind: "resume",
+			launch: spawned.spec.launch,
+			initialPrompt: "Message from the parent agent:\n\nContinue.",
+		},
+		resume.context,
+	);
+	assert.deepEqual(resumed.spec.launch, spawned.spec.launch);
+	assert.equal(
+		readFileSync(spawned.spec.launch.childSessionFile, "utf8"),
+		before,
+	);
+	assert.deepEqual(readdirSync(resume.sessions), ["parent.jsonl"]);
+});
+
 test("trust is recomputed for each launch, including resume", async (t) => {
 	const f = transaction(t);
-	f.plan.kind = "resume";
+	f.plan = {
+		kind: "resume",
+		launch: { ...f.plan.launch, childSessionFile: join(f.dir, "child.jsonl") },
+		initialPrompt: "Message from the parent agent:\n\nContinue.",
+	};
 	writeFileSync(f.plan.launch.childSessionFile, "existing");
 	let trust = true;
 	f.context.trusted = () => trust;

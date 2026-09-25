@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import {
+import fs, {
 	appendFileSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -10,6 +11,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type TestContext, test } from "node:test";
@@ -146,6 +148,124 @@ function launch(cwd: string, childSessionFile: string): Launch {
 		"test launch",
 	);
 }
+
+for (const failure of ["write", "realpath"] as const) {
+	test(`child writer removes its new file after ${failure} fails`, (t) => {
+		const f = fixture(t);
+		const primary = new Error(
+			failure === "write" ? "ENOSPC" : "realpath failed",
+		);
+		const write = fs.writeFileSync;
+		const realpath = fs.realpathSync;
+		t.after(() => {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		});
+		if (failure === "write") {
+			t.mock.method(
+				fs,
+				"writeFileSync",
+				(
+					file: Parameters<typeof fs.writeFileSync>[0],
+					_data: unknown,
+					options: Parameters<typeof fs.writeFileSync>[2],
+				) => {
+					write(file, "partial", options);
+					throw primary;
+				},
+			);
+		} else {
+			t.mock.method(fs, "realpathSync", (path: string) => {
+				if (path.endsWith(".jsonl") && path !== f.parent) throw primary;
+				return realpath(path);
+			});
+		}
+		syncBuiltinESMExports();
+		assert.throws(
+			() => writeChildSession(f.dir, f.cwd, f.parent, []),
+			(error) => error === primary,
+		);
+		assert.deepEqual(readdirSync(f.dir), ["parent.jsonl"]);
+		assert.ok(readFileSync(f.parent, "utf8").includes("parent-session"));
+	});
+}
+
+test("child writer keeps the primary error when removing its partial file fails", (t) => {
+	const f = fixture(t);
+	const primary = new Error("ENOSPC");
+	const cleanup = new Error("unlink failed");
+	const write = fs.writeFileSync;
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+	t.mock.method(
+		fs,
+		"writeFileSync",
+		(
+			file: Parameters<typeof fs.writeFileSync>[0],
+			_data: unknown,
+			options: Parameters<typeof fs.writeFileSync>[2],
+		) => {
+			write(file, "partial", options);
+			throw primary;
+		},
+	);
+	t.mock.method(fs, "unlinkSync", () => {
+		throw cleanup;
+	});
+	syncBuiltinESMExports();
+	assert.throws(
+		() => writeChildSession(f.dir, f.cwd, f.parent, []),
+		(error) => {
+			assert.ok(error instanceof AggregateError);
+			assert.deepEqual(error.errors, [primary, cleanup]);
+			assert.equal(error.cause, primary);
+			assert.match(error.message, /ENOSPC.*unlink failed/s);
+			return true;
+		},
+	);
+});
+
+test("child writer never removes a file that already exists", (t) => {
+	const f = fixture(t);
+	const write = fs.writeFileSync;
+	const open = fs.openSync;
+	let collision: string | undefined;
+	const createCollision = (path: string) => {
+		collision = path;
+		const fd = open(path, "wx", 0o600);
+		try {
+			write(fd, "keep existing");
+		} finally {
+			fs.closeSync(fd);
+		}
+	};
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+	t.mock.method(fs, "openSync", (path: string, flags: string, mode: number) => {
+		createCollision(path);
+		return open(path, flags, mode);
+	});
+	t.mock.method(
+		fs,
+		"writeFileSync",
+		(
+			file: Parameters<typeof fs.writeFileSync>[0],
+			data: string,
+			options: Parameters<typeof fs.writeFileSync>[2],
+		) => {
+			if (typeof file === "string") createCollision(file);
+			return write(file, data, options);
+		},
+	);
+	syncBuiltinESMExports();
+	assert.throws(() => writeChildSession(f.dir, f.cwd, f.parent, []), /EEXIST/);
+	assert.ok(collision);
+	assert.equal(readFileSync(collision, "utf8"), "keep existing");
+});
 
 test("child writer resolves directory, cwd and parent symlinks and writes a Pi header", (t) => {
 	const f = fixture(t);

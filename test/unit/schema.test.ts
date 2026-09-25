@@ -13,6 +13,36 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import * as schemas from "../../src/schema.ts";
 
+test("thinking levels keep their literal types and strict runtime values", () => {
+	const launchLevel: schemas.Launch["thinking"] = "low";
+	const profileLevel: schemas.ProfileDef["thinking"] = "low";
+	// @ts-expect-error Invalid thinking levels must not typecheck.
+	const invalidLaunch: schemas.Launch["thinking"] = "invalid";
+	// @ts-expect-error Invalid thinking levels must not typecheck.
+	const invalidProfile: schemas.ProfileDef["thinking"] = "invalid";
+	assert.equal(launchLevel, "low");
+	assert.equal(profileLevel, "low");
+	for (const level of [
+		"off",
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	]) {
+		assert.equal(
+			schemas.parseStrict(schemas.ThinkingLevel, level, "thinking"),
+			level,
+		);
+	}
+	for (const level of [invalidLaunch, invalidProfile, "LOW", "", null, 1]) {
+		assert.throws(() =>
+			schemas.parseStrict(schemas.ThinkingLevel, level, "thinking"),
+		);
+	}
+});
+
 const validRun = () => ({
 	v: 1,
 	runId: "01234567-89ab-4def-8abc-0123456789ab",
@@ -40,6 +70,25 @@ const validRun = () => ({
 		depth: 1,
 		nested: null,
 	},
+});
+
+test("spawn drafts exclude the session path and stored launches require it", () => {
+	const full = validRun().launch;
+	const { childSessionFile, ...draft } = full;
+	assert.ok(childSessionFile);
+	assert.deepEqual(
+		schemas.parseStrict(schemas.LaunchDraft, draft, "draft"),
+		draft,
+	);
+	assert.throws(
+		() => schemas.parseStrict(schemas.LaunchDraft, full, "draft"),
+		/childSessionFile/,
+	);
+	assert.throws(
+		() => schemas.parseStrict(schemas.Launch, draft, "launch"),
+		/childSessionFile/,
+	);
+	assert.deepEqual(schemas.parseStrict(schemas.Launch, full, "launch"), full);
 });
 
 test("RunSpec rejects unknown properties at the root and nested objects", () => {

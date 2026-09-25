@@ -8,9 +8,11 @@ import {
 } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { processIdentity } from "./process.ts";
 import {
 	Launch,
+	LaunchDraft,
 	Name,
 	PaneFile,
 	type ProcessIdentity,
@@ -134,13 +136,14 @@ export function renderLaunchScript(options: LaunchScriptOptions): string {
 	].join("\n");
 }
 
-export interface LaunchPlan {
-	kind: "spawn" | "resume";
-	// Spawn replaces childSessionFile with the session writer's new path.
-	launch: Launch;
-	initialPrompt: string;
-	entries?: SessionEntry[];
-}
+export type LaunchPlan =
+	| {
+			kind: "spawn";
+			launch: LaunchDraft;
+			initialPrompt: string;
+			entries?: SessionEntry[];
+	  }
+	| { kind: "resume"; launch: Launch; initialPrompt: string; entries?: never };
 
 export interface StartedRun {
 	runDir: string;
@@ -184,8 +187,17 @@ function checkDisposed(context: LaunchContext, name: string): void {
 	}
 }
 
-function canonicalLaunch(launch: Launch, ownExtensionPath: string): Launch {
-	const value = structuredClone(parseStrict(Launch, launch, "launch"));
+function canonicalLaunch(
+	plan: LaunchPlan,
+	ownExtensionPath: string,
+): LaunchDraft {
+	const value = structuredClone(
+		parseStrict(
+			plan.kind === "spawn" ? LaunchDraft : Launch,
+			plan.launch,
+			"launch",
+		),
+	);
 	value.cwd = realpathSync(value.cwd);
 	if (!statSync(value.cwd).isDirectory())
 		throw new Error(`Launch cwd is not a directory: ${value.cwd}.`);
@@ -250,32 +262,32 @@ export async function launchRun(
 			"launch run id",
 		);
 		const ownExtensionPath = realpathSync(context.ownExtensionPath);
-		const launch = canonicalLaunch(plan.launch, ownExtensionPath);
+		const draft = canonicalLaunch(plan, ownExtensionPath);
 		const directory = join(realpathSync(context.ownerDir), runId);
 		const sessionDir = realpathSync(context.sessionDir);
 		const parentSession = realpathSync(context.spawnerSessionFile);
 		// The writer uses an ISO timestamp and a UUID. This path has the same byte size.
-		launch.childSessionFile =
+		const candidateSessionFile =
 			plan.kind === "spawn"
 				? join(
 						sessionDir,
 						`${new Date().toISOString().replace(/[:.]/g, "-")}_00000000-0000-0000-0000-000000000000.jsonl`,
 					)
-				: realpathSync(launch.childSessionFile);
+				: realpathSync(plan.launch.childSessionFile);
 		if (
 			plan.kind === "spawn" &&
-			launch.session === "fork" &&
+			draft.session === "fork" &&
 			plan.entries === undefined
 		)
 			throw new Error("A fork launch requires session entries.");
 		if (
-			launch.session === "standalone" &&
+			draft.session === "standalone" &&
 			plan.entries !== undefined &&
 			plan.entries.length > 0
 		)
 			throw new Error("A standalone launch cannot copy session entries.");
-		const spec = parseStrict(
-			RunSpec,
+		const metadata = parseStrict(
+			Type.Omit(RunSpec, ["launch"]),
 			{
 				v: 1,
 				runId,
@@ -286,23 +298,25 @@ export async function launchRun(
 				spawnerSessionId: context.spawnerSessionId,
 				spawnerSessionFile: parentSession,
 				initialPrompt: plan.initialPrompt,
-				launch,
 			},
 			"run spec",
 		);
 		const argsOptions = {
 			runDir: directory,
 			ownExtensionPath,
-			trusted: context.trusted(launch.cwd),
-			initialPrompt: spec.initialPrompt,
+			trusted: context.trusted(draft.cwd),
+			initialPrompt: metadata.initialPrompt,
 		};
 		const scriptOptions = {
 			runId,
 			name,
-			cwd: launch.cwd,
+			cwd: draft.cwd,
 			env: { ...context.env },
 			invocation: (context.invocation ?? piInvocation)(),
-			args: piArgs(launch, argsOptions),
+			args: piArgs(
+				{ ...draft, childSessionFile: candidateSessionFile },
+				argsOptions,
+			),
 		};
 		// Validate the full command before mkdir or the session writer can write a file.
 		renderLaunchScript(scriptOptions);
@@ -320,12 +334,20 @@ export async function launchRun(
 		if (plan.kind === "spawn") {
 			newSession = writeChildSession(
 				sessionDir,
-				launch.cwd,
+				draft.cwd,
 				parentSession,
 				plan.entries ?? [],
 			);
-			launch.childSessionFile = newSession;
 		}
+		// Only an existing session path can complete the stored launch.
+		const childSessionFile =
+			plan.kind === "spawn" ? newSession : candidateSessionFile;
+		const launch = parseStrict(
+			Launch,
+			{ ...draft, childSessionFile },
+			"launch",
+		);
+		const spec = parseStrict(RunSpec, { ...metadata, launch }, "run spec");
 		writeFileSync(join(runDir, "system-prompt.md"), systemPrompt(spec), {
 			flag: "wx",
 			mode: 0o600,
@@ -427,7 +449,7 @@ export async function launchRun(
 		context.appendRegistry(
 			parseStrict(
 				RegistryRecord,
-				plan.kind === "spawn"
+				metadata.kind === "spawn"
 					? { v: 1, kind: "spawn", runId, launch }
 					: { v: 1, kind: "resume", runId, name },
 				"registry record",

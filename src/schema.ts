@@ -24,11 +24,15 @@ const Rec = <V extends TSchema>(
 export const Name = Type.String({ pattern: NAME_PATTERN });
 export const AgentName = Type.String({ pattern: "^[a-z0-9][a-z0-9-]{0,31}$" });
 export const Qid = Type.String({ pattern: "^q-[0-9a-f]{8}$" });
-export const ThinkingLevel = Type.Union(
-	(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const).map(
-		(level) => Type.Literal(level),
-	),
-);
+export const ThinkingLevel = Type.Union([
+	Type.Literal("off"),
+	Type.Literal("minimal"),
+	Type.Literal("low"),
+	Type.Literal("medium"),
+	Type.Literal("high"),
+	Type.Literal("xhigh"),
+	Type.Literal("max"),
+] as const);
 export const ModelRef = Obj({
 	provider: Type.String({ minLength: 1 }),
 	id: Type.String({ minLength: 1 }),
@@ -81,12 +85,11 @@ export const Catalog = Obj({
 	toolSources: Rec(Type.String({ minLength: 1 }), ToolSource),
 	skills: Rec(Type.String({ minLength: 1 }), AbsPath),
 });
-export const Launch = Obj({
+export const LaunchDraft = Obj({
 	name: Name,
 	agent: AgentName,
 	profile: Name,
 	cwd: AbsPath,
-	childSessionFile: AbsPath,
 	session: Type.Union([Type.Literal("standalone"), Type.Literal("fork")]),
 	autoExit: Type.Boolean(),
 	model: ModelRef,
@@ -97,6 +100,10 @@ export const Launch = Obj({
 	skills: Type.Array(AbsPath, { uniqueItems: true }),
 	depth: Type.Integer({ minimum: 1, maximum: MAX_DEPTH }),
 	nested: Type.Union([Catalog, Type.Null()]),
+});
+export const Launch = Obj({
+	...LaunchDraft.properties,
+	childSessionFile: AbsPath,
 });
 export const RunSpec = Obj({
 	v: Type.Literal(1),
@@ -302,6 +309,7 @@ export type AgentDef = Static<typeof AgentDef>;
 export type ProfileDef = Static<typeof ProfileDef>;
 export type ToolSource = Static<typeof ToolSource>;
 export type Catalog = Static<typeof Catalog>;
+export type LaunchDraft = Static<typeof LaunchDraft>;
 export type Launch = Static<typeof Launch>;
 export type RunSpec = Static<typeof RunSpec>;
 export type PaneFile = Static<typeof PaneFile>;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	realpathSync,
@@ -22,7 +23,7 @@ import {
 	resolveLaunch,
 } from "../../src/catalog.ts";
 import type { ConfigContext } from "../../src/config.ts";
-import { Catalog, Launch, parseStrict } from "../../src/schema.ts";
+import { Catalog, LaunchDraft, parseStrict } from "../../src/schema.ts";
 
 function put(file: string, content = "") {
 	mkdirSync(dirname(file), { recursive: true });
@@ -127,7 +128,6 @@ function fixture(t: TestContext) {
 		);
 	agent("worker");
 	profiles();
-	const childSessionFile = put(join(root, "child.jsonl"));
 	const build = () => buildLiveCatalog(pi, ctx, ownAlias, agentDir);
 	const options = {
 		name: "worker-1",
@@ -137,7 +137,6 @@ function fixture(t: TestContext) {
 		spawnerAllowlist: ["worker", "helper", "leaf"],
 		cwd,
 		parentCwd: cwd,
-		childSessionFile,
 		modelInvocation: true,
 	};
 	return {
@@ -198,7 +197,9 @@ test("launch adds managed tools and deduplicates extensions in tool then profile
 	assert.equal(launch.nested, null);
 	assert.equal(launch.depth, 1);
 	assert.equal(launch.name, "worker-1");
-	parseStrict(Launch, launch, "launch");
+	parseStrict(LaunchDraft, launch, "launch draft");
+	assert.equal(Object.hasOwn(launch, "childSessionFile"), false);
+	assert.equal(existsSync(join(f.root, "child.jsonl")), false);
 });
 for (const [tool, expected] of [
 	["inline", /tool inline comes from <inline:test>/],
@@ -429,20 +430,17 @@ test("unknown agent, profile, forbidden agent and hidden model invocation fail",
 		"worker",
 	);
 });
-test("cwd and session paths become real paths; fork compares real cwd", (t) => {
+test("draft cwd becomes a real path without a child session; fork compares real cwd", (t) => {
 	const f = fixture(t);
 	const alias = join(f.root, "alias");
 	symlinkSync(f.cwd, alias);
-	const sessionAlias = join(f.root, "session.jsonl");
-	symlinkSync(f.options.childSessionFile, sessionAlias);
 	const launch = resolveLaunch({
 		...f.options,
 		catalog: f.build(),
 		cwd: "../alias",
-		childSessionFile: sessionAlias,
 	});
 	assert.equal(launch.cwd, f.cwd);
-	assert.equal(launch.childSessionFile, f.options.childSessionFile);
+	assert.equal(Object.hasOwn(launch, "childSessionFile"), false);
 	f.agent("worker", "tools: []\nsession: fork");
 	assert.equal(
 		resolveLaunch({ ...f.options, catalog: f.build(), cwd: alias }).cwd,
@@ -455,15 +453,6 @@ test("cwd and session paths become real paths; fork compares real cwd", (t) => {
 	assert.throws(
 		() => resolveLaunch({ ...f.options, catalog: f.build(), cwd: f.a }),
 		/directory/,
-	);
-	assert.throws(
-		() =>
-			resolveLaunch({
-				...f.options,
-				catalog: f.build(),
-				childSessionFile: join(f.root, "missing"),
-			}),
-		/ENOENT/,
 	);
 });
 test("live diagnostics remain visible in summary and spawn errors", (t) => {

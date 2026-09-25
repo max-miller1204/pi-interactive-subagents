@@ -1,4 +1,11 @@
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { type AssistantMessage, uuidv7 } from "@earendil-works/pi-ai";
 import {
@@ -29,12 +36,40 @@ export function writeChildSession(
 		cwd: realpathSync(cwd),
 		parentSession: realpathSync(parentSession),
 	};
-	writeFileSync(
-		file,
-		`${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-		{ flag: "wx", mode: 0o600 },
-	);
-	return realpathSync(file);
+	const content = `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	// A successful exclusive open establishes ownership before the first write.
+	let descriptor: number | undefined = openSync(file, "wx", 0o600);
+	try {
+		writeFileSync(descriptor, content);
+		const opened = descriptor;
+		descriptor = undefined;
+		closeSync(opened);
+		return realpathSync(file);
+	} catch (error) {
+		const errors: unknown[] = [error];
+		if (descriptor !== undefined) {
+			try {
+				closeSync(descriptor);
+			} catch (closeError) {
+				errors.push(closeError);
+			}
+		}
+		try {
+			unlinkSync(file);
+		} catch (unlinkError) {
+			errors.push(unlinkError);
+		}
+		if (errors.length > 1) {
+			throw new AggregateError(
+				errors,
+				errors
+					.map((item) => (item instanceof Error ? item.message : String(item)))
+					.join("; "),
+				{ cause: error },
+			);
+		}
+		throw error;
+	}
 }
 
 export function forkEntries(
