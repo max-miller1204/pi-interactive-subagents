@@ -12,16 +12,18 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { processIdentity } from "../../src/process.ts";
+import { processAlive, processIdentity } from "../../src/process.ts";
 import {
 	ChildEntry,
 	ChildStatus,
 	PaneFile,
+	ProcessIdentity,
 	parseStrict,
 	RegistryRecord,
 	ResultDetails,
 	RunSpec,
 	readJsonStrict,
+	type TmuxServerIdentity,
 	UndeliveredRecord,
 } from "../../src/schema.ts";
 import { createTmux, verifiedPane } from "../../src/tmux.ts";
@@ -30,6 +32,8 @@ import {
 	readBranch,
 	type Scenario,
 	scenario,
+	trackedResource,
+	waitFor,
 } from "./harness.ts";
 
 const script = (steps: unknown[]) => `#script ${JSON.stringify(steps)}`;
@@ -616,10 +620,64 @@ test("19.3.11: parent quit stops child and grandchild with durable records", asy
 	const child = await active(run);
 	const grandchild = await active(run, "grandchild");
 	await visible(run, "Working", grandchild.pane.paneId);
+	await visible(run, "Grandchild started.", child.pane.paneId);
+	await run.waitFor(() => {
+		const statusFile = join(grandchild.path, "status.json");
+		return (
+			existsSync(statusFile) &&
+			readJsonStrict(ChildStatus, statusFile).state === "working"
+		);
+	}, "grandchild working status before quit");
 	await verify(run, child);
 	await verify(run, grandchild);
+	const descendants = [child, grandchild].map((stopped) => ({
+		...stopped,
+		process: parseStrict(
+			ProcessIdentity,
+			stopped.pane.process,
+			"saved descendant process",
+		),
+	}));
+	for (const stopped of descendants) {
+		assert.equal(processAlive(stopped.process), true);
+		t.diagnostic(
+			`Saved ${stopped.spec.launch.name} process: ${JSON.stringify(stopped.process)}`,
+		);
+	}
 	await run.sendKeys(run.parentPane, "/quit");
-	for (const stopped of [child, grandchild]) {
+	for (const stopped of descendants) {
+		await run
+			.waitFor(
+				() => processAlive(stopped.process) === false,
+				`descendant process exit ${stopped.spec.launch.name}`,
+			)
+			.catch((error) => {
+				run.retainFiles(
+					`Exit was not confirmed for ${stopped.spec.launch.name}: ${JSON.stringify(stopped.process)}`,
+				);
+				try {
+					t.diagnostic(
+						execFileSync(
+							"ps",
+							[
+								"-o",
+								"pid=,ppid=,stat=,args=",
+								"-p",
+								String(stopped.process.pid),
+							],
+							{ encoding: "utf8" },
+						),
+					);
+				} catch (diagnosticError) {
+					throw new AggregateError(
+						[error, diagnosticError],
+						"Descendant exit and process diagnostics failed.",
+					);
+				}
+				throw error;
+			});
+	}
+	for (const stopped of descendants) {
 		const file = join(
 			run.agentDir,
 			"subagent-runs",
@@ -836,58 +894,76 @@ test("19.3.19: an open child session rejects resume without a second pane", asyn
 		]),
 	});
 	const finished = await result(run);
-	const tmux = createTmux(run.socket);
-	const server = await tmux.serverIdentity();
-	const paneId = (
-		await run.tmux([
-			"new-window",
-			"-d",
-			"-P",
-			"-F",
-			"#{pane_id}",
-			"--",
-			"/bin/sh",
-			join(run.root, "reopen.sh"),
-			finished.childSessionFile,
-		])
-	).trim();
-	await run.tmux([
-		"set-option",
-		"-p",
-		"-t",
-		paneId,
-		"@pi_subagent_session",
-		finished.childSessionFile,
-	]);
-	const state = (await tmux.listPanes()).get(paneId);
-	assert.ok(state);
-	const identity = processIdentity(state.pid);
-	assert.ok(identity);
-	const saved = parseStrict(
-		PaneFile,
-		{ v: 1, paneId, process: identity, server },
-		"human reopened pane",
-	);
-	t.after(async () => {
-		const current = await verifiedPane(tmux, saved, finished.childSessionFile);
-		if (current) await tmux.run(["kill-pane", "-t", paneId]);
-	});
-	await visible(run, "Original output.", paneId);
-	const panes = [...(await tmux.listPanes()).keys()];
-	assert.equal(
-		(await verifiedPane(tmux, saved, finished.childSessionFile))?.dead,
-		false,
-	);
-	await prompt(run, [steer("Resume must fail."), { say: "Guard checked." }]);
-	await visible(run, "Guard checked.");
-	const denied = toolResults(run.parentFile, "subagent_message")[0];
-	assert.ok(denied?.isError);
-	assert.match(JSON.stringify(denied.content), /still open in pane/);
-	await visible(run, `still open in pane ${paneId}`);
-	assert.deepEqual([...(await tmux.listPanes()).keys()], panes);
-	assert.equal(
-		records(run.parentFile).filter((entry) => entry.kind === "resume").length,
-		0,
+	await t.test(
+		"guard the human-reopened window before acquisition",
+		async (t) => {
+			const tmux = createTmux(run.socket);
+			const resource = trackedResource(
+				t,
+				`Pi window for ${finished.childSessionFile} on ${run.socket}`,
+				async (saved: { pane: PaneFile; session: string }) => {
+					const current = await verifiedPane(tmux, saved.pane, saved.session);
+					if (current) await tmux.run(["kill-pane", "-t", saved.pane.paneId]);
+				},
+				(reason) => run.retainFiles(reason),
+			);
+			const server = await tmux.serverIdentity();
+			resource.acquiring();
+			const paneId = (
+				await run.tmux([
+					"new-window",
+					"-d",
+					"-P",
+					"-F",
+					"#{pane_id}",
+					"--",
+					"/bin/sh",
+					join(run.root, "reopen.sh"),
+					finished.childSessionFile,
+				])
+			).trim();
+			assert.match(paneId, /^%[0-9]+$/);
+			const state = (await tmux.listPanes()).get(paneId);
+			assert.ok(state);
+			const identity = processIdentity(state.pid);
+			assert.ok(identity);
+			const saved = parseStrict(
+				PaneFile,
+				{ v: 1, paneId, process: identity, server },
+				"human reopened pane",
+			);
+			resource.identified({ pane: saved, session: state.session });
+			await run.tmux([
+				"set-option",
+				"-p",
+				"-t",
+				paneId,
+				"@pi_subagent_session",
+				finished.childSessionFile,
+			]);
+			resource.identified({ pane: saved, session: finished.childSessionFile });
+			await visible(run, "Original output.", paneId);
+			const panes = [...(await tmux.listPanes()).keys()];
+			assert.equal(
+				(await verifiedPane(tmux, saved, finished.childSessionFile))?.dead,
+				false,
+			);
+			await prompt(run, [
+				steer("Resume must fail."),
+				{ say: "Guard checked." },
+			]);
+			await visible(run, "Guard checked.");
+			const denied = toolResults(run.parentFile, "subagent_message")[0];
+			assert.ok(denied?.isError);
+			assert.match(JSON.stringify(denied.content), /still open in pane/);
+			await visible(run, `still open in pane ${paneId}`);
+			assert.deepEqual([...(await tmux.listPanes()).keys()], panes);
+			assert.equal(
+				records(run.parentFile).filter((entry) => entry.kind === "resume")
+					.length,
+				0,
+			);
+		},
 	);
 });
 
@@ -898,7 +974,25 @@ test("pane recovery proves server and pane identity before cleanup", async (t) =
 	const runnerIdentity = await runner.serverIdentity();
 	const socket = `/tmp/pi-subagents-test-lifecycle-${randomUUID()}.sock`;
 	const second = createTmux(socket);
-	const start = () =>
+	const resource = trackedResource(
+		t,
+		`private tmux server ${socket}`,
+		async (saved: TmuxServerIdentity) => {
+			assert.deepEqual(await second.serverIdentity(), saved);
+			await second.run(["kill-server"]);
+			await waitFor(
+				() => processAlive(saved.process) === false,
+				"private server process exit",
+			);
+		},
+		(reason) =>
+			t.diagnostic(`Keep private socket ${socket} for inspection. ${reason}`),
+	);
+	t.after(async () => {
+		assert.deepEqual(await runner.serverIdentity(), runnerIdentity);
+	});
+	const start = async () => {
+		resource.acquiring();
 		execFileSync(
 			"tmux",
 			[
@@ -918,17 +1012,12 @@ test("pane recovery proves server and pane identity before cleanup", async (t) =
 			],
 			{ encoding: "utf8" },
 		);
-	start();
-	let cleanupServer = await second.serverIdentity();
-	let serverRunning = true;
-	t.after(async () => {
-		if (serverRunning) {
-			assert.deepEqual(await second.serverIdentity(), cleanupServer);
-			await second.run(["kill-server"]);
-		}
-		assert.deepEqual(await runner.serverIdentity(), runnerIdentity);
-	});
-	const oldServer = cleanupServer;
+		const identity = await second.serverIdentity();
+		resource.identified(identity);
+		return identity;
+	};
+	assert.equal(existsSync(socket), false, "Private socket already exists.");
+	const oldServer = await start();
 	const oldState = (await second.listPanes()).get("%0");
 	assert.ok(oldState);
 	const oldProcess = processIdentity(oldState.pid);
@@ -939,13 +1028,8 @@ test("pane recovery proves server and pane identity before cleanup", async (t) =
 		"original private pane",
 	);
 	assert.ok(await verifiedPane(second, oldPane, oldState.session));
-	assert.deepEqual(await second.serverIdentity(), oldServer);
-	await second.run(["kill-server"]);
-	serverRunning = false;
-	start();
-	serverRunning = true;
-	const currentServer = await second.serverIdentity();
-	cleanupServer = currentServer;
+	await resource.release();
+	const currentServer = await start();
 	await t.test(
 		"reused server and pane IDs preserve unrelated work; matching dead pane is cleaned",
 		async (t) => {

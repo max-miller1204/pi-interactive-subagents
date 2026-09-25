@@ -307,3 +307,146 @@ Local logs: `/tmp/task3-resume-probe-schema-red.log`, `/tmp/task3-resume-wrong-s
 ### Remaining concerns
 
 No open blocker remains under the approved ruling. The documented deviations remain explicit: scenario 18 uses live in-process arguments, and scenario 24 follows the restart instruction from pinned Pi after `/trust`. The full E2E suite was not run in this continuation; the requested lifecycle file and full `npm test` passed.
+
+## FIX ROUND 1
+
+### Status
+
+Both Important findings are addressed. Final lifecycle, harness, and `npm test` checks pass. An earlier unmutated grandchild exit timeout is recorded under concerns below. The approved scenario 18 argument proof is unchanged.
+
+### Finding 1: prove both descendant processes exit
+
+`test/e2e/lifecycle.test.ts` now captures strict `ProcessIdentity` values from both saved pane files before parent quit. It checks that both processes are alive before quit. It also waits for the worker's delegation reply and the grandchild's strict on-disk `working` status.
+
+After quit, it waits for `processAlive(identity) === false` for each captured identity. Both waits must finish before either stopped record is accepted. Existing stopped-record, saved-session, and absent-pane assertions remain.
+
+The test logs both captured identities. If an exit wait fails, it retains the scenario files and reports the remaining process PID, parent PID, state, and arguments. A diagnostic failure preserves both errors in an `AggregateError`. The normal exit deadline remains 20 seconds.
+
+#### Focused mutation RED
+
+The test temporarily substituted the known-live test runner identity into one descendant's exit observation. The actual descendants still received normal parent quit. Each mutation used a 1500 ms deadline to keep the negative test bounded.
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-name-pattern='19.3.11' test/e2e/lifecycle.test.ts
+```
+
+Worker mutation:
+
+```text
+ tests 1
+ pass 0
+ fail 1
+ Timed out waiting for descendant process exit worker after 1500 ms.
+```
+
+Grandchild mutation:
+
+```text
+ tests 1
+ pass 0
+ fail 1
+ Timed out waiting for descendant process exit grandchild after 1500 ms.
+```
+
+The substitutions and shorter deadlines were removed. The final test uses only the two strict identities from the saved pane files. Six additional isolated scenario 11 runs passed, as did the subsequent complete lifecycle runs.
+
+### Finding 2: register cleanup before resource acquisition
+
+`test/e2e/harness.ts` adds the focused `trackedResource` helper. Its cleanup hook registers when the helper is constructed, before acquisition starts. The helper tracks acquisition and proven identity separately. A successful release clears the saved identity. A later acquisition cannot reuse the previous identity.
+
+If acquisition or identity discovery fails, cleanup does not issue a destructive command with an unknown identity. It reports `Retain <resource>: Resource identity is not proved.` and calls the retention handler. Verification and kill failures also report retention and throw. A retained resource is not retried. Failures in retention or diagnostic reporting preserve the original cleanup error and the reporting error.
+
+The reopened Pi window in scenario 19 now uses this helper before `new-window`. It saves the first proven pane PID, server, and current session before setting its child-session marker. After that command succeeds, it updates the expected session. Cleanup calls `verifiedPane` before `kill-pane`. If setup succeeds only in part and identity cannot be proved, the pane and session files are retained.
+
+The window test now has a nested test scope. Its cleanup runs before the outer scenario can remove the files. `Scenario.retainFiles(reason)` prevents file removal and reports the retained root path.
+
+The second private server also registers its cleanup before the first start. Each start marks acquisition before the tmux command. Each verified release checks the current server identity, stops that server, and waits for its saved process identity to exit. The next start begins with no saved identity from the old generation. The first start rejects an existing socket path. Restart uses only the same test-owned socket after verified server exit.
+
+No default tmux server is used. The runner server remains alive. All destructive window and server cleanup still requires matching identity.
+
+#### Focused cleanup RED/GREEN
+
+The initial helper tests failed before the helper existed:
+
+```text
+node --test --test-name-pattern='tracked cleanup' test/e2e/harness.test.ts
+ SyntaxError: The requested module './harness.ts' does not provide an export named 'trackedResource'
+```
+
+After implementation, a mutation moved hook registration until after identity discovery. The focused tests caught the original registration-order risk:
+
+```text
+node --test --test-name-pattern='tracked cleanup' test/e2e/harness.test.ts
+ tests 6
+ pass 1
+ fail 5
+ AssertionError: cleanup must register before acquisition
+ 0 !== 1
+```
+
+That mutation was removed. Focused tests cover acquisition failure, identity-discovery failure, setup failure after proven identity, verification mismatch, kill failure, and failed restart without reuse of the old identity. They assert no kill with unknown or mismatched identity and no retry after retention.
+
+Two reporting tests were RED before error aggregation was added:
+
+```text
+node --test --test-name-pattern='tracked cleanup preserves errors' test/e2e/harness.test.ts
+ tests 2
+ pass 0
+ fail 2
+ assert.ok(error instanceof AggregateError)
+```
+
+The implementation now attempts retention and diagnostic reporting and preserves both errors. Both reporting tests pass.
+
+A separate mutation disabled the retained-files condition in scenario cleanup:
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-name-pattern='scenario retains files' test/e2e/harness.test.ts
+ tests 2
+ pass 1
+ fail 1
+ assert.ok(root !== undefined && existsSync(root))
+```
+
+The condition was restored. The test now proves that the saved session survives scenario cleanup when external pane identity is not proved. Its own outer cleanup removes only the test's retained directory after the assertions.
+
+### Final verification
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/lifecycle.test.ts
+ tests 15
+ pass 15
+ fail 0
+ skipped 0
+ todo 0
+```
+
+The lifecycle count increased by one because scenario 19 now has a nested cleanup scope. No prior scenario was removed.
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/harness.test.ts
+ tests 13
+ pass 13
+ fail 0
+ skipped 0
+ todo 0
+```
+
+```text
+npm test
+ check:pi-version: PASS
+ typecheck: PASS
+ lint: PASS
+ unit: 366 tests, 366 pass, 0 fail
+ sdk: 80 tests, 80 pass, 0 fail
+```
+
+`git diff --check` passed. Self-review covered hook registration order, acquisition-state transitions, both descendant waits, retention ordering, error propagation, and preservation of the live-child argument oracle. No production source, global file, handoff file, or fixture provider changed. No subagent or reviewer was used. No merge or push occurred.
+
+### Investigation notes and concerns
+
+An early combined unmutated run returned 23 passes and two failures. One failure came from treating the old private socket file as an unowned path on restart. The server can leave that path behind. The test now rejects an existing path only on first acquisition and allows only a verified restart of its own socket. Server release also waits for the old process identity to exit.
+
+The other failure was a 20-second grandchild exit timeout. This occurred before per-process failure diagnostics and file retention were added, so its cause is not confirmed. It did not recur in six isolated scenario 11 runs, a combined harness/lifecycle run, or subsequent complete lifecycle runs. The test now proves the worker delegation reply and grandchild working state before quit. It retains files and process diagnostics if this exit failure occurs again. No process-exit assertion was removed, skipped, or replaced with a pane-only check. This unreproduced timeout remains a diagnostic concern, not a claimed production fix.
+
+Evidence logs include `/tmp/task3-fix1-child-red.log`, `/tmp/task3-fix1-grandchild-red.log`, `/tmp/task3-fix1-late-hook-red.log`, `/tmp/task3-fix1-retention-red.log`, `/tmp/task3-fix1-reporting-red.log`, `/tmp/task3-fix1-focused-green.log` (the early run with two failures), `/tmp/task3-fix1-focused-recheck.log`, `/tmp/task3-fix1-lifecycle-complete.log`, `/tmp/task3-fix1-harness-final.log`, and `/tmp/task3-fix1-npm-complete.log`. Relevant output is preserved above.

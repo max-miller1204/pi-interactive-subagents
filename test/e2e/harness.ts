@@ -98,6 +98,60 @@ export async function terminateWindow(
 		);
 }
 
+export function trackedResource<Identity>(
+	context: {
+		after(cleanup: () => Promise<void>): void;
+		diagnostic(text: string): void;
+	},
+	label: string,
+	dispose: (identity: Identity) => Promise<void>,
+	retain: (reason: string) => void,
+) {
+	let state:
+		| { kind: "idle" | "acquiring" | "retained" }
+		| { kind: "identified"; identity: Identity } = { kind: "idle" };
+	const release = async () => {
+		if (state.kind === "idle" || state.kind === "retained") return;
+		try {
+			if (state.kind !== "identified")
+				throw new Error("Resource identity is not proved.");
+			await dispose(state.identity);
+			state = { kind: "idle" };
+		} catch (error) {
+			state = { kind: "retained" };
+			const message = `Retain ${label}: ${String(error)}`;
+			const failure = new Error(message, { cause: error });
+			const errors: unknown[] = [failure];
+			for (const report of [
+				() => retain(message),
+				() => context.diagnostic(message),
+			]) {
+				try {
+					report();
+				} catch (reportError) {
+					errors.push(reportError);
+				}
+			}
+			if (errors.length > 1) throw new AggregateError(errors, message);
+			throw failure;
+		}
+	};
+	context.after(release);
+	return {
+		acquiring() {
+			if (state.kind !== "idle")
+				throw new Error(`Cannot acquire ${label} while ${state.kind}.`);
+			state = { kind: "acquiring" };
+		},
+		identified(identity: Identity) {
+			if (state.kind !== "acquiring" && state.kind !== "identified")
+				throw new Error(`Cannot identify ${label} while ${state.kind}.`);
+			state = { kind: "identified", identity };
+		},
+		release,
+	};
+}
+
 export interface ScenarioOptions {
 	prompt: string;
 	tmuxEnvironment?: string;
@@ -124,6 +178,7 @@ export interface Scenario {
 		deadlineMs?: number,
 	): Promise<NonNullable<T>>;
 	childRuns(): string[];
+	retainFiles(reason: string): void;
 }
 
 export async function scenario(
@@ -235,6 +290,7 @@ export async function scenario(
 		{ mode: 0o700 },
 	);
 	let pane: string | undefined;
+	const retentionReasons: string[] = [];
 	t.after(async () => {
 		const errors: Error[] = [];
 		let windowExists = false;
@@ -276,11 +332,12 @@ export async function scenario(
 			}
 		}
 		if (
+			retentionReasons.length > 0 ||
 			errors.some((error) =>
 				error.message.startsWith("Cannot kill parent window"),
 			)
 		)
-			t.diagnostic(`Keep ${root} for recovery.`);
+			t.diagnostic(`Keep ${root} for recovery. ${retentionReasons.join(" ")}`);
 		else {
 			try {
 				rmSync(root, { recursive: true, force: true });
@@ -312,6 +369,9 @@ export async function scenario(
 		stderrFile,
 		socket,
 		tmux,
+		retainFiles: (reason) => {
+			retentionReasons.push(reason);
+		},
 		readParent: () => readBranch(parentFile),
 		capture: (target = parentPane) =>
 			tmux(["capture-pane", "-p", "-J", "-S", "-80", "-t", target]),
