@@ -1,5 +1,6 @@
 import {
 	existsSync,
+	lstatSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -214,9 +215,13 @@ export function loadProfiles(
 		"subagent-profiles.json",
 	);
 	let selected: string;
-	if (projectConfigAllowed(ctx, agentDir) && existsSync(project))
+	if (
+		projectConfigAllowed(ctx, agentDir) &&
+		lstatSync(project, { throwIfNoEntry: false }) !== undefined
+	)
 		selected = project;
-	else if (existsSync(user)) selected = user;
+	else if (lstatSync(user, { throwIfNoEntry: false }) !== undefined)
+		selected = user;
 	else throw new Error(`No subagent profiles. Create ${user} or ${project}.`);
 	const file = realpathSync(selected);
 	const parsed = readJsonStrict(ProfilesFile, file);

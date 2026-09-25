@@ -383,6 +383,26 @@ test("closed gate does not parse project agents or project profiles", (t) => {
 	new ProjectTrustStore(f.agentDir).set(f.cwd, true);
 	assert.throws(() => loadProfiles(f.ctx, f.agentDir), /invalid JSON/);
 });
+test("trusted dangling project profile links do not select valid user profiles", (t) => {
+	const f = fixture(t);
+	f.profiles(profile());
+	mkdirSync(join(f.cwd, ".pi"));
+	symlinkSync(
+		join(f.root, "missing-project-profiles.json"),
+		join(f.cwd, ".pi/subagent-profiles.json"),
+	);
+	assert.equal(loadProfiles(f.ctx, f.agentDir).quick?.model.provider, "openai");
+	new ProjectTrustStore(f.agentDir).set(f.cwd, true);
+	assert.throws(() => loadProfiles(f.ctx, f.agentDir), { code: "ENOENT" });
+});
+test("dangling user profile links fail path resolution instead of reporting no profiles", (t) => {
+	const f = fixture(t);
+	symlinkSync(
+		join(f.root, "missing-user-profiles.json"),
+		join(f.agentDir, "subagent-profiles.json"),
+	);
+	assert.throws(() => loadProfiles(f.ctx, f.agentDir), { code: "ENOENT" });
+});
 test("profile selection reports missing files and lets the project replace the user", (t) => {
 	const f = fixture(t);
 	assert.throws(
