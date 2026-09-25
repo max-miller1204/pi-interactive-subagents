@@ -1,0 +1,758 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	watch,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import {
+	type LaunchContext,
+	type LaunchPlan,
+	launchRun,
+	piArgs,
+	piInvocation,
+	renderLaunchScript,
+	type StartedRun,
+} from "../../src/launch.ts";
+import {
+	Launch,
+	PaneFile,
+	parseStrict,
+	RunSpec,
+	readJsonStrict,
+} from "../../src/schema.ts";
+
+const runId = "9a32db26-97ef-4d95-8d91-fc4f9fe118bf";
+function temp(t: { after(fn: () => void): void }): string {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "launch-")));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	return dir;
+}
+function launch(dir: string): Launch {
+	return parseStrict(
+		Launch,
+		{
+			name: "scout-1",
+			agent: "scout",
+			profile: "quick",
+			cwd: dir,
+			childSessionFile: join(dir, "child.jsonl"),
+			session: "standalone",
+			autoExit: true,
+			model: { provider: "provider", id: "model/id" },
+			thinking: "low",
+			systemPrompt: { mode: "append", text: "Read files." },
+			tools: ["read", "ask_question"],
+			extensions: [],
+			skills: [],
+			depth: 1,
+			nested: null,
+		},
+		"test launch",
+	);
+}
+
+test("piInvocation uses only the parent executable, flags and real CLI path", (t) => {
+	const dir = temp(t);
+	const cli = join(dir, "cli.mjs");
+	writeFileSync(cli, "");
+	const link = join(dir, "alias.js");
+	symlinkSync(cli, link);
+	assert.deepEqual(
+		piInvocation({
+			execPath: process.execPath,
+			execArgv: ["--no-warnings"],
+			argv: ["node", link],
+		}),
+		[process.execPath, "--no-warnings", cli],
+	);
+	for (const script of [undefined, "cli.js", join(dir, "missing.js"), dir]) {
+		assert.throws(
+			() =>
+				piInvocation({
+					execPath: process.execPath,
+					execArgv: [],
+					argv: script === undefined ? ["node"] : ["node", script],
+				}),
+			/no CLI script/,
+		);
+	}
+});
+
+test("script preserves hostile argv and environment, inherits pane identity and deletes itself", (t) => {
+	const root = temp(t);
+	const dir = join(root, "cwd's\n$(touch PWNED)`touch PWNED`");
+	mkdirSync(dir, { mode: 0o700 });
+	const stub = join(dir, "stub's\n$(touch PWNED).cjs");
+	writeFileSync(
+		stub,
+		"process.stdout.write(JSON.stringify({argv:process.argv.slice(2),env:process.env,cwd:process.cwd()}));",
+	);
+	const hostile = [
+		"apostrophe's",
+		"line\nbreak",
+		"$(touch PWNED)",
+		"`touch PWNED`",
+		"",
+		"é",
+	];
+	const env = {
+		VALUE: hostile.join("|"),
+		"BASH_FUNC_f%%": "() { touch PWNED; }",
+		TMUX: "old",
+		TMUX_PANE: "%1",
+	};
+	const script = join(dir, "launch's\n$(touch PWNED).sh");
+	writeFileSync(
+		script,
+		renderLaunchScript({
+			runId,
+			name: "scout-1",
+			cwd: dir,
+			env,
+			invocation: [process.execPath, stub],
+			args: hostile,
+		}),
+		{ flag: "wx", mode: 0o700 },
+	);
+	const result = JSON.parse(
+		execFileSync("/bin/sh", [script], {
+			env: { TMUX: "/socket,1,2", TMUX_PANE: "%77", STALE: "bad" },
+			encoding: "utf8",
+		}),
+	);
+	// CoreFoundation adds this variable when Node starts on macOS.
+	if (process.platform === "darwin") {
+		assert.equal(typeof result.env.__CF_USER_TEXT_ENCODING, "string");
+		delete result.env.__CF_USER_TEXT_ENCODING;
+	}
+	assert.deepEqual(result, {
+		argv: hostile,
+		env: {
+			TMUX: "/socket,1,2",
+			TMUX_PANE: "%77",
+			VALUE: env.VALUE,
+			"BASH_FUNC_f%%": env["BASH_FUNC_f%%"],
+		},
+		cwd: dir,
+	});
+	assert.equal(existsSync(script), false);
+	assert.equal(existsSync(join(dir, "PWNED")), false);
+});
+
+test("script rejects invalid words and byte limits before the caller writes a file", (t) => {
+	const dir = temp(t);
+	const input = {
+		runId,
+		name: "scout-1",
+		cwd: dir,
+		env: {},
+		invocation: ["node"],
+		args: [] as string[],
+	};
+	for (const change of [
+		{ args: ["nul\0"] },
+		{ invocation: ["node\0"] },
+		{ cwd: "bad\0" },
+		{ env: { "": "empty" } },
+		{ env: { "BAD=NAME": "value" } },
+		{ env: { BAD: "nul\0" } },
+		{ env: { "BAD\0": "value" } },
+		{ args: ["x".repeat(200 * 1024)] },
+		{ args: ["é".repeat(65536)] },
+		{ env: { BIG: "x".repeat(131068) } },
+		{ args: Array.from({ length: 7 }, () => "x".repeat(120000)) },
+	]) {
+		assert.throws(() =>
+			writeFileSync(
+				join(dir, "launch.sh"),
+				renderLaunchScript({ ...input, ...change }),
+				{ flag: "wx" },
+			),
+		);
+		assert.deepEqual(readdirSync(dir), []);
+	}
+	assert.doesNotThrow(() =>
+		renderLaunchScript({ ...input, args: ["x".repeat(131071)] }),
+	);
+	assert.doesNotThrow(() =>
+		renderLaunchScript({
+			...input,
+			invocation: ["n"],
+			args: [...Array<string>(6).fill("x".repeat(131071)), "12345"],
+		}),
+	);
+	assert.throws(
+		() =>
+			renderLaunchScript({
+				...input,
+				invocation: ["n"],
+				args: [...Array<string>(6).fill("x".repeat(131071)), "123456"],
+			}),
+		/The task is too long/,
+	);
+});
+
+test("piArgs has exact sandbox, model, trust and prompt argument order", (t) => {
+	const dir = temp(t);
+	const value = launch(dir);
+	value.extensions = [join(dir, "tools.ts"), join(dir, "provider.ts")];
+	value.skills = [join(dir, "SKILL.md")];
+	const options = {
+		runDir: dir,
+		ownExtensionPath: join(dir, "index.ts"),
+		trusted: true,
+		initialPrompt: "Task from the parent agent:\n\n@/--work",
+	};
+	const expected = [
+		"--session",
+		value.childSessionFile,
+		"--model",
+		"provider/model/id",
+		"--thinking",
+		"low",
+		"--no-extensions",
+		"-e",
+		options.ownExtensionPath,
+		"-e",
+		value.extensions[0],
+		"-e",
+		value.extensions[1],
+		"--tools",
+		"read,ask_question",
+		"--no-skills",
+		"--skill",
+		value.skills[0],
+		"--append-system-prompt",
+		join(dir, "system-prompt.md"),
+		"--approve",
+		`--subagent-run=${dir}`,
+		options.initialPrompt,
+	];
+	assert.deepEqual(piArgs(value, options), expected);
+	value.systemPrompt.mode = "replace";
+	const args = piArgs(value, { ...options, trusted: false });
+	assert.ok(args.includes("--system-prompt"));
+	assert.ok(args.includes("--no-approve"));
+	assert.ok(!args.includes("--approve"));
+});
+
+function transaction(t: { after(fn: () => void): void }, vertical = false) {
+	const dir = temp(t);
+	const sessions = join(dir, "sessions");
+	const ownerDir = join(dir, "owner");
+	mkdirSync(sessions);
+	mkdirSync(ownerDir);
+	const parent = join(sessions, "parent.jsonl");
+	const own = join(dir, "index.ts");
+	const cli = join(dir, "cli.js");
+	writeFileSync(parent, "parent");
+	writeFileSync(own, "");
+	writeFileSync(cli, "");
+	const plan: LaunchPlan = {
+		kind: "spawn",
+		launch: launch(dir),
+		initialPrompt: "Task from the parent agent:\n\nDo work.",
+	};
+	const events: string[] = [];
+	const calls: string[][] = [];
+	const names = new Set<string>();
+	const committed: StartedRun[] = [];
+	const state = {
+		disposed: false,
+		fail: "",
+		disposeAt: "",
+		pid: "123\n",
+		pane: "%9\n",
+		identity: true,
+		killFails: false,
+		registryFails: false,
+	};
+	const runDir = join(ownerDir, runId);
+	const context: LaunchContext = {
+		runId,
+		ownerDir,
+		ownerKey: "owner",
+		owner: { pid: 1, start: "owner-start" },
+		spawnerSessionId: "parent",
+		spawnerSessionFile: parent,
+		sessionDir: sessions,
+		mode: "tui",
+		ownExtensionPath: own,
+		env: {
+			TMUX: "/socket,1,0",
+			TMUX_PANE: "%1",
+			SECRET: "secret-launch-value",
+		},
+		invocation: () =>
+			piInvocation({
+				execPath: process.execPath,
+				execArgv: [],
+				argv: ["node", cli],
+			}),
+		trusted: (cwd) => {
+			assert.equal(cwd, dir);
+			events.push("trust");
+			return true;
+		},
+		isDisposed: () => state.disposed,
+		reserve: (name) => {
+			events.push("reserve");
+			assert.ok(!names.has(name), "name already reserved");
+			names.add(name);
+		},
+		release: (name) => {
+			events.push("release");
+			names.delete(name);
+		},
+		newestLivePane: () => (vertical ? "%8" : undefined),
+		commit: (run) => {
+			events.push("live");
+			assert.deepEqual(
+				readJsonStrict(PaneFile, join(runDir, "pane.json")),
+				run.pane,
+			);
+			committed.push(run);
+		},
+		appendRegistry: (record) => {
+			events.push("registry");
+			if (state.registryFails) throw new Error("registry failed");
+			assert.equal(record.kind, plan.kind);
+			assert.equal(record.runId, runId);
+			if (record.kind === "spawn")
+				assert.deepEqual(record.launch, committed[0]?.spec.launch);
+		},
+		startTick: () => {
+			events.push("tick");
+		},
+		identity: (pid) => {
+			events.push("identity");
+			assert.equal(pid, 123);
+			assert.equal(existsSync(join(runDir, "pane.json")), false);
+			return state.identity ? { pid, start: "child-start" } : null;
+		},
+		tmux: {
+			async run(args) {
+				calls.push(args);
+				const command = args[0];
+				assert.ok(command);
+				events.push(command);
+				if (command === "kill-pane") {
+					if (state.killFails) throw new Error("kill failed");
+					return "";
+				}
+				assert.equal(existsSync(join(runDir, "pane.json")), false);
+				if (command === "split-window") {
+					assert.ok(names.has(plan.launch.name));
+					assert.deepEqual(readdirSync(runDir).sort(), [
+						"inbox",
+						"launch.sh",
+						"outbox",
+						"questions",
+						"spec.json",
+						"system-prompt.md",
+					]);
+					assert.equal(statSync(runDir).mode & 0o777, 0o700);
+					assert.equal(statSync(join(runDir, "launch.sh")).mode & 0o777, 0o700);
+					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
+					assert.ok(existsSync(spec.launch.childSessionFile));
+				}
+				if (state.disposeAt === command) state.disposed = true;
+				if (state.fail === command) throw new Error(`${command} failed`);
+				if (command === "split-window") return state.pane;
+				if (command === "display-message") return state.pid;
+				return "";
+			},
+			async listPanes() {
+				throw new Error("Unexpected listPanes");
+			},
+			async capture() {
+				throw new Error("Unexpected capture");
+			},
+		},
+	};
+	return {
+		dir,
+		sessions,
+		ownerDir,
+		parent,
+		own,
+		plan,
+		context,
+		state,
+		events,
+		calls,
+		names,
+		runDir,
+		committed,
+	};
+}
+
+test("launch transaction prepares private files, preserves focus and commits pane.json last", async (t) => {
+	const f = transaction(t);
+	const pending = launchRun(f.plan, f.context);
+	assert.ok(f.names.has("scout-1"));
+	assert.equal(f.calls.length, 1);
+	const result = await pending;
+	assert.deepEqual(f.calls, [
+		[
+			"split-window",
+			"-d",
+			"-h",
+			"-l",
+			"50%",
+			"-t",
+			"%1",
+			"-P",
+			"-F",
+			"#{pane_id}",
+			"",
+		],
+		[
+			"set-option",
+			"-p",
+			"-t",
+			"%9",
+			"remain-on-exit",
+			"on",
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			"%9",
+			"@pi_subagent_run",
+			runId,
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			"%9",
+			"@pi_subagent_name",
+			"scout-1",
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			"%9",
+			"@pi_subagent_session",
+			result.spec.launch.childSessionFile,
+			";",
+			"respawn-pane",
+			"-k",
+			"-t",
+			"%9",
+			"--",
+			"/bin/sh",
+			join(f.runDir, "launch.sh"),
+		],
+		["display-message", "-p", "-t", "%9", "#{pane_pid}"],
+	]);
+	assert.deepEqual(f.events, [
+		"reserve",
+		"trust",
+		"split-window",
+		"set-option",
+		"display-message",
+		"identity",
+		"live",
+		"registry",
+		"tick",
+	]);
+	assert.equal(result.runDir, realpathSync(f.runDir));
+	assert.equal(
+		result.spec.launch.childSessionFile,
+		realpathSync(result.spec.launch.childSessionFile),
+	);
+	assert.equal(result.spec.initialPrompt, f.plan.initialPrompt);
+	assert.equal(
+		readFileSync(join(f.runDir, "system-prompt.md"), "utf8"),
+		`Read files.\n\nSubagent run ${runId}.\nYou are the subagent "scout-1" (agent scout). A parent Pi agent started you.\nYour last reply is your result. The parent receives it when you finish.\nMessages from the parent start with "Message from the parent agent".\nUse ask_question only when you cannot continue without a decision from the parent.\n`,
+	);
+	assert.ok(
+		!f.calls
+			.flat()
+			.some(
+				(word) =>
+					word.includes("secret-launch-value") || word.includes("Do work."),
+			),
+	);
+	assert.equal(f.plan.launch.childSessionFile, join(f.dir, "child.jsonl"));
+});
+
+test("a newer child gets a vertical split and column-only layout", async (t) => {
+	const f = transaction(t, true);
+	await launchRun(f.plan, f.context);
+	assert.deepEqual(f.calls[0], [
+		"split-window",
+		"-d",
+		"-v",
+		"-t",
+		"%8",
+		"-P",
+		"-F",
+		"#{pane_id}",
+		"",
+	]);
+	assert.deepEqual(f.calls.at(-1), ["select-layout", "-E", "-t", "%9"]);
+});
+
+for (const command of [
+	"split-window",
+	"set-option",
+	"display-message",
+	"select-layout",
+]) {
+	for (const cause of ["failure", "disposed"]) {
+		test(`rollback after ${cause} at ${command}`, async (t) => {
+			const f = transaction(t, true);
+			if (cause === "failure") f.state.fail = command;
+			else f.state.disposeAt = command;
+			await assert.rejects(
+				launchRun(f.plan, f.context),
+				cause === "failure"
+					? new RegExp(`${command} failed`)
+					: /Pi replaced the session.*It was not started/,
+			);
+			const killed = cause === "disposed" || command !== "split-window";
+			assert.equal(
+				f.calls.some((args) => args[0] === "kill-pane"),
+				killed,
+			);
+			if (killed)
+				assert.deepEqual(f.calls.at(-1), ["select-layout", "-E", "-t", "%8"]);
+			assert.deepEqual(readdirSync(f.ownerDir), []);
+			assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
+			assert.equal(f.names.size, 0);
+			assert.ok(!f.events.includes("live"));
+			assert.ok(!f.events.includes("registry"));
+		});
+	}
+}
+
+test("rollback preserves the primary and kill errors and removes files", async (t) => {
+	const f = transaction(t);
+	f.state.fail = "set-option";
+	f.state.killFails = true;
+	await assert.rejects(launchRun(f.plan, f.context), (error: unknown) => {
+		assert.ok(error instanceof AggregateError);
+		assert.match(error.message, /set-option failed.*kill failed/s);
+		assert.equal(error.errors.length, 2);
+		return true;
+	});
+	assert.deepEqual(readdirSync(f.ownerDir), []);
+	assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
+	assert.equal(f.names.size, 0);
+});
+
+for (const [pane, pid, identity, pattern] of [
+	["bad", "123", true, /pane id/],
+	["%9", "0", true, /pid/],
+	["%9", "12x", true, /pid/],
+	["%9", "9007199254740992", true, /pid/],
+	["%9", "123", false, /exited before it could start/],
+] as const) {
+	test(`rejects invalid pane identity ${pane}/${pid}/${identity}`, async (t) => {
+		const f = transaction(t);
+		Object.assign(f.state, { pane, pid, identity });
+		await assert.rejects(launchRun(f.plan, f.context), pattern);
+		assert.equal(
+			f.calls.some((args) => args[0] === "kill-pane"),
+			pane === "%9",
+		);
+		assert.equal(f.names.size, 0);
+		assert.deepEqual(readdirSync(f.ownerDir), []);
+	});
+}
+
+test("resume keeps its session on rollback and appends a resume record on success", async (t) => {
+	const f = transaction(t);
+	f.plan.kind = "resume";
+	writeFileSync(f.plan.launch.childSessionFile, "existing session");
+	f.state.fail = "set-option";
+	await assert.rejects(launchRun(f.plan, f.context), /set-option failed/);
+	assert.equal(
+		readFileSync(f.plan.launch.childSessionFile, "utf8"),
+		"existing session",
+	);
+	f.state.fail = "";
+	const result = await launchRun(f.plan, f.context);
+	assert.equal(
+		result.spec.launch.childSessionFile,
+		f.plan.launch.childSessionFile,
+	);
+	assert.deepEqual(readdirSync(f.sessions), ["parent.jsonl"]);
+});
+
+test("preflight rejects invalid command words before any filesystem change", async (t) => {
+	for (const change of [
+		(f: ReturnType<typeof transaction>) => {
+			f.plan.initialPrompt = "bad\0";
+		},
+		(f: ReturnType<typeof transaction>) => {
+			f.plan.initialPrompt = "x".repeat(200 * 1024);
+		},
+		(f: ReturnType<typeof transaction>) => {
+			f.context.env.BIG = "x".repeat(200 * 1024);
+		},
+		(f: ReturnType<typeof transaction>) => {
+			for (let i = 0; i < 7; i++) f.context.env[`BIG${i}`] = "x".repeat(120000);
+		},
+	]) {
+		const f = transaction(t);
+		change(f);
+		const changes: string[] = [];
+		const watchers = [f.ownerDir, f.sessions].map((dir) =>
+			watch(dir, (event, name) => changes.push(`${event}:${name}`)),
+		);
+		try {
+			await assert.rejects(launchRun(f.plan, f.context), /NUL|too long/);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.deepEqual(changes, []);
+		} finally {
+			for (const watcher of watchers) watcher.close();
+		}
+		assert.equal(f.calls.length, 0);
+		assert.equal(f.names.size, 0);
+	}
+});
+
+test("reservations prevent concurrent launches of one name", async (t) => {
+	const f = transaction(t);
+	const pending = launchRun(f.plan, f.context);
+	await assert.rejects(launchRun(f.plan, f.context), /already reserved/);
+	assert.equal(f.names.size, 1);
+	await pending;
+	assert.equal(f.calls.filter((args) => args[0] === "split-window").length, 1);
+});
+
+test("an existing run directory is never removed on rollback", async (t) => {
+	const f = transaction(t);
+	mkdirSync(f.runDir);
+	writeFileSync(join(f.runDir, "keep"), "existing");
+	await assert.rejects(launchRun(f.plan, f.context), /EEXIST/);
+	assert.equal(readFileSync(join(f.runDir, "keep"), "utf8"), "existing");
+	assert.equal(f.names.size, 0);
+});
+
+test("synchronous commit failure rolls back a started pane", async (t) => {
+	const f = transaction(t);
+	f.state.registryFails = true;
+	await assert.rejects(launchRun(f.plan, f.context), /registry failed/);
+	assert.deepEqual(f.calls.at(-1), ["kill-pane", "-t", "%9"]);
+	assert.equal(f.names.size, 0);
+	assert.deepEqual(readdirSync(f.ownerDir), []);
+	assert.ok(!f.events.includes("tick"));
+});
+
+for (const [field, value, pattern] of [
+	["mode", "rpc", /interactive Pi TUI/],
+	["spawnerSessionFile", undefined, /saved Pi session/],
+] as const) {
+	test(`rejects launch precondition ${field}`, async (t) => {
+		const f = transaction(t);
+		Object.assign(f.context, { [field]: value });
+		await assert.rejects(launchRun(f.plan, f.context), pattern);
+		assert.deepEqual(f.events, []);
+		assert.deepEqual(readdirSync(f.ownerDir), []);
+	});
+}
+
+test("missing tmux and an already disposed context cannot start a pane", async (t) => {
+	const f = transaction(t);
+	f.context.env.TMUX = "";
+	await assert.rejects(launchRun(f.plan, f.context), /inside tmux/);
+	assert.deepEqual(f.events, []);
+	f.context.env.TMUX = "/socket,1,0";
+	f.state.disposed = true;
+	await assert.rejects(launchRun(f.plan, f.context), /Pi replaced the session/);
+	assert.equal(f.names.size, 0);
+	assert.deepEqual(f.calls, []);
+	assert.deepEqual(readdirSync(f.ownerDir), []);
+});
+
+test("fork copies only the supplied entries and adds the human guidance", async (t) => {
+	const f = transaction(t);
+	f.plan.launch.session = "fork";
+	f.plan.launch.autoExit = false;
+	f.plan.entries = [
+		{
+			type: "custom",
+			id: "branch",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			customType: "test",
+			data: {},
+		},
+	];
+	const result = await launchRun(f.plan, f.context);
+	const lines = readFileSync(result.spec.launch.childSessionFile, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	assert.equal(lines[0].cwd, f.dir);
+	assert.equal(lines[0].parentSession, f.parent);
+	assert.deepEqual(lines.slice(1), f.plan.entries);
+	assert.match(
+		readFileSync(join(f.runDir, "system-prompt.md"), "utf8"),
+		/A human works with you in this pane/,
+	);
+});
+
+test("canonical paths are stored and extension aliases fail before writes", async (t) => {
+	const f = transaction(t);
+	const alias = join(f.dir, "alias");
+	symlinkSync(f.dir, alias);
+	f.plan.launch.cwd = alias;
+	f.context.ownerDir = join(alias, "owner");
+	f.context.sessionDir = join(alias, "sessions");
+	f.context.spawnerSessionFile = join(alias, "sessions", "parent.jsonl");
+	f.context.ownExtensionPath = join(alias, "index.ts");
+	const extension = join(f.dir, "extension.ts");
+	writeFileSync(extension, "");
+	f.plan.launch.extensions = [extension, join(alias, "extension.ts")];
+	await assert.rejects(
+		launchRun(f.plan, f.context),
+		/Two extension paths point to one file/,
+	);
+	assert.deepEqual(readdirSync(f.ownerDir), []);
+	f.plan.launch.extensions = [join(alias, "extension.ts")];
+	f.plan.launch.skills = [join(alias, "index.ts")];
+	const result = await launchRun(f.plan, f.context);
+	assert.equal(result.runDir, f.runDir);
+	assert.equal(result.spec.spawnerSessionFile, f.parent);
+	assert.equal(result.spec.launch.cwd, f.dir);
+	assert.deepEqual(result.spec.launch.extensions, [extension]);
+	assert.deepEqual(result.spec.launch.skills, [f.own]);
+});
+
+test("trust is recomputed for each launch, including resume", async (t) => {
+	const f = transaction(t);
+	f.plan.kind = "resume";
+	writeFileSync(f.plan.launch.childSessionFile, "existing");
+	let trust = true;
+	f.context.trusted = () => trust;
+	f.state.fail = "set-option";
+	const run = f.context.tmux.run;
+	f.context.tmux.run = async (args) => {
+		if (args[0] === "split-window") {
+			const script = readFileSync(join(f.runDir, "launch.sh"), "utf8");
+			assert.ok(script.includes(trust ? "'--approve'" : "'--no-approve'"));
+		}
+		return run(args);
+	};
+	await assert.rejects(launchRun(f.plan, f.context), /set-option failed/);
+	trust = false;
+	f.state.fail = "";
+	await launchRun(f.plan, f.context);
+});
