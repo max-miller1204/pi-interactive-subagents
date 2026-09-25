@@ -4,6 +4,7 @@ import {
 	chmodSync,
 	existsSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -113,6 +114,65 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 		}
 	});
 }
+
+test("reaps a test child that ignores SIGTERM before runner exit", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-tmux-stubborn-"));
+	const fixture = join(dir, "ignore.mjs");
+	const readyFile = join(dir, "ready");
+	writeFileSync(
+		fixture,
+		`import { writeFileSync } from "node:fs";\nprocess.on("SIGTERM", () => {});\nwriteFileSync(${JSON.stringify(readyFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+	);
+	const runnerChild = spawn(
+		process.execPath,
+		[runner, "--isolated-tmux", fixture],
+		{
+			cwd: root,
+			env: cleanEnvironment(),
+			stdio: "ignore",
+		},
+	);
+	assert.ok(runnerChild.pid);
+	let fixturePid: number | undefined;
+	try {
+		await waitForServer(runnerChild.pid, readyFile);
+		const pid = Number(readFileSync(readyFile, "utf8"));
+		fixturePid = pid;
+		const exit = new Promise<number | null>((resolve, reject) => {
+			const timeout = setTimeout(
+				() => reject(new Error("runner exit timed out")),
+				2000,
+			);
+			runnerChild.once("exit", (code) => {
+				clearTimeout(timeout);
+				resolve(code);
+			});
+		});
+		runnerChild.kill("SIGTERM");
+		assert.equal(await exit, 1);
+		assert.throws(
+			() => process.kill(pid, 0),
+			{ code: "ESRCH" },
+			"test child still runs",
+		);
+		assert.equal(
+			serverStatus(runnerChild.pid),
+			1,
+			"private tmux server still runs",
+		);
+	} finally {
+		runnerChild.kill("SIGKILL");
+		if (fixturePid) spawnSync("kill", ["-KILL", String(fixturePid)]);
+		spawnSync("tmux", [
+			"-L",
+			`pi-subagents-test-${runnerChild.pid}`,
+			"-f",
+			"/dev/null",
+			"kill-server",
+		]);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 test("cleans the private tmux server after startup failure", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-tmux-startup-"));

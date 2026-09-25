@@ -69,34 +69,36 @@ function startPrivateServer() {
 }
 
 const isolated = isolatedTmux ? startPrivateServer() : null;
-let child;
+let escalation;
+let interrupted = false;
 try {
-	child = spawn(process.execPath, nodeArgs, {
+	const child = spawn(process.execPath, nodeArgs, {
 		env: isolated ? isolated.environment : environment,
 		stdio: "inherit",
+	});
+	const exit = new Promise((resolve, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code, signal) => resolve({ code, signal }));
 	});
 	if (isolated) {
 		for (const signal of ["SIGINT", "SIGTERM"]) {
 			process.on(signal, () => {
+				if (interrupted) return;
+				interrupted = true;
 				child.kill(signal);
-				isolated.stop();
-				process.exit(1);
+				escalation = setTimeout(() => child.kill("SIGKILL"), 500);
 			});
 		}
 	}
-	const result = await new Promise((resolve, reject) => {
-		child.once("error", reject);
-		child.once("exit", (code, signal) => resolve({ code, signal }));
-	});
+	const result = await exit;
 	if (result.signal) {
 		console.error(`Tests stopped with signal ${result.signal}.`);
-		process.exitCode = 1;
-	} else {
-		process.exitCode = result.code;
 	}
+	process.exitCode = interrupted || result.signal ? 1 : result.code;
 } catch (error) {
 	console.error(`Cannot start tests: ${error.message}`);
 	process.exitCode = 1;
 } finally {
+	clearTimeout(escalation);
 	isolated?.stop();
 }
