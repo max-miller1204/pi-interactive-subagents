@@ -257,12 +257,13 @@ export function registerRenderers(
 			const d = detailsOf<{ stopped: string[]; undelivered: ResultDetails[] }>(
 				message.details,
 			);
+			if (typeof message.content !== "string")
+				throw new Error("Subagent notice content must be text.");
 			return new Text(
 				theme.fg(
 					"warning",
 					`Subagent delivery notice: ${d.stopped.join(", ")}`,
-				) +
-					(expanded ? `\n${d.undelivered.map(resultContent).join("\n")}` : ""),
+				) + (expanded ? `\n${message.content}` : ""),
 				0,
 				0,
 			);

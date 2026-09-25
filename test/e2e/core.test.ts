@@ -1035,10 +1035,6 @@ test("quit saves a stopped child, reports stderr, and reopens one notice", async
 	const saved = readJsonStrict(UndeliveredRecord, join(dir, record));
 	assert.equal(saved.kind, "stopped");
 	assert.equal(saved.launch.childSessionFile, child);
-	assert.match(
-		readFileSync(run.stderrFile, "utf8"),
-		/Pi quit, so it stopped 1 running subagents: worker/,
-	);
 	assert.ok(
 		!(await run.tmux(["list-panes", "-a", "-F", "#{pane_id}"]))
 			.split("\n")
@@ -1058,19 +1054,37 @@ test("quit saves a stopped child, reports stderr, and reopens one notice", async
 			),
 		"final quit report and dead pane",
 	);
+	assert.match(
+		readFileSync(run.stderrFile, "utf8"),
+		/Pi quit, so it stopped 1 running subagents: worker/,
+	);
 	await run.reopen(run.parentFile);
 	await run.waitFor(
 		() => messages(run.readParent(), "subagent_notice")[0],
 		"reopened notice",
 	);
 	const notice = checkedNotice(run.readParent(), [saved.runId]);
-	assert.match(notice.content, /Stopped: worker/);
-	assert.match(
-		await rendered(run, run.parentPane, "Subagent delivery notice: worker"),
-		/Subagent delivery notice: worker/,
+	const stoppedLine =
+		"Stopped: worker. Their sessions are saved. Resume one with subagent_message({ name, message }).";
+	assert.equal(
+		notice.content,
+		`Pi stopped while subagents were running.\n\n${stoppedLine}`,
 	);
-	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
 	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
+	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
+	await rendered(
+		run,
+		run.parentPane,
+		"Pi stopped while subagents were running.",
+	);
+	const expanded = await rendered(run, run.parentPane, stoppedLine);
+	assert.ok(
+		expanded
+			.split("\n")
+			.map((line) => line.trim())
+			.join("\n")
+			.includes(`Pi stopped while subagents were running.\n\n${stoppedLine}`),
+	);
 	assert.equal(
 		run
 			.readParent()
@@ -1184,10 +1198,28 @@ test("quit after new stores the notice for the new session", async (t) => {
 		() => messages(readBranch(file), "subagent_notice")[0],
 		"notice in new session",
 	);
-	checkedNotice(readBranch(file), [saved.runId]);
+	const notice = checkedNotice(readBranch(file), [saved.runId]);
+	const stoppedLine =
+		"Stopped: worker. Their sessions are saved. Resume one with subagent_message({ name, message }).";
+	assert.equal(
+		notice.content,
+		`Pi stopped while subagents were running.\n\n${stoppedLine}`,
+	);
 	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
 	await run.tmux(["send-keys", "-t", run.parentPane, "C-o"]);
-	await rendered(run, run.parentPane, "Subagent delivery notice: worker");
+	await rendered(
+		run,
+		run.parentPane,
+		"Pi stopped while subagents were running.",
+	);
+	const expanded = await rendered(run, run.parentPane, stoppedLine);
+	assert.ok(
+		expanded
+			.split("\n")
+			.map((line) => line.trim())
+			.join("\n")
+			.includes(`Pi stopped while subagents were running.\n\n${stoppedLine}`),
+	);
 	await prompt(run, [
 		steer("Resume after new quit"),
 		{ say: "Resume sent." },
