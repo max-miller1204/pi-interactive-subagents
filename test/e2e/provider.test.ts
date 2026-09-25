@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Socket } from "node:net";
 import { test } from "node:test";
 import {
 	type Message,
@@ -44,7 +45,11 @@ function provider(): ProviderConfig {
 	assert.ok(config);
 	return config;
 }
-async function response(messages: Message[], signal?: AbortSignal) {
+async function response(
+	messages: Message[],
+	signal?: AbortSignal,
+	events?: string[],
+) {
 	const config = provider();
 	assert.equal(config.baseUrl, "http://localhost:0");
 	assert.ok(config.models?.[0]);
@@ -59,11 +64,15 @@ async function response(messages: Message[], signal?: AbortSignal) {
 	assert.ok(config.streamSimple);
 	const stream = config.streamSimple(model, normalizeContext({ messages }), {
 		...(signal ? { signal } : {}),
-		onPayload: (payload) => {
+		onPayload: async (payload) => {
+			events?.push("payload-start");
+			await Promise.resolve();
+			events?.push("payload-end");
 			payloads.push(payload);
 			return payload;
 		},
 		onResponse: (value) => {
+			events?.push("response");
 			responses.push(value);
 		},
 	});
@@ -117,6 +126,25 @@ test("no script acknowledges the newest message", async () => {
 	const result = await response([user("probe\nmore")]);
 	assert.equal(result.stopReason, "stop");
 	assert.deepEqual(result.content, [{ type: "text", text: "ack: probe" }]);
+});
+
+test("provider completes payload before response", async () => {
+	const events: string[] = [];
+	await response([user("probe")], undefined, events);
+	assert.deepEqual(events, ["payload-start", "payload-end", "response"]);
+});
+
+test("scripted requests use no network API", async (t) => {
+	let requests = 0;
+	const block = () => {
+		requests++;
+		throw new Error("Provider attempted a network request.");
+	};
+	t.mock.method(globalThis, "fetch", block);
+	t.mock.method(Socket.prototype, "connect", block);
+	await response([user("probe")]);
+	await response([user('#script [{"call":"read","args":{}}]')]);
+	assert.equal(requests, 0);
 });
 
 test("error response and hang abort do not request a network", async () => {

@@ -1,5 +1,6 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	createFauxCore,
 	fauxAssistantMessage,
 	fauxToolCall,
@@ -137,8 +138,9 @@ export default function fauxBrain(pi: ExtensionAPI): void {
 		streamSimple(model, context, options) {
 			const step = scriptStep(context.messages);
 			if ("exit" in step) process.exit(step.exit);
-			core.setResponses([
-				async () => {
+			const outer = createAssistantMessageEventStream();
+			queueMicrotask(async () => {
+				try {
 					await options?.onPayload?.(
 						{ model: model.id, messages: context.messages },
 						model,
@@ -147,18 +149,32 @@ export default function fauxBrain(pi: ExtensionAPI): void {
 						if (!options?.signal)
 							throw new Error("hang requires an abort signal");
 						const signal = options.signal;
-						if (!signal.aborted)
-							await new Promise<void>((resolve) =>
-								signal.addEventListener("abort", () => resolve(), {
-									once: true,
-								}),
-							);
-						return fauxAssistantMessage([], { stopReason: "aborted" });
-					}
-					return toFauxMessage(step);
-				},
-			]);
-			return core.streamSimple(model, context, options);
+						core.setResponses([
+							async () => {
+								if (!signal.aborted)
+									await new Promise<void>((resolve) =>
+										signal.addEventListener("abort", () => resolve(), {
+											once: true,
+										}),
+									);
+								return fauxAssistantMessage([], { stopReason: "aborted" });
+							},
+						]);
+					} else core.setResponses([toFauxMessage(step)]);
+					const inner = core.streamSimple(model, context, options);
+					for await (const event of inner) outer.push(event);
+					outer.end(await inner.result());
+				} catch (error) {
+					const message = fauxAssistantMessage([], {
+						stopReason: "error",
+						errorMessage:
+							error instanceof Error ? error.message : String(error),
+					});
+					outer.push({ type: "error", reason: "error", error: message });
+					outer.end(message);
+				}
+			});
+			return outer;
 		},
 	});
 }

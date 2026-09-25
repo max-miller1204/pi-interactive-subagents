@@ -65,6 +65,39 @@ export async function waitFor<T>(
 		`Timed out waiting for ${description} after ${deadlineMs} ms.`,
 	);
 }
+export async function terminateWindow(
+	tmux: (args: string[]) => Promise<string>,
+	pane: string,
+	diagnostic: (text: string) => void,
+): Promise<void> {
+	const errors: Error[] = [];
+	try {
+		diagnostic(
+			`Pane tail:\n${(await tmux(["capture-pane", "-p", "-J", "-S", "-40", "-t", pane])).slice(-2000)}`,
+		);
+	} catch (error) {
+		errors.push(
+			new Error(`Cannot capture parent pane: ${String(error)}`, {
+				cause: error,
+			}),
+		);
+	}
+	try {
+		await tmux(["kill-window", "-t", pane]);
+	} catch (error) {
+		errors.push(
+			new Error(`Cannot kill parent window ${pane}: ${String(error)}`, {
+				cause: error,
+			}),
+		);
+	}
+	if (errors.length)
+		throw new AggregateError(
+			errors,
+			errors.map((error) => error.message).join("; "),
+		);
+}
+
 export interface ScenarioOptions {
 	prompt: string;
 	agents?: Record<string, string>;
@@ -184,14 +217,19 @@ export async function scenario(
 	);
 	let pane: string | undefined;
 	t.after(async () => {
+		const errors: Error[] = [];
+		let windowExists = false;
 		try {
 			const panes = await tmux(["list-panes", "-a", "-F", "#{pane_id}"]);
-			if (pane && panes.split("\n").includes(pane)) {
-				t.diagnostic(
-					`Pane tail:\n${(await tmux(["capture-pane", "-p", "-J", "-S", "-40", "-t", pane])).slice(-2000)}`,
-				);
-				await tmux(["kill-window", "-t", pane]);
-			}
+			windowExists = pane !== undefined && panes.split("\n").includes(pane);
+		} catch (error) {
+			errors.push(
+				new Error("Cannot list private panes during cleanup.", {
+					cause: error,
+				}),
+			);
+		}
+		try {
 			if (existsSync(stderrFile))
 				t.diagnostic(`Stderr:\n${readFileSync(stderrFile, "utf8")}`);
 			if (existsSync(parentFile))
@@ -205,9 +243,39 @@ export async function scenario(
 			const runs = join(agentDir, "subagent-runs");
 			if (existsSync(runs))
 				t.diagnostic(`Run directories: ${readdirSync(runs).join(", ")}`);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
+		} catch (error) {
+			errors.push(
+				new Error("Cannot read private run diagnostics.", { cause: error }),
+			);
 		}
+		if (pane && (windowExists || errors.length > 0)) {
+			try {
+				await terminateWindow(tmux, pane, (text) => t.diagnostic(text));
+			} catch (error) {
+				if (error instanceof AggregateError) errors.push(...error.errors);
+				else errors.push(new Error("Window cleanup failed.", { cause: error }));
+			}
+		}
+		if (
+			errors.some((error) =>
+				error.message.startsWith("Cannot kill parent window"),
+			)
+		)
+			t.diagnostic(`Keep ${root} for recovery.`);
+		else {
+			try {
+				rmSync(root, { recursive: true, force: true });
+			} catch (error) {
+				errors.push(
+					new Error(`Cannot remove test directory ${root}.`, { cause: error }),
+				);
+			}
+		}
+		if (errors.length)
+			throw new AggregateError(
+				errors,
+				`Private scenario cleanup failed: ${errors.map((error) => error.message).join("; ")}`,
+			);
 	});
 	pane = (
 		await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", ""])
