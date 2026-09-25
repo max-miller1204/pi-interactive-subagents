@@ -624,13 +624,28 @@ test("preflight rejects invalid command words before any filesystem change", asy
 		const f = transaction(t);
 		change(f);
 		const changes: string[] = [];
+		const parentContentBefore = readFileSync(f.parent);
+		const parentBefore = statSync(f.parent, { bigint: true });
+		const sessionEntriesBefore = readdirSync(f.sessions);
+		const ownerEntriesBefore = readdirSync(f.ownerDir);
 		const watchers = [f.ownerDir, f.sessions].map((dir) =>
 			watch(dir, (event, name) => changes.push(`${event}:${name}`)),
 		);
 		try {
 			await assert.rejects(launchRun(f.plan, f.context), /NUL|too long/);
 			await new Promise<void>((resolve) => setImmediate(resolve));
-			assert.deepEqual(changes, []);
+			assert.deepEqual(
+				changes.filter((change) => change !== "rename:parent.jsonl"),
+				[],
+			);
+			assert.equal(readFileSync(f.parent).compare(parentContentBefore), 0);
+			const parentAfter = statSync(f.parent, { bigint: true });
+			assert.equal(parentAfter.dev, parentBefore.dev);
+			assert.equal(parentAfter.ino, parentBefore.ino);
+			assert.equal(parentAfter.size, parentBefore.size);
+			assert.equal(parentAfter.mtimeNs, parentBefore.mtimeNs);
+			assert.deepEqual(readdirSync(f.sessions), sessionEntriesBefore);
+			assert.deepEqual(readdirSync(f.ownerDir), ownerEntriesBefore);
 		} finally {
 			for (const watcher of watchers) watcher.close();
 		}
