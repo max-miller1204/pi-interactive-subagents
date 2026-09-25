@@ -202,3 +202,108 @@ node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/
 - Did not dispatch subagents or reviewers. Did not merge or push.
 - Main concern: the code commit intentionally retains the exact blocked E2E assertion. Task 3 cannot be approved as complete without a decision on scenario 18.
 - Compatibility note: `/trust` takes effect after the restart required by Pi 0.87.1. The test does not claim an immediate catalog refresh.
+
+## Continuation: approved live argument observation
+
+### Current status: COMPLETE
+
+The initial BLOCKED status above is historical. The ruling supplied on 2026-09-25 at 10:33:22 authorizes a direct in-process argument observation for scenario 18. All lifecycle tests now pass.
+
+### Approved specification deviation
+
+Scenario 18 now obtains actual `process.argv` through the already permitted `lifecycle_probe` tool in the live resumed child. It no longer uses `ps -o args=` as its acceptance oracle. Pi deliberately sets its OS process title to `pi`, so that command cannot expose the flags on this host.
+
+This is one direct observation method, not a fallback. No pinned Pi code, process title, handoff file, or global Pi configuration changed. The other scenarios and private socket identity checks remain intact.
+
+### Changes and ownership checks
+
+- `test/fixtures/lifecycle-tools.ts` now returns the actual process PID, the session manager's saved session path, and the child run argument with its existing active tools and `process.argv`. The fixture rejects a missing saved session or an absent or duplicate run argument.
+- `test/e2e/lifecycle.test.ts` strictly validates those additional probe fields.
+- The initial child calls the probe before it finishes. That saved result remains in the child session as a deliberate earlier-segment test case.
+- The resumed child calls the probe again and then hangs. The test verifies that its pane remains live on the expected private server. The saved probe PID must equal the verified resumed pane PID. The session path and run directory must match the resumed run. The PID and run directory must differ from the earlier observation.
+- The parent session must contain no probe tool result.
+- The test strictly parses the child run marker for the resumed run ID. Exactly one probe result must follow that marker. Its saved details must equal the observation used for assertions.
+- Exact argument-value arrays are compared for `--tools`, every `-e`, every `--skill`, `--model`, `--thinking`, and `--session`. The `-e` comparison includes the subagent extension itself plus the stored Launch extension paths. Missing, extra, duplicate, or changed values fail these comparisons.
+- The child run argument must identify the current resumed run directory. The final result must still contain only `Resumed segment only.`. The session and full rendered result checks remain in place.
+
+### RED evidence
+
+All focused commands used:
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-name-pattern='19.3.18' test/e2e/lifecycle.test.ts
+```
+
+First, the stricter result schema ran against the original probe fixture before the metadata implementation:
+
+```text
+ tests 1
+ pass 0
+ fail 1
+ Error: probe result: / must have required properties pid, sessionFile, runDir
+```
+
+Next, the scenario deliberately selected probe index 0, from the original completed segment, while the resumed child was live:
+
+```text
+ tests 1
+ pass 0
+ fail 1
+ AssertionError: probe must come from the live resumed child PID
+ 94277 !== 95639
+```
+
+After selecting the resumed segment, the test deliberately expected the wrong `--thinking` flag value:
+
+```text
+ tests 1
+ pass 0
+ fail 1
+ AssertionError: Expected values to be strictly deep-equal
+ actual: [ 'off' ]
+ expected: [ 'high' ]
+```
+
+These failures prove that the assertions reject an earlier segment and a wrong flag. The temporary wrong index and wrong expectation were removed. The final expectation comes from the stored Launch.
+
+### GREEN verification
+
+The corrected focused scenario returned:
+
+```text
+ tests 1
+ pass 1
+ fail 0
+ skipped 0
+ todo 0
+```
+
+The complete lifecycle file returned:
+
+```text
+node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/lifecycle.test.ts
+ tests 14
+ pass 14
+ fail 0
+ skipped 0
+ todo 0
+```
+
+The full requested suite returned:
+
+```text
+npm test
+ check:pi-version: PASS
+ typecheck: PASS
+ lint: PASS
+ unit: 366 tests, 366 pass, 0 fail
+ sdk: 80 tests, 80 pass, 0 fail
+```
+
+`git diff --check` passed. Self-review checked exact flag comparisons, persisted segment ownership, and the unchanged private socket checks. No subagent or reviewer was dispatched. No merge or push occurred.
+
+Local logs: `/tmp/task3-resume-probe-schema-red.log`, `/tmp/task3-resume-wrong-segment-red.log`, `/tmp/task3-resume-wrong-flag-red.log`, `/tmp/task3-resume-green.log`, `/tmp/task3-continuation-focused.log`, and `/tmp/task3-continuation-npm.log`. Relevant output is preserved above.
+
+### Remaining concerns
+
+No open blocker remains under the approved ruling. The documented deviations remain explicit: scenario 18 uses live in-process arguments, and scenario 24 follows the restart instruction from pinned Pi after `/trust`. The full E2E suite was not run in this continuation; the requested lifecycle file and full `npm test` passed.

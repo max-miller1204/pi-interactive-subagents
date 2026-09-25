@@ -10,11 +10,27 @@ export default function lifecycleTools(pi: ExtensionAPI): void {
 		label: "Lifecycle probe",
 		description: "Report the actual active tools and process arguments.",
 		parameters: Type.Object({}),
-		async execute() {
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			const runArgs = process.argv.filter((word) =>
+				word.startsWith("--subagent-run="),
+			);
+			if (
+				sessionFile === undefined ||
+				runArgs.length !== 1 ||
+				runArgs[0] === undefined
+			)
+				throw new Error(
+					"The lifecycle probe requires a saved child session and one run argument.",
+				);
+			const runDir = runArgs[0].slice("--subagent-run=".length);
 			const details = {
 				active: pi.getActiveTools(),
 				argv: process.argv,
 				loaded: true,
+				pid: process.pid,
+				sessionFile,
+				runDir,
 			};
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],

@@ -14,6 +14,7 @@ import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { processIdentity } from "../../src/process.ts";
 import {
+	ChildEntry,
 	ChildStatus,
 	PaneFile,
 	parseStrict,
@@ -182,16 +183,27 @@ const Probe = Type.Object(
 		active: Type.Array(Type.String()),
 		argv: Type.Array(Type.String()),
 		loaded: Type.Literal(true),
+		pid: Type.Integer({ minimum: 1 }),
+		sessionFile: Type.String({ pattern: "^/" }),
+		runDir: Type.String({ pattern: "^/" }),
 	},
 	{ additionalProperties: false },
 );
-async function probe(run: Scenario, file: string) {
+async function probe(run: Scenario, file: string, index = 0) {
 	const response = await run.waitFor(
-		() => toolResults(file, "lifecycle_probe")[0],
+		() => toolResults(file, "lifecycle_probe")[index],
 		"child probe result",
 	);
-	assert.equal(response.isError, false);
+	assert.equal(response.isError, false, JSON.stringify(response.content));
 	return parseStrict(Probe, response.details, "probe result");
+}
+function argumentValues(argv: string[], flag: string): string[] {
+	return argv.flatMap((word, index) => {
+		if (word !== flag) return [];
+		const value = argv[index + 1];
+		assert.ok(value !== undefined, `Missing value after ${flag}`);
+		return [value];
+	});
 }
 async function reload(run: Scenario) {
 	await run.sendKeys(run.parentPane, "/reload");
@@ -422,7 +434,12 @@ test("19.3.18: resume uses stored launch arguments and only new output", async (
 	);
 	await reload(run);
 	await prompt(run, [
-		spawn(script([{ say: "Original segment only." }])),
+		spawn(
+			script([
+				{ call: "lifecycle_probe", args: {} },
+				{ say: "Original segment only." },
+			]),
+		),
 		{ say: "First run started." },
 		{ say: "First result received." },
 	]);
@@ -431,8 +448,9 @@ test("19.3.18: resume uses stored launch arguments and only new output", async (
 	const saved = records(run.parentFile).find((entry) => entry.kind === "spawn");
 	assert.ok(saved?.kind === "spawn");
 	assert.deepEqual(saved.launch.skills, [skill]);
+	const originalProbe = await probe(run, first.childSessionFile);
 	await prompt(run, [
-		steer(script([{ hang: true }])),
+		steer(script([{ call: "lifecycle_probe", args: {} }, { hang: true }])),
 		{ say: "Resume started." },
 		{ say: "Resume result received." },
 	]);
@@ -440,12 +458,60 @@ test("19.3.18: resume uses stored launch arguments and only new output", async (
 	assert.equal(child.spec.kind, "resume");
 	assert.deepEqual(child.spec.launch, saved.launch);
 	await visible(run, "Working", child.pane.paneId);
-	await verify(run, child);
-	const argv = execFileSync(
-		"ps",
-		["-o", "args=", "-p", String(child.pane.process.pid)],
-		{ encoding: "utf8" },
+	const observed = await probe(run, child.spec.launch.childSessionFile, 1);
+	const live = await verify(run, child);
+	assert.equal(live.dead, false);
+	assert.equal(
+		observed.pid,
+		live.pid,
+		"probe must come from the live resumed child PID",
 	);
+	assert.equal(observed.sessionFile, child.spec.launch.childSessionFile);
+	assert.equal(observed.runDir, child.path);
+	assert.notEqual(observed.pid, originalProbe.pid);
+	assert.notEqual(observed.runDir, originalProbe.runDir);
+	assert.equal(toolResults(run.parentFile, "lifecycle_probe").length, 0);
+	const branch = readBranch(child.spec.launch.childSessionFile);
+	const boundary = branch.findIndex((entry) => {
+		if (entry.type !== "custom" || entry.customType !== "subagent_child")
+			return false;
+		const data = parseStrict(ChildEntry, entry.data, "child segment marker");
+		return data.kind === "run" && data.runId === child.spec.runId;
+	});
+	assert.ok(boundary >= 0);
+	const segmentProbes = branch
+		.slice(boundary + 1)
+		.flatMap((entry) =>
+			entry.type === "message" &&
+			entry.message.role === "toolResult" &&
+			entry.message.toolName === "lifecycle_probe"
+				? [entry.message]
+				: [],
+		);
+	assert.equal(segmentProbes.length, 1);
+	assert.ok(segmentProbes[0]);
+	assert.equal(segmentProbes[0].isError, false);
+	assert.deepEqual(
+		parseStrict(Probe, segmentProbes[0].details, "saved resumed probe"),
+		observed,
+	);
+	const argv = observed.argv;
+	assert.deepEqual(argumentValues(argv, "--tools"), [
+		saved.launch.tools.join(","),
+	]);
+	assert.deepEqual(argumentValues(argv, "-e"), [
+		realpathSync(resolve("src/index.ts")),
+		...saved.launch.extensions,
+	]);
+	assert.deepEqual(argumentValues(argv, "--skill"), saved.launch.skills);
+	assert.deepEqual(argumentValues(argv, "--model"), [
+		`${saved.launch.model.provider}/${saved.launch.model.id}`,
+	]);
+	assert.deepEqual(argumentValues(argv, "--thinking"), [saved.launch.thinking]);
+	assert.deepEqual(argumentValues(argv, "--session"), [
+		saved.launch.childSessionFile,
+	]);
+	assert.ok(argv.includes(`--subagent-run=${child.path}`));
 	await run.tmux(["send-keys", "-t", child.pane.paneId, "Escape"]);
 	await visible(run, "Operation aborted", child.pane.paneId);
 	await prompt(run, [{ say: "Resumed segment only." }], child.pane.paneId);
@@ -455,21 +521,6 @@ test("19.3.18: resume uses stored launch arguments and only new output", async (
 	assert.equal(second.text, "Resumed segment only.");
 	assert.equal(second.childSessionFile, first.childSessionFile);
 	assert.match(await expanded(run, second), /Resumed segment only\./);
-	assert.ok(
-		argv.includes(`--tools ${saved.launch.tools.join(",")}`),
-		`Pinned Pi replaces OS arguments with its process title: ${JSON.stringify(argv)}`,
-	);
-	for (const extension of saved.launch.extensions)
-		assert.ok(argv.includes(`-e ${extension}`));
-	for (const path of saved.launch.skills)
-		assert.ok(argv.includes(`--skill ${path}`));
-	assert.ok(
-		argv.includes(
-			`--model ${saved.launch.model.provider}/${saved.launch.model.id}`,
-		),
-	);
-	assert.ok(argv.includes(`--thinking ${saved.launch.thinking}`));
-	assert.ok(argv.includes(`--session ${first.childSessionFile}`));
 });
 
 test("19.3.20: nested allowlists and depth three constrain actual tools", async (t) => {
