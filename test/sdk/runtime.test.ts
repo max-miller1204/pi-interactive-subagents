@@ -676,6 +676,283 @@ for (const starts of [2, 3])
 		h.assertNoErrors();
 	});
 
+test("same factory retries recovery after a rejected suspended startup", {
+	timeout: 20_000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t);
+	const ownerKey = `1-${"0".repeat(64)}`;
+	const deadDir = join(h.root, "runs", "owners", ownerKey, h.spec.runId);
+	mkdirSync(deadDir, { recursive: true });
+	writeJsonAtomic(join(deadDir, "spec.json"), {
+		...h.spec,
+		ownerKey,
+		owner: { pid: 1, start: "dead" },
+	});
+	writeJsonAtomic(join(deadDir, "pane.json"), {
+		v: 1,
+		paneId: "%3",
+		process: { pid: 999999, start: "dead" },
+	});
+	const entered = Promise.withResolvers<void>();
+	const snapshot = Promise.withResolvers<Map<string, never>>();
+	let snapshots = 0;
+	h.tmux.listPanes = async () => {
+		snapshots++;
+		if (snapshots === 1) {
+			entered.resolve();
+			return snapshot.promise;
+		}
+		return new Map();
+	};
+	const runner = h.session.extensionRunner;
+	const oldStart = runner.emit({ type: "session_start", reason: "startup" });
+	await entered.promise;
+	const replacement = runner.emit({ type: "session_start", reason: "startup" });
+	await nextImmediate();
+	assert.equal(snapshots, 1);
+	snapshot.reject(new Error("Fixture startup snapshot failed."));
+	await Promise.all([oldStart, replacement]);
+	const errors = h.takeErrors();
+	await runner.emit({ type: "session_start", reason: "startup" });
+	const laterErrors = h.takeErrors();
+	assert.deepEqual(
+		errors.map((event) => event.error),
+		["Fixture startup snapshot failed."],
+	);
+	assert.deepEqual(laterErrors, []);
+	assert.equal(snapshots, 2);
+	assert.equal(existsSync(deadDir), false);
+	assert.equal(h.widgets.length, 3);
+});
+
+for (const killFails of [false, true])
+	test(`quit after a failed startup performs safe cleanup${killFails ? " and reports cleanup errors" : ""}`, {
+		timeout: 20_000,
+	}, async (t) => {
+		const h = await createRuntimeHarness(t);
+		assert.ok(prepareRun);
+		prepareRun({
+			root: h.root,
+			spec: h.spec,
+			runDir: h.runDir,
+			manager: h.session.sessionManager,
+			tmux: h.tmux,
+		});
+		const ownerKey = `1-${"0".repeat(64)}`;
+		const deadDir = join(h.root, "runs", "owners", ownerKey, h.spec.runId);
+		mkdirSync(deadDir, { recursive: true });
+		writeJsonAtomic(join(deadDir, "spec.json"), {
+			...h.spec,
+			ownerKey,
+			owner: { pid: 1, start: "dead" },
+		});
+		writeJsonAtomic(join(deadDir, "pane.json"), {
+			v: 1,
+			paneId: "%3",
+			process: { pid: 999999, start: "dead" },
+		});
+		const entered = Promise.withResolvers<void>();
+		const snapshot = Promise.withResolvers<Map<string, never>>();
+		const listPanes = h.tmux.listPanes.bind(h.tmux);
+		const run = h.tmux.run.bind(h.tmux);
+		let snapshots = 0;
+		h.tmux.listPanes = async () => {
+			if (++snapshots === 1) {
+				entered.resolve();
+				return snapshot.promise;
+			}
+			return listPanes();
+		};
+		if (killFails)
+			h.tmux.run = async (args) => {
+				h.tmux.commands.push(args);
+				throw new Error("Fixture pane cleanup failed.");
+			};
+		const runner = h.session.extensionRunner;
+		const start = runner.emit({ type: "session_start", reason: "startup" });
+		await entered.promise;
+		const quit = runner.emit({ type: "session_shutdown", reason: "quit" });
+		snapshot.reject(new Error("Fixture startup snapshot failed."));
+		await Promise.all([start, quit]);
+		const errors = h.takeErrors();
+		h.tmux.run = run;
+		assert.ok(
+			h.tmux.commands.some(
+				(args) => args[0] === "kill-pane" && args[2] === "%2",
+			),
+			"Quit must close its attached pane after failed startup.",
+		);
+		assert.equal(existsSync(h.runDir), killFails);
+		assert.equal(
+			existsSync(deadDir),
+			true,
+			"Disposed startup must not recover foreign files.",
+		);
+		assert.deepEqual(
+			errors.map((event) => event.error),
+			["Fixture startup snapshot failed."],
+		);
+		assert.equal(h.stderr.length, 1);
+		if (killFails) {
+			assert.match(h.stderr[0] ?? "", /Fixture pane cleanup failed/);
+			assert.ok(
+				h.notices.some(
+					(notice) => notice.message === "Fixture pane cleanup failed.",
+				),
+			);
+		} else assert.match(h.stderr[0] ?? "", /stopped 1 running subagents/);
+	});
+
+test("failed parent startup reconciles a durable result before quit cleanup", {
+	timeout: 20_000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t);
+	h.faux.setResponses([fauxAssistantMessage("Save parent.")]);
+	await h.session.prompt("Save parent.");
+	assert.ok(prepareRun);
+	prepareRun({
+		root: h.root,
+		spec: h.spec,
+		runDir: h.runDir,
+		manager: h.session.sessionManager,
+		tmux: h.tmux,
+	});
+	const details = {
+		v: 1,
+		deliveryId: `${h.spec.runId}:result`,
+		runId: h.spec.runId,
+		name: h.spec.launch.name,
+		agent: h.spec.launch.agent,
+		profile: h.spec.launch.profile,
+		autoExit: false,
+		status: "completed",
+		text: "Durable result",
+		truncated: false,
+		undelivered: [],
+		openQuestions: [],
+		durationMs: 1,
+		contextTokens: null,
+		childSessionFile: h.spec.launch.childSessionFile,
+		spawnerSessionFile: h.spec.spawnerSessionFile,
+	};
+	writeJsonAtomic(join(h.runDir, "result.json"), details);
+	h.pi.sendMessage(
+		{
+			customType: "subagent_result",
+			content: "Durable result",
+			display: true,
+			details,
+		},
+		{ triggerTurn: false },
+	);
+	const ownerKey = `1-${"0".repeat(64)}`;
+	const deadDir = join(h.root, "runs", "owners", ownerKey, h.spec.runId);
+	mkdirSync(deadDir, { recursive: true });
+	writeJsonAtomic(join(deadDir, "spec.json"), {
+		...h.spec,
+		ownerKey,
+		owner: { pid: 1, start: "dead" },
+	});
+	writeJsonAtomic(join(deadDir, "pane.json"), {
+		v: 1,
+		paneId: "%3",
+		process: { pid: 999999, start: "dead" },
+	});
+	const entered = Promise.withResolvers<void>();
+	const snapshot = Promise.withResolvers<Map<string, never>>();
+	const listPanes = h.tmux.listPanes.bind(h.tmux);
+	let snapshots = 0;
+	h.tmux.listPanes = async () => {
+		if (++snapshots === 1) {
+			entered.resolve();
+			return snapshot.promise;
+		}
+		return listPanes();
+	};
+	const runner = h.session.extensionRunner;
+	const start = runner.emit({ type: "session_start", reason: "startup" });
+	await entered.promise;
+	const quit = runner.emit({ type: "session_shutdown", reason: "quit" });
+	snapshot.reject(new Error("Fixture startup snapshot failed."));
+	await Promise.all([start, quit]);
+	assert.deepEqual(
+		h.takeErrors().map((event) => event.error),
+		["Fixture startup snapshot failed."],
+	);
+	assert.equal(existsSync(h.runDir), false);
+	assert.equal(h.messages("subagent_result").length, 1);
+	assert.equal(
+		existsSync(
+			join(
+				h.root,
+				"runs",
+				"undelivered",
+				h.session.sessionManager.getSessionId(),
+			),
+		),
+		false,
+	);
+	assert.doesNotMatch(h.stderr.join(""), /kept 1 result/);
+});
+
+test("failed factory startup still reconciles and disposes its child", {
+	timeout: 20_000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t, { child: true });
+	const runner = h.session.extensionRunner;
+	h.failNextWidget(new Error("Fixture widget startup failed."));
+	await runner.emit({ type: "session_start", reason: "reload" });
+	const startupErrors = h.takeErrors();
+	const seq = inbox(h, "Durable before shutdown");
+	h.pi.sendMessage(
+		{
+			customType: "subagent_parent_message",
+			content: "Durable before shutdown",
+			display: true,
+			details: {
+				deliveryId: queue.itemId(h.spec.runId, "inbox", seq),
+				kind: "message",
+			},
+		},
+		{ triggerTurn: false },
+	);
+	h.faux.setResponses([
+		fauxAssistantMessage(
+			{
+				type: "toolCall",
+				id: "disposed",
+				name: "ask_question",
+				arguments: { question: "Must be disposed?" },
+			},
+			{ stopReason: "toolUse" },
+		),
+		fauxAssistantMessage("Disposed."),
+	]);
+	const prompt = h.session.prompt(h.spec.initialPrompt);
+	try {
+		await until(() => questions(h).length === 1, "The question did not open.");
+		await runner.emit({ type: "session_shutdown", reason: "reload" });
+		const shutdownErrors = h.takeErrors();
+		assert.equal(
+			questions(h).length,
+			0,
+			"Failed startup must not skip child disposal.",
+		);
+		assert.equal(queue.count(join(h.runDir, "inbox")), 0);
+		assert.deepEqual(
+			startupErrors.map((event) => event.error),
+			["Fixture widget startup failed."],
+		);
+		assert.deepEqual(shutdownErrors, []);
+	} finally {
+		await h.session.abort();
+		await prompt;
+	}
+	await runner.emit({ type: "session_start", reason: "reload" });
+	h.assertNoErrors();
+	assert.equal(h.widgets.length, 2);
+});
+
 test("dead parent pane result is delivered once and removed", {
 	timeout: 20_000,
 }, async (t) => {

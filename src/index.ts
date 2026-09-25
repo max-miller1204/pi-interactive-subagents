@@ -59,7 +59,7 @@ interface ActiveRuntime {
 	startup?: ChildStartup;
 	child?: ReturnType<typeof installChildRole>;
 	disposed: boolean;
-	startupTask?: Promise<void>;
+	startupCompletion: Promise<void>;
 	shutdown(reason: Parameters<Runtime["onShutdown"]>[0]): Promise<void>;
 }
 export function createSubagentsExtension(
@@ -75,17 +75,38 @@ export function createSubagentsExtension(
 	let runtime: ActiveRuntime | undefined;
 	pi.on("session_start", async (event, ctx) => {
 		const previous = runtime;
+		const completion = Promise.withResolvers<void>();
 		const current: ActiveRuntime = {
 			disposed: false,
+			startupCompletion: completion.promise,
 			async shutdown(reason) {
 				current.disposed = true;
-				await current.parent?.onShutdown(reason);
-				await current.startupTask;
-				current.child?.dispose();
+				const errors: unknown[] = [];
+				try {
+					await current.parent?.onShutdown(reason);
+				} catch (error) {
+					errors.push(error);
+				}
+				await current.startupCompletion;
+				try {
+					current.child?.dispose();
+				} catch (error) {
+					errors.push(error);
+				}
+				if (errors.length === 1) throw errors[0];
+				if (errors.length > 1)
+					throw new AggregateError(
+						errors,
+						errors
+							.map((error) =>
+								error instanceof Error ? error.message : String(error),
+							)
+							.join("\n"),
+					);
 			},
 		};
 		runtime = current;
-		current.startupTask = (async () => {
+		try {
 			await previous?.shutdown("reload");
 			if (runtime !== current || current.disposed) return;
 			const path = pi.getFlag("subagent-run");
@@ -163,8 +184,9 @@ export function createSubagentsExtension(
 				},
 				{ placement: "aboveEditor" },
 			);
-		})();
-		await current.startupTask;
+		} finally {
+			completion.resolve();
+		}
 	});
 	pi.on("input", (event) => {
 		const blocked = runtime?.startup?.onInput();

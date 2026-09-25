@@ -25,6 +25,7 @@ import {
 	createAgentSessionServices,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type ExtensionError,
 	type ExtensionFactory,
 	type ExtensionUIContext,
 	ModelRuntime,
@@ -211,7 +212,8 @@ export async function createRuntimeHarness(
 	const widgets: unknown[] = [];
 	const renderers = new Set<string>();
 	const events: string[] = [];
-	const errors: unknown[] = [];
+	const errors: ExtensionError[] = [];
+	let widgetFailure: Error | undefined;
 	let shutdowns = 0;
 	let renderRequests = 0;
 	let api: ExtensionAPI | undefined;
@@ -220,6 +222,11 @@ export async function createRuntimeHarness(
 		notify: (message: string, type?: string) => notices.push({ message, type }),
 		setStatus: () => {},
 		setWidget: (_key: string, widget: unknown) => {
+			if (widgetFailure !== undefined) {
+				const error = widgetFailure;
+				widgetFailure = undefined;
+				throw error;
+			}
 			widgets.push(widget);
 			if (typeof widget === "function")
 				widget(
@@ -343,6 +350,10 @@ export async function createRuntimeHarness(
 		renderers,
 		events,
 		stderr,
+		takeErrors: (): ExtensionError[] => errors.splice(0),
+		failNextWidget: (error: Error) => {
+			widgetFailure = error;
+		},
 		get session() {
 			return runtime.session;
 		},

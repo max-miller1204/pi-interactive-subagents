@@ -254,7 +254,7 @@ export class Runtime {
 	private readonly retiredSources = new Set<Source>();
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private inFlight: Promise<void> | undefined;
-	private startupTask: Promise<void> | undefined;
+	private startupCompletion: Promise<void> | undefined;
 	private shutdownTask: Promise<void> | undefined;
 	private disposed = false;
 	private enabled = false;
@@ -296,8 +296,13 @@ export class Runtime {
 		if (this.started || this.disposed)
 			throw new Error("This subagent runtime cannot start again.");
 		this.started = true;
-		this.startupTask = this.startRuntime(event, ctx);
-		await this.startupTask;
+		const completion = Promise.withResolvers<void>();
+		this.startupCompletion = completion.promise;
+		try {
+			await this.startRuntime(event, ctx);
+		} finally {
+			completion.resolve();
+		}
 	}
 	private async startRuntime(
 		event: Pick<SessionStartEvent, "reason">,
@@ -350,16 +355,17 @@ export class Runtime {
 				this.notify(error);
 			}
 		}
-		if (event.reason === "startup") await this.recoverDeadOwners();
-		if (this.disposed) return;
+		// Prepare shutdown reconciliation before recovery can await.
 		this.sources.push(this.noticeSource());
 		this.deliverer = new Deliverer(
 			this.pi,
 			ctx,
 			this.sources,
-			() => this.disposed,
+			() => this.disposed || !this.enabled,
 			this.deps.childSpec !== undefined,
 		);
+		if (event.reason === "startup") await this.recoverDeadOwners();
+		if (this.disposed) return;
 		this.deliverer.reconcile();
 		this.enabled = true;
 		this.startTick();
@@ -1129,7 +1135,7 @@ export class Runtime {
 		this.disposed = true;
 		this.stopTick();
 		this.shutdownTask = (async () => {
-			await this.startupTask;
+			await this.startupCompletion;
 			await this.inFlight;
 			try {
 				this.deliverer?.shutdown();
@@ -1141,7 +1147,8 @@ export class Runtime {
 		return this.shutdownTask;
 	}
 	private async quit(): Promise<void> {
-		if (!this.enabled) return;
+		if (!this.enabled && this.runs.size === 0 && this.launching.size === 0)
+			return;
 		const fold = this.fold();
 		const runs = [...this.runs.values()];
 		const notStarted = [...this.launching.keys()];
