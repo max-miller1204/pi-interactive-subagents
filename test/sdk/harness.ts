@@ -86,7 +86,15 @@ export async function createRuntimeHarness(
 		tmux?: FakeTmux;
 		child?: boolean;
 		autoExit?: boolean;
-		fault?: "spec" | "session" | "tool" | "model" | "thinking" | "prompt";
+		fault?:
+			| "directory"
+			| "spec"
+			| "session"
+			| "tool"
+			| "model"
+			| "thinking"
+			| "prompt";
+		identity?: NonNullable<RuntimeDeps["identity"]>;
 		prepare?: (fixture: {
 			root: string;
 			spec: RunSpec;
@@ -193,7 +201,7 @@ export async function createRuntimeHarness(
 		runsRoot,
 		env:
 			options.disabled === "tmux" ? {} : { TMUX: "fake,1,0", TMUX_PANE: "%1" },
-		identity: processIdentity,
+		identity: options.identity ?? processIdentity,
 		alive: (identity) => identity.pid === process.pid,
 		trusted: () => false,
 		stderr: (line) => stderr.push(line),
@@ -233,7 +241,14 @@ export async function createRuntimeHarness(
 			agentDir,
 			modelRuntime,
 			extensionFlagValues: new Map(
-				options.child ? [["subagent-run", runDir]] : [],
+				options.child
+					? [
+							[
+								"subagent-run",
+								options.fault === "directory" ? join(root, "missing") : runDir,
+							],
+						]
+					: [],
 			),
 			settingsManager: SettingsManager.inMemory({
 				compaction: { enabled: false },

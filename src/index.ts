@@ -59,6 +59,7 @@ interface ActiveRuntime {
 	startup?: ChildStartup;
 	child?: ReturnType<typeof installChildRole>;
 	disposed: boolean;
+	startupTask?: Promise<void>;
 	shutdown(reason: Parameters<Runtime["onShutdown"]>[0]): Promise<void>;
 }
 export function createSubagentsExtension(
@@ -79,87 +80,91 @@ export function createSubagentsExtension(
 			async shutdown(reason) {
 				current.disposed = true;
 				await current.parent?.onShutdown(reason);
+				await current.startupTask;
 				current.child?.dispose();
 			},
 		};
 		runtime = current;
-		await previous?.shutdown("reload");
-		if (runtime !== current || current.disposed) return;
-		const path = pi.getFlag("subagent-run");
-		if (typeof path === "string") {
-			current.startup = preflightChild(ctx, path);
-			if (current.startup.spec === undefined) return;
-		}
-		const spec = current.startup?.spec;
-		let requestRender: (() => void) | undefined;
-		const parent = new Runtime(pi, ctx, {
-			...deps,
-			...(spec === undefined ? {} : { childSpec: spec }),
-			trusted: (cwd) =>
-				realpathSync(cwd) === realpathSync(ctx.cwd)
-					? ctx.isProjectTrusted()
-					: deps.trusted(cwd),
-			requestRender: () => {
-				requestRender?.();
-				deps.requestRender?.();
-			},
-		});
-		current.parent = parent;
-		await parent.start(event);
-		if (runtime !== current || current.disposed) return;
-		if (parent.deliverer === undefined) return;
-		const catalog: CatalogInput =
-			spec === undefined
-				? buildLiveCatalog(pi, ctx, deps.ownExtensionPath, deps.agentDir)
-				: (spec.launch.nested ?? {
-						agents: {},
-						profiles: {},
-						toolSources: {},
-						skills: {},
-					});
-		registerTools(pi, parent, () => catalog, undefined, spec);
-		registerCommand(pi, parent, () => catalog, undefined, spec);
-		if (
-			spec !== undefined &&
-			(spec.launch.nested === null || spec.launch.depth >= MAX_DEPTH)
-		) {
-			pi.setActiveTools(
-				pi
-					.getActiveTools()
-					.filter(
-						(name) =>
-							!["subagent", "subagent_message", "subagents_list"].includes(
-								name,
-							),
-					),
-			);
-			pi.registerCommand("subagent", {
-				description: "Start a subagent",
-				handler: async (_args, commandCtx) => {
-					commandCtx.ui.notify(
-						"This subagent cannot start subagents.",
-						"error",
-					);
+		current.startupTask = (async () => {
+			await previous?.shutdown("reload");
+			if (runtime !== current || current.disposed) return;
+			const path = pi.getFlag("subagent-run");
+			if (typeof path === "string") {
+				current.startup = preflightChild(ctx, path);
+				if (current.startup.spec === undefined) return;
+			}
+			const spec = current.startup?.spec;
+			let requestRender: (() => void) | undefined;
+			const parent = new Runtime(pi, ctx, {
+				...deps,
+				...(spec === undefined ? {} : { childSpec: spec }),
+				trusted: (cwd) =>
+					realpathSync(cwd) === realpathSync(ctx.cwd)
+						? ctx.isProjectTrusted()
+						: deps.trusted(cwd),
+				requestRender: () => {
+					requestRender?.();
+					deps.requestRender?.();
 				},
 			});
-		}
-		if (current.startup !== undefined)
-			current.child = installChildRole(pi, ctx, parent, current.startup);
-		if ("catalog" in catalog) {
-			const errors = [...catalog.errors.map((entry) => entry.error)];
-			if (catalog.profileError !== null) errors.push(catalog.profileError);
-			if (catalog.projectFilesIgnored)
-				errors.push("Project subagent files are ignored. Run /trust first.");
-			for (const error of new Set(errors)) ctx.ui.notify(error, "error");
-		}
-		ctx.ui.setWidget(
-			"subagents",
-			(tui, theme) => {
-				requestRender = () => tui.requestRender();
-				return createWidget(parent, tui, theme, deps.now);
-			},
-			{ placement: "aboveEditor" },
-		);
+			current.parent = parent;
+			await parent.start(event);
+			if (runtime !== current || current.disposed) return;
+			if (parent.deliverer === undefined) return;
+			const catalog: CatalogInput =
+				spec === undefined
+					? buildLiveCatalog(pi, ctx, deps.ownExtensionPath, deps.agentDir)
+					: (spec.launch.nested ?? {
+							agents: {},
+							profiles: {},
+							toolSources: {},
+							skills: {},
+						});
+			registerTools(pi, parent, () => catalog, undefined, spec);
+			registerCommand(pi, parent, () => catalog, undefined, spec);
+			if (
+				spec !== undefined &&
+				(spec.launch.nested === null || spec.launch.depth >= MAX_DEPTH)
+			) {
+				pi.setActiveTools(
+					pi
+						.getActiveTools()
+						.filter(
+							(name) =>
+								!["subagent", "subagent_message", "subagents_list"].includes(
+									name,
+								),
+						),
+				);
+				pi.registerCommand("subagent", {
+					description: "Start a subagent",
+					handler: async (_args, commandCtx) => {
+						commandCtx.ui.notify(
+							"This subagent cannot start subagents.",
+							"error",
+						);
+					},
+				});
+			}
+			if (current.startup !== undefined)
+				current.child = installChildRole(pi, ctx, parent, current.startup);
+			if ("catalog" in catalog) {
+				const errors = [...catalog.errors.map((entry) => entry.error)];
+				if (catalog.profileError !== null) errors.push(catalog.profileError);
+				if (catalog.projectFilesIgnored)
+					errors.push("Project subagent files are ignored. Run /trust first.");
+				for (const error of new Set(errors)) ctx.ui.notify(error, "error");
+			}
+			ctx.ui.setWidget(
+				"subagents",
+				(tui, theme) => {
+					requestRender = () => tui.requestRender();
+					return createWidget(parent, tui, theme, deps.now);
+				},
+				{ placement: "aboveEditor" },
+			);
+		})();
+		await current.startupTask;
 	});
 	pi.on("input", (event) => {
 		const blocked = runtime?.startup?.onInput();
@@ -174,7 +179,7 @@ export function createSubagentsExtension(
 	pi.on("turn_end", (event) => runtime?.parent?.onBoundary(event));
 	pi.on("agent_before_settle", (event) => runtime?.parent?.onBoundary(event));
 	pi.on("agent_settled", () => {
-		runtime?.parent?.onAgentSettled();
+		runtime?.parent?.onAgentSettled(runtime.child?.wasInterrupted === true);
 		runtime?.child?.onAgentSettled();
 	});
 	pi.on("message_end", (event) => {

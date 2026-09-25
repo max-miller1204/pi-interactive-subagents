@@ -201,7 +201,7 @@ export class Deliverer {
 			}
 		return entries.length ? { entries, continue: cont } : undefined;
 	}
-	onAgentSettled(): void {
+	onAgentSettled(interrupted = false): void {
 		if (this.disposed || this.isDisposed()) return;
 		this.reconcile();
 		const { inSession } = this.sessionIds();
@@ -215,9 +215,10 @@ export class Deliverer {
 			)
 			.at(-1);
 		if (
-			lastAssistant?.type === "message" &&
-			lastAssistant.message.role === "assistant" &&
-			lastAssistant.message.stopReason === "aborted"
+			interrupted ||
+			(lastAssistant?.type === "message" &&
+				lastAssistant.message.role === "assistant" &&
+				lastAssistant.message.stopReason === "aborted")
 		) {
 			for (const source of this.sources)
 				for (const item of source.items())

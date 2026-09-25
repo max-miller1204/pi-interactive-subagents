@@ -160,7 +160,7 @@ function fixture(t: TestContext) {
 		ctx,
 		runtime,
 		start: () => {
-			child = installChildRole(pi, ctx, runtime, runDir);
+			child = installChildRole(pi, ctx, runtime, preflightChild(ctx, runDir));
 			return child;
 		},
 		ask: (question: string, signal?: AbortSignal) => {
@@ -182,6 +182,15 @@ function fixture(t: TestContext) {
 		shutdowns: () => shutdowns,
 	};
 }
+
+test("child installation rejects a raw path without preflight", (t) => {
+	const f = fixture(t);
+	assert.throws(() => {
+		// @ts-expect-error Installation requires a child-owned preflight object.
+		const child = installChildRole(f.pi, f.ctx, f.runtime, f.runDir);
+		child.dispose();
+	}, /Child startup must pass preflight/);
+});
 
 test("child preflight validates the spec and session before runtime startup", (t) => {
 	const f = fixture(t);
@@ -676,7 +685,12 @@ test("startup resolves run and session symlinks before comparing paths", (t) => 
 	symlinkSync(f.runDir, runLink);
 	symlinkSync(f.file, fileLink);
 	f.ctx.sessionManager.getSessionFile = () => fileLink;
-	const child = installChildRole(f.pi, f.ctx, f.runtime, runLink);
+	const child = installChildRole(
+		f.pi,
+		f.ctx,
+		f.runtime,
+		preflightChild(f.ctx, runLink),
+	);
 	try {
 		assert.equal(f.shutdowns(), 0);
 		assert.equal(f.entries.filter((e) => e.data?.kind === "run").length, 1);
@@ -690,7 +704,7 @@ test("a missing run path blocks input and tools and shuts down", (t) => {
 		f.pi,
 		f.ctx,
 		f.runtime,
-		join(f.root, "missing"),
+		preflightChild(f.ctx, join(f.root, "missing")),
 	);
 	assert.equal(f.shutdowns(), 1);
 	assert.match(present(f.notices[0]), /ENOENT/);

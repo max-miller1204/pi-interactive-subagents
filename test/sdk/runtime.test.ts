@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { setImmediate as nextImmediate } from "node:timers/promises";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { checkPiVersion, createSubagentsExtension } from "../../src/index.ts";
@@ -331,6 +332,33 @@ for (const fault of [
 			assert.equal(h.widgets.length, 0);
 	});
 
+for (const fault of ["directory", "spec", "session"] as const)
+	test(`invalid child ${fault} cannot construct or start the parent role`, async (t) => {
+		let parentIdentityCalls = 0;
+		const h = await createRuntimeHarness(t, {
+			child: true,
+			fault,
+			identity: () => {
+				parentIdentityCalls++;
+				throw new Error("Parent startup must not run.");
+			},
+		});
+		assert.equal(parentIdentityCalls, 0);
+		assert.equal(h.widgets.length, 0);
+		assert.equal(h.shutdowns, 1);
+		assert.equal(h.notices.length, 1);
+		assert.deepEqual(h.tmux.commands, []);
+		await h.session.prompt(h.spec.initialPrompt);
+		assert.equal(h.faux.state.callCount, 0);
+		const result = await h.session.extensionRunner.emitToolCall({
+			type: "tool_call",
+			toolCallId: "test",
+			toolName: "ask_question",
+			input: { question: "Blocked?" },
+		});
+		assert.equal(result?.block, true);
+	});
+
 test("child session guards cancel newSession and fork", async (t) => {
 	const h = await createRuntimeHarness(t, { child: true });
 	h.faux.setResponses([fauxAssistantMessage("Task complete.")]);
@@ -507,6 +535,146 @@ test("abort during a question holds an unread inbox item without a new run", {
 	assert.equal(h.faux.state.callCount, 1);
 	assert.equal(h.shutdowns, 0);
 });
+
+test("an aborted question holds an item first queued at settlement until a later item wakes it", {
+	timeout: 20_000,
+}, async (t) => {
+	let h: Harness;
+	let firstSettlement = true;
+	h = await createRuntimeHarness(t, {
+		child: true,
+		autoExit: true,
+		extension: (pi) => {
+			pi.on("agent_settled", () => {
+				if (!firstSettlement) return;
+				firstSettlement = false;
+				const assistant = h.session.messages.findLast(
+					(message) => message.role === "assistant",
+				);
+				assert.equal(assistant?.stopReason, "error");
+				assert.equal(h.messages("subagent_parent_message").length, 0);
+				inbox(h, "Unread at settlement");
+			});
+		},
+	});
+	h.faux.setResponses([
+		fauxAssistantMessage(
+			{
+				type: "toolCall",
+				id: "question",
+				name: "ask_question",
+				arguments: { question: "Which file?" },
+			},
+			{ stopReason: "toolUse" },
+		),
+		async (_context, options) => {
+			options?.signal?.throwIfAborted();
+			return fauxAssistantMessage("Unexpected wake.");
+		},
+	]);
+	const prompt = h.session.prompt(h.spec.initialPrompt);
+	await until(() => questions(h).length === 1, "The question did not open.");
+	await h.session.abort();
+	await prompt;
+	await until(
+		() => queue.count(join(h.runDir, "inbox")) === 0,
+		"The quiet delivery was not confirmed.",
+	);
+	assert.equal(h.messages("subagent_parent_message").length, 1);
+	assert.equal(h.events.filter((event) => event === "agent_start").length, 1);
+	assert.equal(h.events.filter((event) => event === "agent_settled").length, 1);
+	assert.equal(h.faux.state.callCount, 1);
+	assert.equal(h.shutdowns, 0);
+	h.faux.setResponses([fauxAssistantMessage("Read the new item.")]);
+	inbox(h, "Later wake");
+	await idle(h, 2);
+	assert.equal(h.events.filter((event) => event === "agent_start").length, 2);
+	assert.equal(h.faux.state.callCount, 2);
+	assert.equal(h.shutdowns, 1);
+	assert.equal(h.messages("subagent_parent_message").length, 2);
+});
+
+for (const starts of [2, 3])
+	test(`same factory replacement with ${starts} starts joins suspended recovery before touching its files`, {
+		timeout: 20_000,
+	}, async (t) => {
+		const h = await createRuntimeHarness(t);
+		const ownerKey = `1-${"0".repeat(64)}`;
+		const deadDir = join(h.root, "runs", "owners", ownerKey, h.spec.runId);
+		mkdirSync(deadDir, { recursive: true });
+		writeJsonAtomic(join(deadDir, "spec.json"), {
+			...h.spec,
+			ownerKey,
+			owner: { pid: 1, start: "dead" },
+		});
+		writeJsonAtomic(join(deadDir, "pane.json"), {
+			v: 1,
+			paneId: "%2",
+			process: { pid: 999999, start: "dead" },
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let snapshots = 0;
+		h.tmux.listPanes = async () => {
+			snapshots++;
+			if (snapshots === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			return new Map();
+		};
+		const runner = h.session.extensionRunner;
+		const oldStart = runner.emit({ type: "session_start", reason: "startup" });
+		await Promise.race([entered.promise, oldStart]);
+		h.assertNoErrors();
+		assert.deepEqual(h.notices, []);
+		assert.equal(snapshots, 1);
+		let replacementFinished = false;
+		const replacing = runner.emit({ type: "session_start", reason: "startup" });
+		const latest =
+			starts === 3
+				? runner.emit({ type: "session_start", reason: "startup" })
+				: replacing;
+		const replacement = latest.then(() => {
+			replacementFinished = true;
+		});
+		let finishedBeforeRelease: boolean;
+		let snapshotsBeforeRelease: number;
+		try {
+			await nextImmediate();
+			finishedBeforeRelease = replacementFinished;
+			snapshotsBeforeRelease = snapshots;
+		} finally {
+			release.resolve();
+			await Promise.all([oldStart, replacing, replacement]);
+		}
+		assert.equal(
+			finishedBeforeRelease,
+			false,
+			"Replacement must join the old startup.",
+		);
+		assert.equal(
+			snapshotsBeforeRelease,
+			1,
+			"Recovery must not overlap across runtimes.",
+		);
+		assert.equal(snapshots, 2);
+		assert.equal(existsSync(deadDir), false);
+		assert.equal(
+			h.widgets.length,
+			2,
+			"Only the replacement installs a new widget.",
+		);
+		assert.deepEqual(h.notices, []);
+		const noticeDir = join(
+			h.root,
+			"runs",
+			"undelivered",
+			h.session.sessionManager.getSessionId(),
+		);
+		assert.equal(readdirSync(noticeDir).length, 1);
+		h.assertNoErrors();
+	});
 
 test("dead parent pane result is delivered once and removed", {
 	timeout: 20_000,

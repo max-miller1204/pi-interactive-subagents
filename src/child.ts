@@ -144,12 +144,14 @@ class ChildRole {
 		pi: ExtensionAPI,
 		ctx: ExtensionContext,
 		runtime: ChildRuntime,
-		path: string | ChildStartup,
+		startup: ChildStartup,
 	) {
 		this.pi = pi;
 		this.ctx = ctx;
 		this.runtime = runtime;
-		this.startup = typeof path === "string" ? preflightChild(ctx, path) : path;
+		if (!(startup instanceof ChildStartup))
+			throw new Error("Child startup must pass preflight.");
+		this.startup = startup;
 		this.runDir = this.startup.runDir;
 		this.spec = this.startup.spec;
 		if (this.fatal !== undefined) return;
@@ -455,6 +457,9 @@ class ChildRole {
 		this.contextTokens = this.ctx.getContextUsage()?.tokens ?? null;
 		this.writeStatus();
 	}
+	get wasInterrupted(): boolean {
+		return this.interrupted;
+	}
 	// Call this after Deliverer.onAgentSettled, before its scheduled pump.
 	onAgentSettled(): void {
 		if (!this.active()) return;
@@ -544,7 +549,7 @@ export function installChildRole(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	runtime: ChildRuntime,
-	runDir: string | ChildStartup,
+	startup: ChildStartup,
 ): ChildRole {
-	return new ChildRole(pi, ctx, runtime, runDir);
+	return new ChildRole(pi, ctx, runtime, startup);
 }

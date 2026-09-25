@@ -254,6 +254,7 @@ export class Runtime {
 	private readonly retiredSources = new Set<Source>();
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private inFlight: Promise<void> | undefined;
+	private startupTask: Promise<void> | undefined;
 	private shutdownTask: Promise<void> | undefined;
 	private disposed = false;
 	private enabled = false;
@@ -295,6 +296,13 @@ export class Runtime {
 		if (this.started || this.disposed)
 			throw new Error("This subagent runtime cannot start again.");
 		this.started = true;
+		this.startupTask = this.startRuntime(event, ctx);
+		await this.startupTask;
+	}
+	private async startRuntime(
+		event: Pick<SessionStartEvent, "reason">,
+		ctx: ExtensionContext,
+	): Promise<void> {
 		this.ctx = ctx;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		const reason =
@@ -343,6 +351,7 @@ export class Runtime {
 			}
 		}
 		if (event.reason === "startup") await this.recoverDeadOwners();
+		if (this.disposed) return;
 		this.sources.push(this.noticeSource());
 		this.deliverer = new Deliverer(
 			this.pi,
@@ -929,8 +938,8 @@ export class Runtime {
 	onBoundary(event: Pick<TurnEndEvent, "outcome">) {
 		return this.deliverer?.onBoundary(event);
 	}
-	onAgentSettled(): void {
-		this.deliverer?.onAgentSettled();
+	onAgentSettled(interrupted = false): void {
+		this.deliverer?.onAgentSettled(interrupted);
 	}
 	private undeliveredDir(sessionId: string): string {
 		if (
@@ -1002,8 +1011,10 @@ export class Runtime {
 						throw new Error(`Run identity does not match ${runDir}.`);
 					if (this.alive(pane.process)) continue;
 					panes ??= await this.deps.tmux.listPanes();
+					if (this.disposed) return;
 					if (panes.has(pane.paneId)) {
 						await this.deps.tmux.run(["kill-pane", "-t", pane.paneId]);
+						if (this.disposed) return;
 						panes.delete(pane.paneId);
 					}
 					if (this.acknowledged({ runDir, spec, pane })) {
@@ -1020,6 +1031,7 @@ export class Runtime {
 					);
 					rmSync(runDir, { recursive: true });
 				} catch (error) {
+					if (this.disposed) throw error;
 					this.notify(error);
 				}
 			}
@@ -1117,6 +1129,7 @@ export class Runtime {
 		this.disposed = true;
 		this.stopTick();
 		this.shutdownTask = (async () => {
+			await this.startupTask;
 			await this.inFlight;
 			try {
 				this.deliverer?.shutdown();
