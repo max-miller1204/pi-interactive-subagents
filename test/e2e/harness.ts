@@ -100,9 +100,10 @@ export async function terminateWindow(
 
 export interface ScenarioOptions {
 	prompt: string;
+	tmuxEnvironment?: string;
 	agents?: Record<string, string>;
 	extensionPaths?: string[];
-	approval?: "approve" | "no-approve";
+	approval?: "approve" | "no-approve" | "ask";
 }
 export interface Scenario {
 	root: string;
@@ -129,7 +130,10 @@ export async function scenario(
 	t: TestContext,
 	options: ScenarioOptions,
 ): Promise<Scenario> {
-	const tmuxValue = process.env.TMUX;
+	const tmuxValue =
+		options.tmuxEnvironment === undefined
+			? process.env.TMUX
+			: options.tmuxEnvironment;
 	if (!tmuxValue)
 		throw new Error("E2E tests require the isolated tmux runner.");
 	const socket = tmuxValue.split(",")[0];
@@ -195,7 +199,9 @@ export async function scenario(
 		"off",
 		"--session",
 		parentFile,
-		`--${options.approval ?? "approve"}`,
+		...(options.approval === "ask"
+			? []
+			: [`--${options.approval ?? "approve"}`]),
 		options.prompt,
 	];
 	const env = {
