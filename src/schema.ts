@@ -167,19 +167,15 @@ export const Fatal = Obj({
 	v: Type.Literal(1),
 	message: Type.String({ minLength: 1 }),
 });
-export const ResultStatus = Type.Union(
-	(
-		[
-			"completed",
-			"error",
-			"aborted",
-			"crashed",
-			"closed",
-			"no_output",
-			"failed",
-		] as const
-	).map((status) => Type.Literal(status)),
-);
+export const ResultStatus = Type.Union([
+	Type.Literal("completed"),
+	Type.Literal("error"),
+	Type.Literal("aborted"),
+	Type.Literal("crashed"),
+	Type.Literal("closed"),
+	Type.Literal("no_output"),
+	Type.Literal("failed"),
+] as const);
 export const ResultDetails = Obj({
 	v: Type.Literal(1),
 	deliveryId: Type.String(),
