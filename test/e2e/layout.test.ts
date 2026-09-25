@@ -675,6 +675,202 @@ test("19.3.28: three child panes share one even column without resizing the user
 	await resource.release();
 });
 
+async function fullGeometry(run: Scenario, pane: string) {
+	const value = await run.tmux([
+		"display-message",
+		"-p",
+		"-t",
+		pane,
+		"#{pane_left},#{pane_top},#{pane_width},#{pane_height}",
+	]);
+	assert.match(value, /^[0-9]+,[0-9]+,[1-9][0-9]*,[1-9][0-9]*$/);
+	return value;
+}
+
+async function startLayoutChild(
+	run: Scenario,
+	name: string,
+	parent = run.parentPane,
+	agentName = "worker",
+) {
+	await run.sendKeys(
+		parent,
+		script([
+			{
+				call: "subagent",
+				args: {
+					agent: agentName,
+					profile: "test",
+					name,
+					task: script([{ say: `${name} actual output.` }]),
+				},
+			},
+			{ say: `${name} launch acknowledged.` },
+			...Array.from({ length: 6 }, () => ({ say: "Layout result received." })),
+		]),
+	);
+	const child = await active(run, name);
+	await run.waitFor(
+		() =>
+			readBranch(child.spec.launch.childSessionFile).some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.content.some(
+						(block) =>
+							block.type === "text" && block.text === `${name} actual output.`,
+					),
+			),
+		`${name} actual session output`,
+	);
+	assert.equal((await verified(run, child)).dead, false);
+	assert.deepEqual(processIdentity(child.pane.process.pid), child.pane.process);
+	return child;
+}
+
+async function finishLayoutChild(
+	run: Scenario,
+	child: Awaited<ReturnType<typeof active>>,
+	parentFile = run.parentFile,
+	expectedText = `${child.spec.launch.name} actual output.`,
+) {
+	await verified(run, child);
+	await run.sendKeys(child.pane.paneId, "/quit");
+	const message = await run.waitFor(
+		() =>
+			messages(parentFile, "subagent_result").find(
+				(item) => item.details.runId === child.spec.runId,
+			),
+		`${child.spec.launch.name} result`,
+	);
+	const details = parseStrict(
+		ResultDetails,
+		message.details,
+		"layout regression result",
+	);
+	assert.equal(details.status, "completed");
+	assert.equal(details.deliveryId, `${child.spec.runId}:result`);
+	assert.equal(details.childSessionFile, child.spec.launch.childSessionFile);
+	assert.ok(
+		details.text.includes(expectedText),
+		`Missing result output: ${details.text}`,
+	);
+	await run.waitFor(
+		() => !existsSync(child.path) && !processAlive(child.pane.process),
+		"layout run and process cleanup",
+	);
+	assert.equal(
+		(await createTmux(run.socket).listPanes()).has(child.pane.paneId),
+		false,
+	);
+}
+
+for (const border of ["top", "bottom"]) {
+	test(`layout regression: pane-border-status ${border} permits later children`, async (t) => {
+		const run = await scenario(t, {
+			agents: { worker: agent("auto-exit: false\n") },
+			prompt: script([{ say: "Border layout ready." }]),
+		});
+		await visible(t, run, "Border layout ready.");
+		await run.tmux([
+			"set-option",
+			"-w",
+			"-t",
+			run.parentPane,
+			"pane-border-status",
+			border,
+		]);
+		const first = await startLayoutChild(run, "one");
+		const user = await fullGeometry(run, run.parentPane);
+		const children = [first];
+		for (const name of ["two", "three"]) {
+			children.push(await startLayoutChild(run, name));
+			assert.equal(await fullGeometry(run, run.parentPane), user);
+			for (const child of children) await verified(run, child);
+			const column = (await layout(run)).filter((row) =>
+				children.some((child) => child.pane.paneId === row.pane),
+			);
+			assert.equal(column.length, children.length);
+			assert.ok(
+				Math.max(...column.map((row) => row.height)) -
+					Math.min(...column.map((row) => row.height)) <=
+					1,
+				"usable child heights must be even",
+			);
+		}
+		t.diagnostic(
+			`Border ${border}: ${await run.tmux(["display-message", "-p", "-t", run.parentPane, "#{window_layout}"])}`,
+		);
+		for (const index of [1, 0, 2]) {
+			const child = children[index];
+			assert.ok(child);
+			await finishLayoutChild(run, child);
+			if (index !== 2)
+				assert.equal(await fullGeometry(run, run.parentPane), user);
+		}
+	});
+}
+
+test("layout regression: root A B, A spawns G, then root C preserves the nested row", async (t) => {
+	const run = await scenario(t, {
+		agents: {
+			worker: agent("auto-exit: false\nspawns: [helper]\n"),
+			helper: agent("auto-exit: false\n"),
+		},
+		prompt: script([{ say: "Nested layout ready." }]),
+	});
+	await visible(t, run, "Nested layout ready.");
+	const a = await startLayoutChild(run, "a");
+	const user = await fullGeometry(run, run.parentPane);
+	const b = await startLayoutChild(run, "b");
+	assert.equal(await fullGeometry(run, run.parentPane), user);
+	const g = await startLayoutChild(run, "g", a.pane.paneId, "helper");
+	assert.equal(g.spec.spawnerSessionFile, a.spec.launch.childSessionFile);
+	const frozen = await Promise.all(
+		[a, g].map((child) => fullGeometry(run, child.pane.paneId)),
+	);
+	const c = await startLayoutChild(run, "c");
+	assert.equal(await fullGeometry(run, run.parentPane), user);
+	assert.deepEqual(
+		await Promise.all(
+			[a, g].map((child) => fullGeometry(run, child.pane.paneId)),
+		),
+		frozen,
+	);
+	for (const child of [a, b, g, c]) {
+		await verified(run, child);
+		assert.deepEqual(
+			processIdentity(child.pane.process.pid),
+			child.pane.process,
+		);
+		t.diagnostic(
+			`Verified ${child.spec.launch.name}: ${JSON.stringify(child.pane)}\n${await run.capture(child.pane.paneId)}`,
+		);
+	}
+	const balanced = (await layout(run)).filter(
+		(row) => row.pane === b.pane.paneId || row.pane === c.pane.paneId,
+	);
+	assert.equal(balanced.length, 2);
+	assert.ok(balanced[0] && balanced[1]);
+	assert.ok(Math.abs(balanced[0].height - balanced[1].height) <= 1);
+	t.diagnostic(
+		`Nested row preserved: ${JSON.stringify(frozen)}; ${await run.tmux(["display-message", "-p", "-t", run.parentPane, "#{window_layout}"])}`,
+	);
+	// Remove C before G. B absorbs C without touching the nested row.
+	await finishLayoutChild(run, c);
+	assert.deepEqual(
+		await Promise.all(
+			[a, g].map((child) => fullGeometry(run, child.pane.paneId)),
+		),
+		frozen,
+	);
+	assert.equal(await fullGeometry(run, run.parentPane), user);
+	await finishLayoutChild(run, g, a.spec.launch.childSessionFile);
+	await finishLayoutChild(run, a, run.parentFile, "Layout result received.");
+	assert.equal(await fullGeometry(run, run.parentPane), user);
+	await finishLayoutChild(run, b);
+});
+
 test("19.3.29: explicit symlinks resolve agent, session, extension and run paths", async (t) => {
 	const run = await scenario(t, {
 		extensionPaths: [resolve("test/fixtures/lifecycle-tools.ts")],

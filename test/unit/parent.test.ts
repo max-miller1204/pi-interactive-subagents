@@ -1595,6 +1595,7 @@ for (const failure of ["none", "before-respawn", "registry"] as const)
 						f.living.delete(pane.pid);
 						f.panes.delete(id);
 					}
+					if (args[0] === "show-options") return "off";
 					if (args[0] === "list-panes")
 						return `${survivor.pane.paneId}\t${survivor.pane.process.pid}\t0\t0\t80\t12\t${survivor.spec.launch.childSessionFile}\n%99\t900\t0\t13\t80\t11\t${present(f.panes.get("%99")).session}`;
 					if (args.at(-1) === "#{window_layout}")

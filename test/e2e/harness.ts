@@ -355,7 +355,7 @@ export async function scenario(
 			);
 	});
 	pane = (
-		await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", ""])
+		await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "/bin/cat -"])
 	).trim();
 	if (!/^%\d+$/.test(pane)) throw new Error(`Invalid parent pane: ${pane}`);
 	await tmux(["set-option", "-p", "-t", pane, "remain-on-exit", "on"]);

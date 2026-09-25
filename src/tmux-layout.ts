@@ -104,12 +104,28 @@ export function isolatedColumn(
 		cell: LayoutCell,
 	): (LayoutCell & { kind: "vertical" | "horizontal" }) | undefined => {
 		if (cell.kind === "pane") return undefined;
+		// A nested row starts with its owned parent. Freeze that entire row.
+		// All other siblings must be owned leaves. Unknown siblings are unsafe.
+		const rowOwner = (child: LayoutCell): string | undefined => {
+			if (child.kind === "pane") return child.paneId;
+			const first = child.children[0];
+			if (child.kind !== "horizontal" || first?.kind !== "pane")
+				return undefined;
+			const owned = layoutPanes(child).filter((pane) =>
+				ids.includes(pane.paneId),
+			);
+			return owned.length === 1 && owned[0]?.paneId === first.paneId
+				? first.paneId
+				: undefined;
+		};
 		if (
 			cell.kind === "vertical" &&
 			cell.children.length === ids.length &&
-			cell.children.every(
-				(child) => child.kind === "pane" && ids.includes(child.paneId),
-			)
+			cell.children.some((child) => child.kind === "pane") &&
+			cell.children.every((child) => {
+				const owner = rowOwner(child);
+				return owner !== undefined && ids.includes(owner);
+			})
 		)
 			return cell;
 		for (const child of cell.children) {

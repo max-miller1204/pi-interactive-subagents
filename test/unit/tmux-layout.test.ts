@@ -50,6 +50,30 @@ test("an owned subset cannot resize a column with an unrelated sibling", () => {
 	);
 });
 
+for (const [label, body, ids] of [
+	[
+		"owned pane moved to the right",
+		"80x24,0,0[80x10,0,0{39x10,0,0,4,40x10,40,0,1},80x6,0,11,2,80x6,0,18,3]",
+		["%1", "%2", "%3"],
+	],
+	[
+		"unknown direct sibling",
+		"80x24,0,0[80x10,0,0{39x10,0,0,1,40x10,40,0,4},80x6,0,11,2,80x6,0,18,5]",
+		["%1", "%2", "%3"],
+	],
+	[
+		"two root owners in one row",
+		"80x24,0,0[80x10,0,0{39x10,0,0,1,40x10,40,0,2},80x6,0,11,3,80x6,0,18,4]",
+		["%1", "%2", "%3"],
+	],
+] as const)
+	test(`column rejects ${label}`, () => {
+		assert.throws(
+			() => isolatedColumn(parseTmuxLayout(tmuxLayout(body)), [...ids]),
+			/isolated column subtree/,
+		);
+	});
+
 for (const body of [
 	"80x24,0,0,0garbage",
 	"80x24,0,0[80x24,0,0,0]",

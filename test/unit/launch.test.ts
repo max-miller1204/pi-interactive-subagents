@@ -410,6 +410,7 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 				}
 				if (state.disposeAt === command) state.disposed = true;
 				if (state.fail === command) throw new Error(`${command} failed`);
+				if (command === "show-options") return "off";
 				if (command === "split-window") return state.pane;
 				if (command === "display-message" && args.at(-1) === "#{window_layout}")
 					return tmuxLayout("119x60,121,0[119x30,121,0,8,119x29,121,31,9]");

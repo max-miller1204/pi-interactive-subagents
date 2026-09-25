@@ -264,6 +264,21 @@ async function columnSnapshot(tmux: Tmux, owned: ColumnPane[], target: string) {
 		)
 			throw new Error(`Child column pane ${current.paneId} identity mismatch.`);
 	}
+	const border = (
+		await tmux.run([
+			"show-options",
+			"-A",
+			"-w",
+			"-v",
+			"-t",
+			target,
+			"pane-border-status",
+		])
+	).trim();
+	if (border !== "off" && border !== "top" && border !== "bottom")
+		throw new Error(
+			`Invalid tmux pane-border-status: ${JSON.stringify(border)}.`,
+		);
 	const tree = parseTmuxLayout(
 		await tmux.run(["display-message", "-p", "-t", target, "#{window_layout}"]),
 	);
@@ -272,12 +287,19 @@ async function columnSnapshot(tmux: Tmux, owned: ColumnPane[], target: string) {
 		leaves.length !== panes.length ||
 		panes.some((pane) => {
 			const leaf = leaves.find((cell) => cell.paneId === pane.paneId);
+			if (leaf === undefined) return true;
+			const inset =
+				border === "top" && leaf.top === tree.top
+					? 1
+					: border === "bottom" &&
+							leaf.top + leaf.height === tree.top + tree.height
+						? 1
+						: 0;
 			return (
-				leaf === undefined ||
 				leaf.width !== pane.width ||
-				leaf.height !== pane.height ||
+				leaf.height - inset !== pane.height ||
 				leaf.left !== pane.left ||
-				leaf.top !== pane.top
+				leaf.top + (border === "top" ? inset : 0) !== pane.top
 			);
 		})
 	)
@@ -288,7 +310,7 @@ async function columnSnapshot(tmux: Tmux, owned: ColumnPane[], target: string) {
 	);
 	assertServerIdentity(server, await tmux.serverIdentity());
 	panes.sort((a, b) => a.paneId.localeCompare(b.paneId));
-	return { panes, tree };
+	return { panes, tree, border };
 }
 
 // Check the whole tree and all identities before each change to the owned subtree.
@@ -307,12 +329,17 @@ export async function balancePaneColumn(
 	if (target === undefined) throw new Error("Missing child column target.");
 	const expected = await columnSnapshot(tmux, owned, target);
 	const column = isolatedColumn(expected.tree, paneIds);
-	const cells = column.children;
-	const height = cells.reduce((total, cell) => total + cell.height, 0);
-	if (!Number.isSafeInteger(height))
-		throw new Error("Invalid child column height.");
-	const base = Math.floor(height / cells.length);
-	const extra = height % cells.length;
+	// Resize only consecutive owned leaves. A nested row is a fixed boundary.
+	const groups: (typeof column.children)[] = [];
+	let group: typeof column.children = [];
+	for (const child of column.children) {
+		if (child.kind === "pane") group.push(child);
+		else {
+			if (group.length > 1) groups.push(group);
+			group = [];
+		}
+	}
+	if (group.length > 1) groups.push(group);
 	const verify = async () => {
 		const current = await columnSnapshot(tmux, owned, target);
 		if (JSON.stringify(current) !== JSON.stringify(expected))
@@ -320,37 +347,77 @@ export async function balancePaneColumn(
 				"Tmux did not preserve the requested child column layout and pane identities.",
 			);
 	};
-	for (let index = 0; index < cells.length - 1; index++) {
-		await verify();
-		const cell = cells[index];
-		const next = cells[index + 1];
-		if (cell?.kind !== "pane" || next === undefined)
-			throw new Error("Invalid child column leaf.");
-		const desired = base + (index < extra ? 1 : 0);
-		let change = desired - cell.height;
-		cell.height = desired;
-		// tmux shrinks into the next sibling, or grows from following siblings.
-		if (change < 0) next.height -= change;
-		else {
-			for (const donor of cells.slice(index + 1)) {
-				const amount = Math.min(change, donor.height - 1);
-				donor.height -= amount;
-				change -= amount;
-			}
-			if (change !== 0)
-				throw new Error("Insufficient space in the child column.");
-		}
-		let top = column.top;
-		for (const child of cells) {
-			if (child.kind !== "pane") throw new Error("Invalid child column leaf.");
-			child.top = top;
-			top += child.height + 1;
-			const pane = expected.panes.find((pane) => pane.paneId === child.paneId);
+	for (const cells of groups) {
+		const groupTop = cells[0]?.top;
+		if (groupTop === undefined)
+			throw new Error("Missing child group position.");
+		const geometry = (cell: (typeof cells)[number]) => {
+			if (cell.kind !== "pane") throw new Error("Invalid child column leaf.");
+			const pane = expected.panes.find((pane) => pane.paneId === cell.paneId);
 			if (pane === undefined) throw new Error("Missing child column geometry.");
-			pane.top = child.top;
-			pane.height = child.height;
+			return pane;
+		};
+		const insets = new Map(
+			cells.map((cell) => [
+				cell,
+				{
+					top: geometry(cell).top - cell.top,
+					height: cell.height - geometry(cell).height,
+				},
+			]),
+		);
+		const inset = (cell: (typeof cells)[number]) => {
+			const value = insets.get(cell);
+			if (value === undefined) throw new Error("Missing child column inset.");
+			return value;
+		};
+		const height = cells.reduce(
+			(total, cell) => total + geometry(cell).height,
+			0,
+		);
+		if (!Number.isSafeInteger(height))
+			throw new Error("Invalid child column height.");
+		const base = Math.floor(height / cells.length);
+		const extra = height % cells.length;
+		for (let index = 0; index < cells.length - 1; index++) {
+			await verify();
+			const cell = cells[index];
+			const next = cells[index + 1];
+			if (cell?.kind !== "pane" || next === undefined)
+				throw new Error("Invalid child column leaf.");
+			const desired = base + (index < extra ? 1 : 0);
+			let change = desired + inset(cell).height - cell.height;
+			cell.height = desired + inset(cell).height;
+			// tmux shrinks into the next sibling, or grows from following siblings.
+			if (change < 0) next.height -= change;
+			else {
+				for (const donor of cells.slice(index + 1)) {
+					const amount = Math.min(
+						change,
+						donor.height - inset(donor).height - 1,
+					);
+					donor.height -= amount;
+					change -= amount;
+				}
+				if (change !== 0)
+					throw new Error("Insufficient space in the child column.");
+			}
+			let top = groupTop;
+			for (const child of cells) {
+				if (child.kind !== "pane")
+					throw new Error("Invalid child column leaf.");
+				child.top = top;
+				top += child.height + 1;
+				const pane = expected.panes.find(
+					(pane) => pane.paneId === child.paneId,
+				);
+				if (pane === undefined)
+					throw new Error("Missing child column geometry.");
+				pane.top = child.top + inset(child).top;
+				pane.height = child.height - inset(child).height;
+			}
+			await tmux.run(["resize-pane", "-t", cell.paneId, "-y", String(desired)]);
 		}
-		await tmux.run(["resize-pane", "-t", cell.paneId, "-y", String(desired)]);
 	}
 	await verify();
 }

@@ -609,17 +609,19 @@ test("parallel questions pair reverse-order answers by qid", async (t) => {
 	await run.waitFor(() => !existsSync(active.path), "question run cleanup");
 });
 
-test("an answer passes an earlier queued instruction without losing it", async (t) => {
+test("an answer passes two earlier queued instructions without reordering them", async (t) => {
 	const task = script([
 		{ call: "ask_question", args: { question: "Need the answer?" } },
 		{ say: "Answer accepted." },
-		{ say: "Instruction accepted." },
+		{ say: "First instruction accepted." },
+		{ say: "Second instruction accepted." },
 	]);
 	const run = await scenario(t, {
 		agents: { worker: agent(false) },
 		prompt: script([
 			spawn(task),
-			steer("Queued instruction"),
+			steer("Queued instruction one"),
+			steer("Queued instruction two"),
 			{ say: "Question pending." },
 			{ say: "Question seen." },
 		]),
@@ -643,19 +645,20 @@ test("an answer passes an earlier queued instruction without losing it", async (
 			.qid,
 		qid,
 	);
-	const blocked = queue.list(join(active.path, "inbox"), "inbox");
-	assert.equal(blocked.length, 1);
-	assert.ok(blocked[0]);
-	assert.deepEqual(blocked[0].item, {
-		v: 1,
-		kind: "message",
-		text: "Queued instruction",
-	});
+	const blocked = await run.waitFor(() => {
+		const items = queue.list(join(active.path, "inbox"), "inbox");
+		return items.length === 2 ? items : undefined;
+	}, "two blocked instructions");
+	assert.deepEqual(
+		blocked.map((item) => item.item),
+		[
+			{ v: 1, kind: "message", text: "Queued instruction one" },
+			{ v: 1, kind: "message", text: "Queued instruction two" },
+		],
+	);
 	assert.equal(messages(readBranch(file), "subagent_parent_message").length, 0);
-	const instructionId = queue.itemId(
-		active.spec.runId,
-		"inbox",
-		blocked[0].seq,
+	const instructionIds = blocked.map((item) =>
+		queue.itemId(active.spec.runId, "inbox", item.seq),
 	);
 	const pendingAnswer = run.waitFor(
 		() =>
@@ -676,7 +679,7 @@ test("an answer passes an earlier queued instruction without losing it", async (
 		qid,
 		text: "Answer now",
 	});
-	assert.ok(blocked[0] && blocked[0].seq < answerFile.seq);
+	assert.ok(blocked.every((item) => item.seq < answerFile.seq));
 	const answerId = queue.itemId(active.spec.runId, "inbox", answerFile.seq);
 	const toolResult = await run.waitFor(
 		() =>
@@ -707,20 +710,43 @@ test("an answer passes an earlier queued instruction without losing it", async (
 	);
 	const delivered = await run.waitFor(async () => {
 		const found = await parentMessages(file);
-		return found.length === 1 ? found : undefined;
-	}, "queued instruction delivery");
-	assert.ok(delivered[0]);
-	assert.deepEqual(delivered[0].details, {
-		deliveryId: instructionId,
-		kind: "message",
-		text: "Queued instruction",
-	});
-	assert.equal(
-		messages(readBranch(file), "subagent_parent_message").filter(
-			(item) => item.details.deliveryId === instructionId,
-		).length,
-		1,
+		return found.length === 2 ? found : undefined;
+	}, "both queued instructions delivered in order");
+	assert.deepEqual(
+		delivered.map((item) => item.details),
+		[
+			{
+				deliveryId: instructionIds[0],
+				kind: "message",
+				text: "Queued instruction one",
+			},
+			{
+				deliveryId: instructionIds[1],
+				kind: "message",
+				text: "Queued instruction two",
+			},
+		],
 	);
+	const branch = readBranch(file);
+	const answerIndex = branch.findIndex((entry) => entry.id === toolResult.id);
+	for (const id of instructionIds) {
+		const index = branch.findIndex(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "subagent_parent_message" &&
+				(entry.details as { deliveryId?: string }).deliveryId === id,
+		);
+		assert.ok(
+			index > answerIndex,
+			"answer must bypass both earlier instructions",
+		);
+		assert.equal(
+			messages(branch, "subagent_parent_message").filter(
+				(item) => item.details.deliveryId === id,
+			).length,
+			1,
+		);
+	}
 	const pane = await childPane(run);
 	assert.match(
 		await rendered(run, pane, "Parent message: message"),
@@ -1476,10 +1502,6 @@ test("quit behind a hanging parent saves one finished result notice", async (t) 
 		`${saved.runId}:result`,
 	);
 	assert.match(saved.content, /Finished behind hang/);
-	assert.match(
-		readFileSync(run.stderrFile, "utf8"),
-		/It kept 1 result that was not delivered: worker/,
-	);
 	await run.waitFor(() => !existsSync(active.path), "quit result run cleanup");
 	await run.waitFor(
 		async () =>
@@ -1492,6 +1514,10 @@ test("quit behind a hanging parent saves one finished result notice", async (t) 
 			])) === "1" &&
 			readFileSync(run.stderrFile, "utf8").includes("It kept 1 result"),
 		"finished result quit complete",
+	);
+	assert.match(
+		readFileSync(run.stderrFile, "utf8"),
+		/It kept 1 result that was not delivered: worker/,
 	);
 	await run.reopen(run.parentFile);
 	const notice = await run.waitFor(

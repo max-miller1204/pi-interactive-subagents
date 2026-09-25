@@ -5,6 +5,7 @@ import {
 	type ColumnPane,
 	type Tmux,
 } from "../../src/tmux.ts";
+import { layoutPanes, parseTmuxLayout } from "../../src/tmux-layout.ts";
 import { tmuxLayout } from "../fixtures/tmux-layout.ts";
 
 type TestTmux = Tmux & { owned: Map<string, ColumnPane> };
@@ -51,6 +52,7 @@ function fixture() {
 			"%5\t105\t151\t41\t89\t19\t/three",
 		].join("\n")}\n`,
 		fail: false,
+		border: "off",
 	};
 	const calls: string[][] = [];
 	let resizes = 0;
@@ -72,6 +74,7 @@ function fixture() {
 		serverIdentity: async () => structuredClone(server),
 		run: async (args) => {
 			calls.push(args);
+			if (args[0] === "show-options") return state.border;
 			if (args[0] === "list-panes")
 				return resizes === 0
 					? state.before
@@ -103,6 +106,205 @@ function fixture() {
 	return { tmux, state, calls, server };
 }
 
+function snapshots(bodies: string[], ids: string[], border = "off") {
+	const calls: string[][] = [];
+	const server = {
+		socket: "/private-test",
+		process: { pid: 99, start: "server" },
+	};
+	let index = 0;
+	const tmux: TestTmux = {
+		owned: new Map(
+			ids.map((id) => [
+				id,
+				{
+					pane: {
+						v: 1,
+						paneId: id,
+						process: { pid: 100 + Number(id.slice(1)), start: "child" },
+						server,
+					},
+					session: `/session${id}`,
+				},
+			]),
+		),
+		serverIdentity: async () => structuredClone(server),
+		listPanes: async () => {
+			throw new Error("Unexpected pane query");
+		},
+		capture: async () => {
+			throw new Error("Unexpected capture");
+		},
+		run: async (args) => {
+			calls.push(args);
+			const body = bodies[index];
+			assert.ok(body, "Missing independent layout expectation");
+			const tree = parseTmuxLayout(tmuxLayout(body));
+			if (args[0] === "display-message") return tmuxLayout(body);
+			if (args[0] === "show-options") return border;
+			if (args[0] === "list-panes")
+				return layoutPanes(tree)
+					.map((leaf) => {
+						const top = border === "top" && leaf.top === tree.top;
+						const bottom =
+							border === "bottom" &&
+							leaf.top + leaf.height === tree.top + tree.height;
+						return [
+							leaf.paneId,
+							100 + Number(leaf.paneId.slice(1)),
+							leaf.left,
+							leaf.top + Number(top),
+							leaf.width,
+							leaf.height - Number(top || bottom),
+							`/session${leaf.paneId}`,
+						].join("\t");
+					})
+					.join("\n");
+			assert.equal(args[0], "resize-pane");
+			index++;
+			return "";
+		},
+	};
+	return { tmux, calls };
+}
+
+for (const border of ["top", "bottom"])
+	test(`column balances usable heights with ${border} border status`, async () => {
+		const children =
+			border === "top"
+				? [
+						"80x12,0,0,1,80x4,0,13,2,80x5,0,18,3",
+						"80x8,0,0,1,80x8,0,9,2,80x5,0,18,3",
+						"80x8,0,0,1,80x7,0,9,2,80x6,0,17,3",
+					]
+				: [
+						"80x12,0,0,1,80x4,0,13,2,80x5,0,18,3",
+						"80x7,0,0,1,80x9,0,8,2,80x5,0,18,3",
+						"80x7,0,0,1,80x7,0,8,2,80x7,0,16,3",
+					];
+		const f = snapshots(
+			children.map((cells) => `80x23,0,0[${cells}]`),
+			["%1", "%2", "%3"],
+			border,
+		);
+		await balancePaneColumn(f.tmux, ["%1", "%2", "%3"]);
+		assert.deepEqual(
+			f.calls.filter((args) => args[0] === "resize-pane"),
+			[
+				["resize-pane", "-t", "%1", "-y", "7"],
+				["resize-pane", "-t", "%2", "-y", "7"],
+			],
+		);
+	});
+
+test("column growth preserves a bottom border donor minimum", async () => {
+	const f = snapshots(
+		[
+			"80x25,0,0[80x1,0,0,1,80x1,0,2,2,80x21,0,4,3]",
+			"80x25,0,0[80x8,0,0,1,80x1,0,9,2,80x14,0,11,3]",
+			"80x25,0,0[80x8,0,0,1,80x7,0,9,2,80x8,0,17,3]",
+		],
+		["%1", "%2", "%3"],
+		"bottom",
+	);
+	await balancePaneColumn(f.tmux, ["%1", "%2", "%3"]);
+	assert.deepEqual(
+		f.calls.filter((args) => args[0] === "resize-pane"),
+		[
+			["resize-pane", "-t", "%1", "-y", "8"],
+			["resize-pane", "-t", "%2", "-y", "7"],
+		],
+	);
+});
+
+test("nested row stays fixed while the following owned group grows", async () => {
+	const prefix =
+		"120x40,0,0{39x40,0,0,0,80x40,40,0[80x17,40,0{39x17,40,0,1,40x17,80,0,4},";
+	const f = snapshots(
+		[
+			`${prefix}80x2,40,18,2,80x19,40,21,3]}`,
+			`${prefix}80x11,40,18,2,80x10,40,30,3]}`,
+		],
+		["%1", "%2", "%3"],
+	);
+	await balancePaneColumn(f.tmux, ["%1", "%2", "%3"]);
+	assert.deepEqual(
+		f.calls.filter((args) => args[0] === "resize-pane"),
+		[["resize-pane", "-t", "%2", "-y", "11"]],
+	);
+});
+
+test("owned groups on either side of a nested row balance without crossing it", async () => {
+	const row = "80x8,0,22{39x8,0,22,3,40x8,40,22,6}";
+	const f = snapshots(
+		[
+			`80x52,0,0[80x1,0,0,1,80x19,0,2,2,${row},80x18,0,31,4,80x2,0,50,5]`,
+			`80x52,0,0[80x10,0,0,1,80x10,0,11,2,${row},80x18,0,31,4,80x2,0,50,5]`,
+			`80x52,0,0[80x10,0,0,1,80x10,0,11,2,${row},80x10,0,31,4,80x10,0,42,5]`,
+		],
+		["%1", "%2", "%3", "%4", "%5"],
+	);
+	await balancePaneColumn(f.tmux, ["%1", "%2", "%3", "%4", "%5"]);
+	assert.deepEqual(
+		f.calls.filter((args) => args[0] === "resize-pane"),
+		[
+			["resize-pane", "-t", "%1", "-y", "10"],
+			["resize-pane", "-t", "%4", "-y", "10"],
+		],
+	);
+});
+
+for (const mutation of ["nested pid", "nested session", "nested layout"])
+	test(`nested group rejects changed ${mutation} before its second resize`, async () => {
+		const row = "80x8,0,22{39x8,0,22,3,40x8,40,22,6}";
+		const f = snapshots(
+			[
+				`80x52,0,0[80x1,0,0,1,80x19,0,2,2,${row},80x18,0,31,4,80x2,0,50,5]`,
+				`80x52,0,0[80x10,0,0,1,80x10,0,11,2,${row},80x18,0,31,4,80x2,0,50,5]`,
+			],
+			["%1", "%2", "%3", "%4", "%5"],
+		);
+		const run = f.tmux.run;
+		let resized = false;
+		f.tmux.run = async (args) => {
+			let output = await run(args);
+			if (args[0] === "resize-pane") resized = true;
+			if (resized && args[0] === "list-panes") {
+				if (mutation === "nested pid")
+					output = output.replace("%6\t106", "%6\t999");
+				if (mutation === "nested session")
+					output = output.replace("/session%6", "/replacement");
+			}
+			if (
+				resized &&
+				args[0] === "display-message" &&
+				mutation === "nested layout"
+			)
+				output = tmuxLayout(
+					output
+						.slice(5)
+						.replace("39x8,0,22,3,40x8,40,22,6", "38x8,0,22,3,41x8,39,22,6"),
+				);
+			return output;
+		};
+		await assert.rejects(
+			balancePaneColumn(f.tmux, ["%1", "%2", "%3", "%4", "%5"]),
+			/did not preserve|does not match/,
+		);
+		assert.equal(f.calls.filter((args) => args[0] === "resize-pane").length, 1);
+	});
+
+for (const border of ["", "bogus", "top\nbottom"])
+	test(`invalid border option fails before resizing: ${JSON.stringify(border)}`, async () => {
+		const f = fixture();
+		f.state.border = border;
+		await assert.rejects(
+			balancePaneColumn(f.tmux, ["%3", "%4", "%5"]),
+			/Invalid tmux pane-border-status/,
+		);
+		assert.equal(f.calls.filter((args) => args[0] === "resize-pane").length, 0);
+	});
+
 test("column balance changes only owned heights and preserves multiple user panes", async () => {
 	const f = fixture();
 	await balancePaneColumn(f.tmux, ["%5", "%3", "%4"]);
@@ -120,6 +322,10 @@ test("column balance changes only owned heights and preserves multiple user pane
 		"-F",
 		"#{pane_id}\t#{pane_pid}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{@pi_subagent_session}",
 	]);
+	assert.deepEqual(
+		f.calls.find((args) => args[0] === "show-options"),
+		["show-options", "-A", "-w", "-v", "-t", "%5", "pane-border-status"],
+	);
 	assert.deepEqual(f.calls.at(-1), [
 		"display-message",
 		"-p",
