@@ -47,6 +47,7 @@ export class Deliverer {
 	private readonly ctx: ExtensionContext;
 	private readonly sources: Source[];
 	private readonly isDisposed: () => boolean;
+	private readonly isReady: () => boolean;
 	private readonly child: boolean;
 	constructor(
 		pi: ExtensionAPI,
@@ -54,11 +55,13 @@ export class Deliverer {
 		sources: Source[],
 		isDisposed: () => boolean,
 		child: boolean,
+		isReady: () => boolean,
 	) {
 		this.pi = pi;
 		this.ctx = ctx;
 		this.sources = sources;
 		this.isDisposed = isDisposed;
+		this.isReady = isReady;
 		this.child = child;
 		this.runActive = !ctx.isIdle();
 	}
@@ -122,6 +125,7 @@ export class Deliverer {
 	pump(): void {
 		if (this.disposed || this.isDisposed()) return;
 		if (this.broken) throw this.broken;
+		if (!this.isReady()) return;
 		this.reconcile();
 		if (
 			this.promptStarting &&
@@ -174,7 +178,12 @@ export class Deliverer {
 	onBoundary(
 		event: Pick<TurnEndEvent | AgentBeforeSettleEvent, "outcome">,
 	): BoundaryResult | undefined {
-		if (this.disposed || this.isDisposed() || event.outcome !== "completed")
+		if (
+			this.disposed ||
+			this.isDisposed() ||
+			!this.isReady() ||
+			event.outcome !== "completed"
+		)
 			return;
 		this.reconcile();
 		const entries: SessionBoundaryDraft[] = [];

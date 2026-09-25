@@ -138,7 +138,14 @@ function fixture(t: TestContext) {
 	const runtime = {
 		sources,
 		runs: new Map<string, unknown>(),
-		deliverer: new Deliverer(pi, ctx, sources, () => false, true),
+		deliverer: new Deliverer(
+			pi,
+			ctx,
+			sources,
+			() => false,
+			true,
+			() => true,
+		),
 	};
 	let child: ReturnType<typeof installChildRole> | undefined;
 	t.after(() => {

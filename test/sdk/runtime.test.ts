@@ -676,6 +676,86 @@ for (const starts of [2, 3])
 		h.assertNoErrors();
 	});
 
+test("a prompt settled during suspended recovery does not block ready notices", {
+	timeout: 20_000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t);
+	const ownerKey = `1-${"0".repeat(64)}`;
+	const deadDir = join(h.root, "runs", "owners", ownerKey, h.spec.runId);
+	mkdirSync(deadDir, { recursive: true });
+	writeJsonAtomic(join(deadDir, "spec.json"), {
+		...h.spec,
+		ownerKey,
+		owner: { pid: 1, start: "dead" },
+	});
+	writeJsonAtomic(join(deadDir, "pane.json"), {
+		v: 1,
+		paneId: "%3",
+		process: { pid: 999999, start: "dead" },
+	});
+	const noticeDir = join(
+		h.root,
+		"runs",
+		"undelivered",
+		h.session.sessionManager.getSessionId(),
+	);
+	mkdirSync(noticeDir, { recursive: true });
+	const noticeFile = join(noticeDir, `${h.spec.runId}.json`);
+	writeJsonAtomic(noticeFile, {
+		v: 1,
+		kind: "stopped",
+		runId: h.spec.runId,
+		launch: h.spec.launch,
+		at: Date.now(),
+	});
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let snapshots = 0;
+	h.tmux.listPanes = async () => {
+		if (++snapshots === 1) {
+			entered.resolve();
+			await release.promise;
+		}
+		return new Map();
+	};
+	const startup = h.session.extensionRunner.emit({
+		type: "session_start",
+		reason: "startup",
+	});
+	await entered.promise;
+	try {
+		h.faux.setResponses([
+			fauxAssistantMessage("Prompt completed during recovery."),
+		]);
+		await h.session.prompt("Complete this prompt before recovery resumes.");
+		await nextImmediate();
+		assert.equal(
+			h.messages("subagent_notice").length,
+			0,
+			"Dormant delivery must not send at boundaries or its scheduled pump.",
+		);
+		assert.equal(existsSync(noticeFile), true);
+		assert.equal(
+			h.events.filter((event) => event === "agent_settled").length,
+			1,
+		);
+	} finally {
+		release.resolve();
+		await startup;
+	}
+	await until(() => snapshots >= 3, "The enabled parent did not tick twice.");
+	assert.equal(
+		h.messages("subagent_notice").length,
+		1,
+		"A settled startup prompt must not block the ready notice.",
+	);
+	assert.equal(h.faux.state.callCount, 1);
+	assert.equal(h.events.filter((event) => event === "agent_start").length, 1);
+	assert.equal(h.events.filter((event) => event === "agent_settled").length, 1);
+	assert.equal(existsSync(noticeFile), false);
+	h.assertNoErrors();
+});
+
 test("same factory retries recovery after a rejected suspended startup", {
 	timeout: 20_000,
 }, async (t) => {

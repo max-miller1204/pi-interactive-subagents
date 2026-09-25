@@ -42,6 +42,7 @@ function fixture(
 		},
 	};
 	let idle = true;
+	let ready = true;
 	const pi = {
 		sendMessage: (
 			message: { details: { deliveryId: string } },
@@ -71,6 +72,7 @@ function fixture(
 		[source],
 		() => false,
 		options.child ?? false,
+		() => ready,
 	);
 	const add = (name: string) => {
 		const id = `run:outbox:${name}`;
@@ -87,6 +89,9 @@ function fixture(
 		source,
 		deliverer,
 		add,
+		setReady: (value: boolean) => {
+			ready = value;
+		},
 		setIdle: (value: boolean) => {
 			idle = value;
 		},
@@ -96,6 +101,28 @@ function fixture(
 		},
 	};
 }
+
+for (const interrupted of [false, true])
+	test(`dormant delivery tracks ${interrupted ? "interrupted" : "completed"} lifecycle without sending`, () => {
+		const f = fixture({ disk: true });
+		try {
+			f.setReady(false);
+			f.add("ready-at-startup");
+			f.deliverer.onInput();
+			f.deliverer.onAgentStart();
+			assert.equal(f.deliverer.onBoundary({ outcome: "completed" }), undefined);
+			f.deliverer.onAgentSettled(interrupted);
+			f.deliverer.pump();
+			assert.deepEqual(f.sent, []);
+			f.setReady(true);
+			f.deliverer.pump();
+			assert.deepEqual(f.sent, [
+				{ id: "run:outbox:ready-at-startup", trigger: !interrupted },
+			]);
+		} finally {
+			f.cleanup();
+		}
+	});
 
 test("read-only delivery view reports a blocked ready item and a broken delivery", () => {
 	const f = fixture();

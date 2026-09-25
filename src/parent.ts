@@ -361,8 +361,9 @@ export class Runtime {
 			this.pi,
 			ctx,
 			this.sources,
-			() => this.disposed || !this.enabled,
+			() => this.disposed,
 			this.deps.childSpec !== undefined,
+			() => this.enabled,
 		);
 		if (event.reason === "startup") await this.recoverDeadOwners();
 		if (this.disposed) return;

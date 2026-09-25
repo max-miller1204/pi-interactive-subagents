@@ -144,6 +144,7 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 		[source],
 		() => false,
 		false,
+		() => true,
 	);
 	runtime.deliverer = delivery;
 	delivery.onInput();
@@ -173,6 +174,7 @@ test("widget renders colored, truncated live and finished rows, notices, and sta
 		[source],
 		() => false,
 		false,
+		() => true,
 	);
 	runtime.deliverer = broken;
 	assert.throws(() => broken.pump(), /did not append/);
