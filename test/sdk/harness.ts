@@ -116,6 +116,50 @@ export async function createHarness(
 	return { session, faux, services, assertNoErrors };
 }
 
+export async function cleanupTmuxServer(
+	socket: string,
+	executable = "tmux",
+): Promise<"already-exited" | "stopped"> {
+	const run = (command: string) =>
+		spawnSync(executable, ["-L", socket, "-f", "/dev/null", command], {
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+	const absent = (result: ReturnType<typeof run>) =>
+		!result.error &&
+		result.signal === null &&
+		result.status === 1 &&
+		/^(?:no server running on .+|error connecting to .+ \(No such file or directory\))\n?$/.test(
+			result.stderr,
+		);
+	const describe = (result: ReturnType<typeof run>) =>
+		`status=${result.status}, signal=${result.signal}, error=${String(result.error)}, stderr=${result.stderr.trim()}`;
+	const check = () => {
+		const result = run("list-sessions");
+		if (absent(result)) return false;
+		if (result.error || result.signal !== null || result.status !== 0)
+			throw new Error(
+				`Cannot verify tmux server ${socket}: ${describe(result)}`,
+			);
+		return true;
+	};
+	if (!check()) return "already-exited";
+	const killed = run("kill-server");
+	if (killed.error || killed.signal !== null || killed.status !== 0) {
+		if (absent(killed) && !check()) return "already-exited";
+		throw new Error(
+			`Failed to stop tmux server ${socket}: ${describe(killed)}`,
+		);
+	}
+	const deadline = Date.now() + 2_000;
+	while (check()) {
+		if (Date.now() >= deadline)
+			throw new Error(`tmux server ${socket} still runs after kill-server.`);
+		await delay(10);
+	}
+	return "stopped";
+}
+
 interface CliOptions {
 	interactive?: boolean;
 	prompt: string;
@@ -204,9 +248,7 @@ export default function (pi) {
 				encoding: "utf8",
 				timeout: 5_000,
 			});
-		t.after(() => {
-			tmux("kill-server");
-		});
+		t.after(() => cleanupTmuxServer(socket));
 		const exitFile = join(root, "exit-code");
 		const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 		const invocation = [
