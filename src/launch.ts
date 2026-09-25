@@ -180,8 +180,6 @@ export interface LaunchContext {
 	release(name: string): void;
 	newestLivePane(excludePaneId?: string): string | undefined;
 	liveColumnPanes(excludePaneId?: string): ColumnPane[];
-	// Do not read pane snapshots inside this action.
-	startPane<T>(action: () => Promise<T>): Promise<T>;
 	// Store the run with phase live. Commit must be synchronous.
 	commit(run: StartedRun): void;
 	appendRegistry(record: RegistryRecord): void;
@@ -374,66 +372,67 @@ export async function launchRun(
 			}),
 			{ flag: "wx", mode: 0o700 },
 		);
-		const server = await context.startPane(async () => {
-			const server = await context.tmux.serverIdentity();
-			checkDisposed(context, name);
-			const paneOutput = (
-				await context.tmux.run([
-					"split-window",
-					"-d",
-					...(target === undefined
-						? ["-h", "-l", "50%", "-t", parentPane]
-						: ["-v", "-t", target]),
-					"-P",
-					"-F",
-					"#{pane_id}",
-					"",
-				])
-			).trim();
-			paneCreated = true;
-			if (/^%[0-9]+$/.test(paneOutput)) paneId = paneOutput;
-			checkDisposed(context, name);
-			if (paneId === undefined)
-				throw new Error(`Invalid tmux pane id: ${JSON.stringify(paneOutput)}.`);
+		const server = await context.tmux.serverIdentity();
+		checkDisposed(context, name);
+		// Start a real process so every server client can read strict snapshots.
+		// An empty command leaves pane_pid at zero until respawn, even on failure.
+		const paneOutput = (
 			await context.tmux.run([
-				"set-option",
-				"-p",
-				"-t",
-				paneId,
-				"remain-on-exit",
-				"on",
-				";",
-				"set-option",
-				"-p",
-				"-t",
-				paneId,
-				"@pi_subagent_run",
-				runId,
-				";",
-				"set-option",
-				"-p",
-				"-t",
-				paneId,
-				"@pi_subagent_name",
-				name,
-				";",
-				"set-option",
-				"-p",
-				"-t",
-				paneId,
-				"@pi_subagent_session",
-				launch.childSessionFile,
-				";",
-				"respawn-pane",
-				"-k",
-				"-t",
-				paneId,
+				"split-window",
+				"-d",
+				...(target === undefined
+					? ["-h", "-l", "50%", "-t", parentPane]
+					: ["-v", "-t", target]),
+				"-P",
+				"-F",
+				"#{pane_id}",
 				"--",
-				"/bin/sh",
-				launchScript,
-			]);
-			return server;
-		});
+				"/bin/cat",
+				"-",
+			])
+		).trim();
+		paneCreated = true;
+		if (/^%[0-9]+$/.test(paneOutput)) paneId = paneOutput;
+		checkDisposed(context, name);
+		if (paneId === undefined)
+			throw new Error(`Invalid tmux pane id: ${JSON.stringify(paneOutput)}.`);
+		await context.tmux.run([
+			"set-option",
+			"-p",
+			"-t",
+			paneId,
+			"remain-on-exit",
+			"on",
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			paneId,
+			"@pi_subagent_run",
+			runId,
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			paneId,
+			"@pi_subagent_name",
+			name,
+			";",
+			"set-option",
+			"-p",
+			"-t",
+			paneId,
+			"@pi_subagent_session",
+			launch.childSessionFile,
+			";",
+			"respawn-pane",
+			"-k",
+			"-t",
+			paneId,
+			"--",
+			"/bin/sh",
+			launchScript,
+		]);
 		checkDisposed(context, name);
 		if (paneId === undefined)
 			throw new Error("Pane creation did not return an identity.");

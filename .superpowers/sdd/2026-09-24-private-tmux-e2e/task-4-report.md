@@ -631,3 +631,54 @@ This section describes uncommitted work left by the implementer before its provi
 - `git diff --check` and Biome checks on all six new files passed.
 
 No private-tmux E2E suite was skipped. The grandchild exit timeout did not recur in these three runs. This is macOS evidence only. The targeted layout adapter fails explicitly for a rearranged child column. The independent scoped re-review and final branch review remain pending.
+
+## Fix round 2: remove empty panes from the launch protocol
+
+Base: `19eb615`. This round addresses the two pane-start races from the scoped re-review. It does not use the earlier controller runs as evidence. No subagents or reviewers were started.
+
+### Root cause and architecture
+
+1. The local gate released its waiters in `finally`. A failure after split but before respawn left a pane with PID zero. Rollback had no saved process identity. It correctly refused to kill that pane, but all later strict snapshots still failed. The existing registry-failure test occurred too late to cover this state.
+2. Each Runtime had its own gate. A descendant Pi process could create an empty pane while its ancestor read all panes on the same server. No in-process gate can protect that shared observation scope.
+3. Keep the full server snapshot and all strict validation. Instead of creating an empty pane, split with the direct command `/bin/cat -`. This bootstrap process waits for terminal input. The existing metadata setup and `respawn-pane -k` replace it with Pi. Two command arguments make tmux execute the program directly, without the user's shell startup files.
+4. Remove `src/pane-snapshots.ts`, its Runtime adapter, its LaunchContext callback, and its four gate-only unit tests. A cross-process lock would need owner-death recovery and extra failure rules. A pane filter would hide malformed state. Neither is needed when normal startup no longer creates an empty pane.
+
+Source check: [tmux 3.7c spawn.c](https://github.com/tmux/tmux/blob/3.7c/spawn.c). `SPAWN_EMPTY` skips the fork. A nonempty command assigns the forked PID before `spawn_pane` returns. Successful respawn also assigns its new PID before returning. Other server commands can observe the bootstrap or Pi, not an empty interval between two client commands. The tests use the installed tmux 3.7c on macOS.
+
+### RED tests before production changes
+
+- Command: `node --test --test-name-pattern='pane startup preserves' test/unit/parent.test.ts`.
+  Log: `logs/task4-fix2-local-red.log`.
+  Output: 3 tests, 0 pass, 3 fail, 0 skipped. The successful-start and registry cases report `Malformed tmux pane line: "%99\\t0\\t0\\t\\t\\t"`. The new pre-respawn failure case receives zero sibling results instead of one.
+  The new case throws from the metadata command before any respawn. It checks the original error, explicit unknown ownership, retained recovery files, the reserved name, no unproved kill, and later sibling result delivery. It uses the real strict pane parser.
+- Command: `node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/pane-start.test.ts`.
+  Valid RED log: `logs/task4-fix2-cross-process-red-5.log`.
+  Output: 1 test, 0 pass, 1 fail, 0 skipped. The sibling result times out while the descendant is paused. The ancestor UI reports `Malformed tmux pane line: "%4\\t0\\t0\\t\\t\\t"`.
+  The barrier records descendant Pi PID 72985 and ancestor Pi PID 72843. This uses separate real Pi processes and one private tmux socket. A temporary PATH wrapper pauses only the descendant's completed split, before its caller can send the metadata and respawn command. The ancestor must deliver and clean up an exited sibling while that barrier remains closed. It must then observe a successful grandchild launch after release.
+- The four earlier cross-process logs are fixture setup failures, not valid race evidence. They exposed a forbidden explicit tool list, missing spawn permission, and forbidden self-spawn. The final fixture uses `worker` with `spawns: [scout]`. It waits for persisted assistant replies before it sends terminal input.
+
+### GREEN and final verification
+
+All log paths below are under `.superpowers/sdd/2026-09-24-private-tmux-e2e/`.
+
+- Initial focused GREEN: 3/3 local cases in `logs/task4-fix2-local-green.log`; 1/1 cross-process case in `logs/task4-fix2-cross-process-green.log`.
+- Final focused unit command: `node --test test/unit/launch.test.ts test/unit/parent.test.ts test/unit/column.test.ts`.
+  `logs/task4-fix2-focused-unit.log`: 137 tests, 137 pass, 0 fail, 0 skipped; 1084.632666 ms.
+- Final focused E2E command: `node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/pane-start.test.ts test/e2e/column.test.ts test/e2e/layout.test.ts`.
+  `logs/task4-fix2-focused-e2e.log`: 7 tests, 7 pass, 0 fail, 0 skipped; 21052.302125 ms.
+- `npm test`: exit 0. `logs/task4-fix2-npm-test.log` records 408/408 unit tests and 80/80 SDK tests, with zero failures or skips. The unit count is 411 minus four removed gate tests plus the new pre-respawn failure case. Typecheck passed. Lint reports the same 34 existing warnings and no errors.
+- Three separate fresh `npm run test:e2e` commands ran on the final source and tests. Each used a new private server. Each exited 0:
+  - `logs/task4-fix2-final-e2e-1.log`: 57 tests, 57 pass, 0 fail, 0 cancelled, 0 skipped; 111493.136833 ms.
+  - `logs/task4-fix2-final-e2e-2.log`: 57 tests, 57 pass, 0 fail, 0 cancelled, 0 skipped; 112187.598959 ms.
+  - `logs/task4-fix2-final-e2e-3.log`: 57 tests, 57 pass, 0 fail, 0 cancelled, 0 skipped; 111092.161125 ms.
+- Searched all three full logs for malformed pane or geometry errors, missing script steps, timeouts, failures, cancellations, and nonzero skips. None occurred. Inspected the ancestor, descendant, and grandchild UI captures in all three runs. Each ancestor delivered `Sibling completed.` before barrier release. Each descendant then showed `Started grandchild` and `Descendant launch completed.`. Each grandchild showed its ready reply. The test also verifies the bootstrap PID is replaced and the bootstrap process exits.
+- Reviewed the logged errors separately. They are the deliberate unsafe-column rejection, extension-load failure, provider failure, and orphan notice. The private server's existing `extended-keys` warning remains visible. The narrow nested-pane footer abbreviates the cwd as expected. No new malformed-pane warning is hidden in the UI.
+- `git diff --check`: exit 0. The checked column tree, geometry, PID, session, and server-identity code in `src/tmux.ts` and `src/tmux-layout.ts` is unchanged.
+
+### Self-review and remaining concern
+
+The bootstrap is a required startup stage, not a fallback. The parser still rejects zero and invalid PIDs. No pane is filtered out. There is no new mutable module state, ignored error, retry, or global lock. Tests use only temporary Pi files, the private socket, and the local faux provider.
+
+A failure before the Pi process identity is saved still retains the pane, name, and recovery files for manual inspection. The code explicitly reports this condition and does not kill a process whose ownership it cannot prove. The retained pane now has a real bootstrap process, so it does not prevent unrelated snapshots or cleanup. The regression checks this contract. This round does not claim to repair arbitrary malformed panes created by other clients or an actual tmux fork failure. Those errors must still fail loudly. Linux execution remains unverified in this macOS environment.
+
+Self-review found no additional required source change. No merge or push was performed. Full logs remain in the local ignored `logs/` directory, as in the earlier rounds.

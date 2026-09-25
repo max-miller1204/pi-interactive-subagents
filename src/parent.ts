@@ -23,7 +23,6 @@ import {
 import { Type } from "typebox";
 import { Deliverer, type Item, type Source } from "./delivery.ts";
 import { type LaunchPlan, launchRun, type StartedRun } from "./launch.ts";
-import { gatePaneSnapshots } from "./pane-snapshots.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import * as queue from "./queue.ts";
 import {
@@ -255,7 +254,6 @@ export class Runtime {
 	private readonly pi: ExtensionAPI;
 	private ctx: ExtensionContext;
 	private readonly deps: RuntimeDeps;
-	private readonly paneSnapshots: ReturnType<typeof gatePaneSnapshots>;
 	private readonly tmux: Tmux;
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly identify: (pid: number) => ProcessIdentity | null;
@@ -277,8 +275,7 @@ export class Runtime {
 		this.pi = pi;
 		this.ctx = ctx;
 		this.deps = deps;
-		this.paneSnapshots = gatePaneSnapshots(deps.tmux);
-		this.tmux = this.paneSnapshots.tmux;
+		this.tmux = deps.tmux;
 		this.env = deps.env ?? process.env;
 		this.identify = deps.identity ?? processIdentity;
 		this.alive = deps.alive ?? processAlive;
@@ -849,7 +846,6 @@ export class Runtime {
 			ownExtensionPath: this.deps.ownExtensionPath,
 			env: this.env,
 			tmux: this.tmux,
-			startPane: (action) => this.paneSnapshots.startPane(action),
 			identity: this.identify,
 			...(this.deps.invocation === undefined
 				? {}

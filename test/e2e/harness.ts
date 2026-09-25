@@ -155,6 +155,7 @@ export function trackedResource<Identity>(
 export interface ScenarioOptions {
 	prompt: string;
 	tmuxEnvironment?: string;
+	commandPath?: string;
 	agents?: Record<string, string>;
 	extensionPaths?: string[];
 	approval?: "approve" | "no-approve" | "ask";
@@ -261,7 +262,7 @@ export async function scenario(
 	];
 	const env = {
 		HOME: process.env.HOME,
-		PATH: process.env.PATH,
+		PATH: options.commandPath ?? process.env.PATH,
 		PI_CODING_AGENT_DIR: agentDir,
 		PI_SUBAGENT_TEST_ROOT: root,
 	};

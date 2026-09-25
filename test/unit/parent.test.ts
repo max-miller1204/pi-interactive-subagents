@@ -1485,8 +1485,9 @@ test("dead pane capture and a human-closed child keep final text", async (t) => 
 		/was closed in its pane by a human/,
 	);
 });
-for (const failRegistry of [false, true])
-	test(`empty launch pane cannot enter parent snapshots; registry failure=${failRegistry}`, async (t) => {
+for (const failure of ["none", "before-respawn", "registry"] as const)
+	test(`pane startup preserves strict snapshots and sibling progress: ${failure}`, async (t) => {
+		const failRegistry = failure === "registry";
 		const f = fixture(t);
 		const survivor = f.prepare("survivor");
 		f.pi.appendEntry("subagent", {
@@ -1560,7 +1561,7 @@ for (const failRegistry of [false, true])
 							"%99",
 							dead({
 								paneId: "%99",
-								pid: 0,
+								pid: args.at(-1) === "" ? 0 : 899,
 								dead: false,
 								status: null,
 								session: "",
@@ -1571,6 +1572,8 @@ for (const failRegistry of [false, true])
 						return "%99";
 					}
 					if (args[0] === "set-option") {
+						if (failure === "before-respawn")
+							throw new Error("Injected failure before respawn");
 						f.panes.set(
 							"%99",
 							dead({
@@ -1611,7 +1614,8 @@ for (const failRegistry of [false, true])
 		let poll: Promise<void> | undefined;
 		try {
 			await empty.promise;
-			await assert.rejects(strict.listPanes(), /Malformed tmux pane line/);
+			// A failed start must not poison snapshots or block sibling progress.
+			if (failure !== "before-respawn") await strict.listPanes();
 			emptyReads = 0;
 			poll = runtime.tick();
 			assert.match(
@@ -1631,7 +1635,28 @@ for (const failRegistry of [false, true])
 			assert.deepEqual(f.notifications, []);
 			respawn.resolve();
 			const outcome = await launched;
-			if (failRegistry) {
+			if (failure === "before-respawn") {
+				assert.match(String(outcome.error), /Injected failure before respawn/);
+				assert.match(String(outcome.error), /ownership is unknown/);
+				assert.match(String(outcome.error), /Kept its name and recovery files/);
+				assert.equal(outcome.value, undefined);
+				assert.equal(f.panes.has("%99"), true);
+				assert.equal(
+					f.commands.some((args) => args[0] === "kill-pane"),
+					false,
+				);
+				const retained = readdirSync(runtime.ownerDir).filter(
+					(id) => id !== survivor.runId,
+				);
+				assert.equal(retained.length, 1);
+				assert.ok(
+					existsSync(join(runtime.ownerDir, present(retained[0]), "spec.json")),
+				);
+				await assert.rejects(
+					runtime.spawn({ ...draft, name: "new" }, "Retry"),
+					/already/,
+				);
+			} else if (failRegistry) {
 				assert.match(String(outcome.error), /Injected registry failure/);
 				assert.equal(outcome.value, undefined);
 				assert.equal(f.panes.has("%99"), false);
@@ -1645,6 +1670,7 @@ for (const failRegistry of [false, true])
 				assert.equal(outcome.value?.pane.paneId, "%99");
 			}
 			await poll;
+			assert.deepEqual(f.notifications, []);
 			const count = snapshots;
 			f.living.delete(survivor.pane.process.pid);
 			f.panes.set(

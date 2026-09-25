@@ -327,7 +327,6 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			events.push("release");
 			names.delete(name);
 		},
-		startPane: (action) => action(),
 		newestLivePane: () => (vertical ? "%8" : undefined),
 		liveColumnPanes: () =>
 			vertical
@@ -475,7 +474,9 @@ test("launch transaction prepares private files, preserves focus and commits pan
 			"-P",
 			"-F",
 			"#{pane_id}",
-			"",
+			"--",
+			"/bin/cat",
+			"-",
 		],
 		[
 			"set-option",
@@ -594,7 +595,9 @@ test("a newer child gets a vertical split and column-only layout", async (t) => 
 		"-P",
 		"-F",
 		"#{pane_id}",
-		"",
+		"--",
+		"/bin/cat",
+		"-",
 	]);
 	assert.deepEqual(
 		f.calls.filter((args) => args[0] === "resize-pane"),
