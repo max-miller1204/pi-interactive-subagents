@@ -2,27 +2,41 @@
   "name": "pi-interactive-subagents",
   "version": "4.0.0",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
-  "pi": { "extensions": ["./src/index.ts"] },
-  "files": ["src", "agents", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "agents",
+    "scripts/patch-pi-declarations.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.14",
     "@earendil-works/pi-agent-core": "0.87.1",
     "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
     "@earendil-works/pi-tui": "0.87.1",
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "@types/node": "24.13.6",
     "typebox": "1.3.27",
-    "typescript": "7.0.2",
-    "@types/node": "26.6.2",
-    "@biomejs/biome": "2.5.14"
+    "typescript": "7.0.2"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-pi-declarations.mjs",
     "typecheck": "tsc",
     "lint": "biome check .",
     "test:unit": "node --test test/unit/*.test.ts",
