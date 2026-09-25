@@ -116,6 +116,7 @@ export interface Scenario {
 	readParent(): SessionEntry[];
 	capture(pane?: string): Promise<string>;
 	sendKeys(pane: string, text: string): Promise<void>;
+	reopen(file: string): Promise<void>;
 	waitFor<T>(
 		test: () => T | Promise<T>,
 		description: string,
@@ -206,13 +207,25 @@ export async function scenario(
 	for (const [name, value] of Object.entries(env))
 		if (value === undefined)
 			throw new Error(`Missing ${name} in E2E environment.`);
+	const scriptPrefix = `#!/bin/sh\ncd ${quote(cwd)} || exit 97\nexec /usr/bin/env -i "TMUX=$TMUX" "TMUX_PANE=$TMUX_PANE" ${Object.entries(
+		env,
+	)
+		.map(([name, value]) => quote(`${name}=${value}`))
+		.join(" ")} `;
 	writeFileSync(
 		script,
-		`#!/bin/sh\ncd ${quote(cwd)} || exit 97\nexec /usr/bin/env -i "TMUX=$TMUX" "TMUX_PANE=$TMUX_PANE" ${Object.entries(
-			env,
-		)
-			.map(([name, value]) => quote(`${name}=${value}`))
-			.join(" ")} ${argv.map(quote).join(" ")} 2>${quote(stderrFile)}\n`,
+		`${scriptPrefix}${argv.map(quote).join(" ")} 2>${quote(stderrFile)}\n`,
+		{ mode: 0o700 },
+	);
+	const reopenScript = join(root, "reopen.sh");
+	const sessionArg = argv.indexOf("--session") + 1;
+	if (sessionArg < 1 || argv[sessionArg] !== parentFile)
+		throw new Error("Parent session argument is missing.");
+	const reopenArgv = argv.slice(0, -1);
+	reopenArgv[sessionArg] = '"$1"';
+	writeFileSync(
+		reopenScript,
+		`${scriptPrefix}${reopenArgv.map((word, index) => (index === sessionArg ? word : quote(word))).join(" ")} 2>>${quote(stderrFile)}\n`,
 		{ mode: 0o700 },
 	);
 	let pane: string | undefined;
@@ -299,6 +312,31 @@ export async function scenario(
 		sendKeys: async (target, text) => {
 			await tmux(["send-keys", "-t", target, "-l", text]);
 			await tmux(["send-keys", "-t", target, "Enter"]);
+		},
+		reopen: async (file) => {
+			if (!existsSync(file) || !realpathSync(file).startsWith(`${root}/`))
+				throw new Error(
+					`Cannot reopen a session outside this scenario: ${file}`,
+				);
+			const dead = await tmux([
+				"display-message",
+				"-p",
+				"-t",
+				parentPane,
+				"#{pane_dead}",
+			]);
+			if (dead !== "1")
+				throw new Error(`Cannot reopen a live parent pane ${parentPane}.`);
+			await tmux([
+				"respawn-pane",
+				"-k",
+				"-t",
+				parentPane,
+				"--",
+				"/bin/sh",
+				reopenScript,
+				file,
+			]);
 		},
 		waitFor,
 		childRuns: () => {

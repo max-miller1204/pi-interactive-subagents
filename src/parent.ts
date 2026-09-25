@@ -611,6 +611,7 @@ export class Runtime {
 			this.deps.requestRender?.();
 			if (
 				this.runs.size === 0 &&
+				this.done.length === 0 &&
 				!this.sources.some((source) => source.items().length)
 			)
 				this.stopTick();
@@ -622,6 +623,7 @@ export class Runtime {
 		if (this.disposed || this.timer !== undefined) return;
 		if (
 			this.runs.size === 0 &&
+			this.done.length === 0 &&
 			!this.sources.some((source) => source.items().length)
 		)
 			return;
@@ -1173,7 +1175,10 @@ export class Runtime {
 	private async quit(): Promise<void> {
 		if (!this.enabled && this.runs.size === 0 && this.launching.size === 0)
 			return;
-		const fold = this.fold();
+		const currentSessionFile = this.ctx.sessionManager.getSessionFile();
+		const currentSessionSaved =
+			currentSessionFile !== undefined &&
+			existsSync(parentSessionPath(currentSessionFile));
 		const runs = [...this.runs.values()];
 		const notStarted = [...this.launching.keys()];
 		const killed = new Set<ParentRun>();
@@ -1273,7 +1278,7 @@ export class Runtime {
 							? "stopped"
 							: undefined;
 				if (kind === undefined) continue;
-				const target = fold.knownRunIds.has(run.spec.runId)
+				const target = currentSessionSaved
 					? this.ctx.sessionManager.getSessionId()
 					: run.spec.spawnerSessionId;
 				this.storeUndelivered(run, target, kind);
