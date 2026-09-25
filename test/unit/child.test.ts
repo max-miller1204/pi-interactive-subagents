@@ -18,7 +18,12 @@ import type {
 	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { canExit, type ExitState, installChildRole } from "../../src/child.ts";
+import {
+	canExit,
+	type ExitState,
+	installChildRole,
+	preflightChild,
+} from "../../src/child.ts";
 import { Deliverer, type Source } from "../../src/delivery.ts";
 import { processIdentity } from "../../src/process.ts";
 import * as queue from "../../src/queue.ts";
@@ -177,6 +182,41 @@ function fixture(t: TestContext) {
 		shutdowns: () => shutdowns,
 	};
 }
+
+test("child preflight validates the spec and session before runtime startup", (t) => {
+	const f = fixture(t);
+	const startup = preflightChild(f.ctx, f.runDir);
+	assert.deepEqual(startup.spec, f.spec);
+	assert.equal(startup.onInput(), undefined);
+	assert.equal(startup.onToolCall(), undefined);
+	assert.equal(f.runtime.sources.length, 0);
+	assert.equal(f.shutdowns(), 0);
+});
+for (const fault of ["spec", "session", "directory"] as const)
+	test(`child preflight handles invalid ${fault} once`, (t) => {
+		const f = fixture(t);
+		if (fault === "spec") writeFileSync(join(f.runDir, "spec.json"), "{}");
+		if (fault === "session")
+			f.ctx.sessionManager.getSessionFile = () => join(f.root, "missing");
+		const startup = preflightChild(
+			f.ctx,
+			fault === "directory" ? join(f.root, "missing") : f.runDir,
+		);
+		assert.equal(startup.spec, undefined);
+		assert.deepEqual(startup.onInput(), { action: "handled" });
+		assert.equal(startup.onToolCall()?.block, true);
+		assert.equal(f.shutdowns(), 1);
+		assert.equal(f.notices.length, 1);
+		if (fault !== "directory") {
+			const fatal = readJsonStrict(Fatal, join(f.runDir, "fatal.json"));
+			startup.fail(new Error("second failure"));
+			assert.deepEqual(
+				readJsonStrict(Fatal, join(f.runDir, "fatal.json")),
+				fatal,
+			);
+			assert.equal(f.shutdowns(), 1);
+		}
+	});
 
 test("answers simultaneous questions by id and keeps delivery files until durable", async (t) => {
 	const f = fixture(t);
@@ -613,6 +653,9 @@ test("settled exit cannot pass an open question or pending Pi message", async (t
 	child.onAgentSettled();
 	assert.equal(f.shutdowns(), 0);
 	f.ctx.hasPendingMessages = () => false;
+	child.onAgentSettled();
+	assert.equal(f.shutdowns(), 0);
+	child.onAgentStart();
 	child.onAgentSettled();
 	assert.equal(f.shutdowns(), 1);
 });

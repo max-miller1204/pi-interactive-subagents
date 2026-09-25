@@ -69,6 +69,56 @@ type Waiter = {
 	dispose(): void;
 };
 
+export class ChildStartup {
+	readonly ctx: ExtensionContext;
+	runDir: string | undefined;
+	spec: RunSpec | undefined;
+	fatal: string | undefined;
+	constructor(ctx: ExtensionContext, path: string) {
+		this.ctx = ctx;
+		try {
+			this.runDir = realpathSync(path);
+			const spec = readJsonStrict(RunSpec, join(this.runDir, "spec.json"));
+			if (spec.runId !== basename(this.runDir))
+				throw new Error(`Run identity does not match ${this.runDir}.`);
+			const file = ctx.sessionManager.getSessionFile();
+			if (
+				file === undefined ||
+				realpathSync(file) !== spec.launch.childSessionFile
+			)
+				throw new Error(
+					"This subagent session does not match its run specification.",
+				);
+			this.spec = spec;
+		} catch (error) {
+			this.fail(error);
+		}
+	}
+	fail(error: unknown): void {
+		if (this.fatal !== undefined) return;
+		this.fatal = error instanceof Error ? error.message : String(error);
+		if (this.runDir !== undefined)
+			writeJsonAtomic(
+				join(this.runDir, "fatal.json"),
+				parseStrict(Fatal, { v: 1, message: this.fatal }, "child fatal"),
+			);
+		this.ctx.ui.notify(this.fatal, "error");
+		this.ctx.shutdown();
+	}
+	onInput(): { action: "handled" } | undefined {
+		if (this.fatal !== undefined) return { action: "handled" };
+	}
+	onToolCall(): { block: true; reason: string } | undefined {
+		if (this.fatal !== undefined) return { block: true, reason: this.fatal };
+	}
+}
+export function preflightChild(
+	ctx: ExtensionContext,
+	path: string,
+): ChildStartup {
+	return new ChildStartup(ctx, path);
+}
+
 class ChildRole {
 	private readonly pi: ExtensionAPI;
 	private readonly ctx: ExtensionContext;
@@ -76,11 +126,15 @@ class ChildRole {
 	private runDir: string | undefined;
 	private spec: RunSpec | undefined;
 	private readonly waiters = new Map<string, Waiter>();
-	private fatal: string | undefined;
+	private readonly startup: ChildStartup;
+	private get fatal(): string | undefined {
+		return this.startup.fatal;
+	}
 	private disposed = false;
 	private orphaned = false;
 	private exiting = false;
 	private initialSeen = false;
+	private interrupted = false;
 	private human = false;
 	private state: ChildStatus["state"] = "starting";
 	private contextTokens: number | null = null;
@@ -90,36 +144,20 @@ class ChildRole {
 		pi: ExtensionAPI,
 		ctx: ExtensionContext,
 		runtime: ChildRuntime,
-		path: string,
+		path: string | ChildStartup,
 	) {
 		this.pi = pi;
 		this.ctx = ctx;
 		this.runtime = runtime;
+		this.startup = typeof path === "string" ? preflightChild(ctx, path) : path;
+		this.runDir = this.startup.runDir;
+		this.spec = this.startup.spec;
+		if (this.fatal !== undefined) return;
 		try {
-			this.runDir = realpathSync(path);
-			this.spec = readJsonStrict(RunSpec, join(this.runDir, "spec.json"));
-			if (this.spec.runId !== basename(this.runDir))
-				throw new Error(`Run identity does not match ${this.runDir}.`);
-			const file = ctx.sessionManager.getSessionFile();
-			if (
-				file === undefined ||
-				realpathSync(file) !== this.spec.launch.childSessionFile
-			)
-				throw new Error(
-					"This subagent session does not match its run specification.",
-				);
 			this.registerQuestion();
 			this.selfCheck();
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this.fatal = message;
-			if (this.runDir !== undefined)
-				writeJsonAtomic(
-					join(this.runDir, "fatal.json"),
-					parseStrict(Fatal, { v: 1, message }, "child fatal"),
-				);
-			ctx.ui.notify(message, "error");
-			ctx.shutdown();
+			this.startup.fail(error);
 			return;
 		}
 		const { spec, runDir } = this.ready();
@@ -347,6 +385,7 @@ class ChildRole {
 			};
 			const onAbort = () => {
 				if (waiter.state !== "open") return;
+				this.interrupted = true;
 				close("withdrawn");
 				queue.put(join(runDir, "outbox"), "outbox", {
 					v: 1,
@@ -407,6 +446,7 @@ class ChildRole {
 	}
 	onAgentStart(): void {
 		if (!this.active()) return;
+		this.interrupted = false;
 		this.state = "working";
 		this.writeStatus();
 	}
@@ -428,7 +468,8 @@ class ChildRole {
 				orphaned: this.orphaned,
 				exiting: this.exiting,
 				fatal: this.fatal !== undefined,
-				stopReason: last?.stopReason,
+				// Pi can report an abort during a tool call as a provider error.
+				stopReason: this.interrupted ? "aborted" : last?.stopReason,
 				inboxCount: queue.count(join(runDir, "inbox")),
 				offeredCount: this.deliverer().offeredCount,
 				nestedRunCount: this.runtime.runs.size,
@@ -503,7 +544,7 @@ export function installChildRole(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	runtime: ChildRuntime,
-	runDir: string,
+	runDir: string | ChildStartup,
 ): ChildRole {
 	return new ChildRole(pi, ctx, runtime, runDir);
 }
