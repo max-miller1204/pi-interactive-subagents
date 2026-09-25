@@ -134,6 +134,7 @@ export function defaultName(agent: string, used: ReadonlySet<string>): string {
 
 export interface ParentRun extends StartedRun {
 	phase: "live" | "finishing" | "finished";
+	paneCleanup: "unknown" | "pending" | "complete";
 	paneGoneAt?: number | undefined;
 	view?: ChildStatus;
 	broken?: Error;
@@ -335,7 +336,7 @@ export class Runtime {
 				this.notify(error);
 			}
 		}
-		if (event.reason === "startup") this.recoverDeadOwners();
+		if (event.reason === "startup") await this.recoverDeadOwners();
 		this.sources.push(this.noticeSource());
 		this.deliverer = new Deliverer(
 			this.pi,
@@ -354,6 +355,7 @@ export class Runtime {
 			throw new Error(`Subagent name "${name}" is already in use.`);
 		const run: ParentRun = {
 			...started,
+			paneCleanup: "unknown",
 			phase: existsSync(join(started.runDir, "result.json"))
 				? "finished"
 				: "live",
@@ -466,13 +468,23 @@ export class Runtime {
 		if (target !== undefined)
 			await this.deps.tmux.run(["select-layout", "-E", "-t", target]);
 	}
-	private async closePane(run: ParentRun): Promise<void> {
+	private async closePane(run: ParentRun): Promise<string | undefined> {
+		run.paneCleanup = "pending";
 		try {
 			await this.deps.tmux.run(["kill-pane", "-t", run.pane.paneId]);
-			if (!this.disposed) await this.rebalance(run.pane.paneId);
 		} catch (error) {
 			this.notify(error);
+			return errorText(error);
 		}
+		run.paneCleanup = "complete";
+		if (!this.disposed) {
+			try {
+				await this.rebalance(run.pane.paneId);
+			} catch (error) {
+				this.notify(error);
+			}
+		}
+		return undefined;
 	}
 	private async finalize(
 		run: ParentRun,
@@ -505,8 +517,12 @@ export class Runtime {
 			)) {
 				try {
 					const pane = panes.get(run.pane.paneId);
+					run.paneCleanup = pane === undefined ? "complete" : "pending";
 					if (this.acknowledged(run)) {
-						if (!this.alive(run.pane.process)) this.removeRun(run);
+						if (pane !== undefined) await this.closePane(run);
+						if (this.disposed) return;
+						if (run.paneCleanup === "complete" && !this.alive(run.pane.process))
+							this.removeRun(run);
 						continue;
 					}
 					if (run.phase === "live") {
@@ -674,8 +690,8 @@ export class Runtime {
 				if (item.seq !== undefined)
 					queue.deleteConsumed(join(run.runDir, "outbox"), item.seq);
 				else {
-					// Persist confirmation before retaining files for a live writer.
-					if (this.alive(run.pane.process)) {
+					// Delivery and resource cleanup have separate completion states.
+					if (run.paneCleanup !== "complete" || this.alive(run.pane.process)) {
 						const ack = parseStrict(
 							DeliveryAck,
 							{ v: 1, runId: run.spec.runId, deliveryId: item.id },
@@ -700,6 +716,10 @@ export class Runtime {
 		return true;
 	}
 	private removeRun(run: ParentRun): void {
+		if (run.paneCleanup !== "complete" || this.alive(run.pane.process))
+			throw new Error(
+				`Cannot remove subagent ${run.spec.launch.name} before pane cleanup and process exit.`,
+			);
 		rmSync(run.runDir, { recursive: true });
 		this.runs.delete(run.spec.launch.name);
 		const source = this.sources.find((source) => source.key === run.spec.runId);
@@ -940,7 +960,8 @@ export class Runtime {
 	private removeEmpty(dir: string): void {
 		if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
 	}
-	private recoverDeadOwners(): void {
+	private async recoverDeadOwners(): Promise<void> {
+		let panes: Map<string, PaneState> | undefined;
 		const owners = join(this.runsRoot, "owners");
 		for (const name of readdirSync(owners)
 			.filter((name) => !name.startsWith("."))
@@ -963,6 +984,11 @@ export class Runtime {
 					if (spec.runId !== id)
 						throw new Error(`Run identity does not match ${runDir}.`);
 					if (this.alive(pane.process)) continue;
+					panes ??= await this.deps.tmux.listPanes();
+					if (panes.has(pane.paneId)) {
+						await this.deps.tmux.run(["kill-pane", "-t", pane.paneId]);
+						panes.delete(pane.paneId);
+					}
 					if (this.acknowledged({ runDir, spec, pane })) {
 						rmSync(runDir, { recursive: true });
 						continue;
@@ -1092,25 +1118,28 @@ export class Runtime {
 		const killed = new Set<ParentRun>();
 		const killFailed = new Set<ParentRun>();
 		const errors: string[] = [];
+		const panes = runs.length
+			? await this.deps.tmux.listPanes()
+			: new Map<string, PaneState>();
 		for (const run of runs) {
-			const live = this.alive(run.pane.process);
-			if (run.phase !== "live" && !live) continue;
 			let missingPaneProcess = false;
 			try {
-				missingPaneProcess =
-					live &&
-					run.phase === "finished" &&
-					(run.paneGoneAt !== undefined || this.acknowledged(run));
+				const live = this.alive(run.pane.process);
+				run.paneCleanup = panes.has(run.pane.paneId) ? "pending" : "complete";
+				missingPaneProcess = live && run.paneCleanup === "complete";
 				if (missingPaneProcess) {
-					// The pane is gone. Send SIGHUP only to the recorded live process.
+					// Recheck the recorded identity before signaling a process without a pane.
 					const stop =
 						this.deps.stopProcess ??
 						((identity: ProcessIdentity) => {
 							process.kill(identity.pid, "SIGHUP");
 						});
 					if (this.alive(run.pane.process)) stop(run.pane.process);
-				} else await this.deps.tmux.run(["kill-pane", "-t", run.pane.paneId]);
-				killed.add(run);
+				} else if (run.paneCleanup === "pending") {
+					const error = await this.closePane(run);
+					if (error !== undefined) throw new Error(error);
+				}
+				if (live || run.phase === "live") killed.add(run);
 			} catch (error) {
 				killFailed.add(run);
 				errors.push(
@@ -1138,18 +1167,18 @@ export class Runtime {
 					stillLive.push(run);
 					continue;
 				}
-				if (killFailed.has(run)) continue;
-				if (this.acknowledged(run)) {
-					this.removeRun(run);
-					if (killed.has(run)) stopped.push(run.spec.launch.name);
-					continue;
-				}
 				if (run.phase === "finishing") {
 					try {
 						this.finalizeSync(run, run.finishPane);
 					} catch (error) {
 						this.finalizeFailed(run, error);
 					}
+				}
+				if (killFailed.has(run) || run.paneCleanup !== "complete") continue;
+				if (this.acknowledged(run)) {
+					this.removeRun(run);
+					if (killed.has(run)) stopped.push(run.spec.launch.name);
+					continue;
 				}
 				if (run.broken !== undefined) throw run.broken;
 				const kind =

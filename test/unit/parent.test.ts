@@ -975,6 +975,248 @@ test("quit owns an in-flight finalization and keeps its crashed result", async (
 	}
 	assert.equal(f.sent.length, 0);
 });
+test("durable result confirmation retains failed pane cleanup across reattach", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	let attempts = 0;
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") {
+			attempts++;
+			throw new Error("pane cleanup denied");
+		}
+		return "";
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	await f.runtime.tick();
+	assert.equal(existsSync(run.runDir), true);
+	assert.equal(f.sent.length, 1);
+	assert.ok(attempts >= 2);
+	assert.equal(existsSync(join(run.runDir, "delivery-ack.json")), true);
+	await f.runtime.onShutdown("new");
+	const next = new Runtime(f.pi, f.ctx, f.deps);
+	t.after(() => next.onShutdown("new"));
+	await next.start({ reason: "new" });
+	await next.tick();
+	assert.equal(existsSync(run.runDir), true);
+	assert.equal(f.sent.length, 1);
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") {
+			attempts++;
+			f.panes.delete(run.pane.paneId);
+		}
+		return "";
+	};
+	await next.tick();
+	assert.equal(existsSync(run.runDir), false);
+	assert.equal(next.runs.size, 0);
+	assert.equal(f.sent.length, 1);
+});
+test("dead-owner recovery retains acknowledged runs until pane cleanup succeeds", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	f.deps.tmux.run = async () => {
+		throw new Error("pane cleanup denied");
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	await f.runtime.tick();
+	await f.runtime.onShutdown("new");
+	const deps = {
+		...f.deps,
+		identity: (pid: number) =>
+			pid === process.pid ? { pid, start: "new owner" } : null,
+	};
+	const recovery = new Runtime(f.pi, f.ctx, deps);
+	t.after(() => recovery.onShutdown("new"));
+	await recovery.start({ reason: "startup" });
+	assert.equal(existsSync(run.runDir), true);
+	assert.equal(f.sent.length, 1);
+	await recovery.onShutdown("new");
+	deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") f.panes.delete(run.pane.paneId);
+		return "";
+	};
+	const retry = new Runtime(f.pi, f.ctx, deps);
+	t.after(() => retry.onShutdown("new"));
+	await retry.start({ reason: "startup" });
+	await retry.tick();
+	assert.equal(existsSync(run.runDir), false);
+	assert.equal(f.sent.length, 1);
+	assert.equal(
+		existsSync(join(f.deps.runsRoot, "undelivered", "parent")),
+		false,
+	);
+});
+test("quit completes retained pane cleanup without another result or notice", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	f.deps.tmux.run = async () => {
+		throw new Error("pane cleanup denied");
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	await f.runtime.tick();
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") f.panes.delete(run.pane.paneId);
+		return "";
+	};
+	await f.runtime.onShutdown("quit");
+	assert.equal(f.panes.size, 0);
+	assert.equal(existsSync(run.runDir), false);
+	assert.equal(f.sent.length, 1);
+	assert.equal(
+		existsSync(join(f.deps.runsRoot, "undelivered", "parent")),
+		false,
+	);
+});
+test("quit retries cleanup of a confirmed finished dead pane and preserves failure", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	let attempts = 0;
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") {
+			attempts++;
+			throw new Error("pane cleanup denied");
+		}
+		return "";
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	const before = attempts;
+	await f.runtime.onShutdown("quit");
+	assert.equal(attempts, before + 1);
+	assert.equal(existsSync(run.runDir), true);
+	assert.match(
+		present(f.stderr[0]),
+		/Could not close pane %2: pane cleanup denied/,
+	);
+	assert.equal(
+		existsSync(
+			join(f.deps.runsRoot, "undelivered", "parent", `${run.runId}.json`),
+		),
+		false,
+	);
+});
+test("quit closes an interrupted capture pane or retains its finalized result on failure", async (t) => {
+	for (const fail of [false, true]) {
+		const f = fixture(t);
+		const run = f.prepare("worker-1");
+		f.panes.set(run.pane.paneId, dead({ status: 2 }));
+		const gate = Promise.withResolvers<void>();
+		const capture = Promise.withResolvers<void>();
+		f.deps.tmux.capture = async () => {
+			capture.resolve();
+			await gate.promise;
+			return "tail";
+		};
+		let attempts = 0;
+		f.deps.tmux.run = async (args) => {
+			if (args[0] === "kill-pane") {
+				attempts++;
+				if (fail) throw new Error("pane cleanup denied");
+				f.panes.delete(run.pane.paneId);
+			}
+			return "";
+		};
+		await f.runtime.start({ reason: "new" });
+		const tick = f.runtime.tick();
+		await capture.promise;
+		const quit = f.runtime.onShutdown("quit");
+		gate.resolve();
+		await Promise.all([tick, quit]);
+		assert.equal(attempts, 1);
+		if (fail) {
+			assert.equal(existsSync(run.runDir), true);
+			assert.equal(run.result().status, "crashed");
+			assert.match(present(f.stderr[0]), /Could not close pane/);
+		} else {
+			assert.equal(existsSync(run.runDir), false);
+			assert.equal(f.panes.size, 0);
+		}
+	}
+});
+test("quit after reattach stops an unacknowledged timeout process and retains an unconfirmed exit", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1", true);
+	f.panes.clear();
+	f.living.add(run.pane.process.pid);
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	f.advance(30_000);
+	await f.runtime.tick();
+	await f.runtime.onShutdown("new");
+	assert.equal(existsSync(join(run.runDir, "delivery-ack.json")), false);
+	const signals: ProcessIdentity[] = [];
+	let livenessChecks = 0;
+	const next = new Runtime(f.pi, f.ctx, {
+		...f.deps,
+		alive: (identity) => {
+			livenessChecks++;
+			return f.living.has(identity.pid);
+		},
+		stopProcess: (identity) => {
+			assert.ok(livenessChecks >= 2);
+			signals.push(identity);
+		},
+	});
+	t.after(() => next.onShutdown("new"));
+	await next.start({ reason: "new" });
+	await next.onShutdown("quit");
+	assert.deepEqual(signals, [run.pane.process]);
+	assert.equal(existsSync(run.runDir), true);
+	assert.match(present(f.stderr[0]), /did not stop within 5 s/);
+	assert.equal(
+		existsSync(
+			join(f.deps.runsRoot, "undelivered", "parent", `${run.runId}.json`),
+		),
+		false,
+	);
+});
+test("the result contains an open question before its stale outbox question is dropped", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	const qid = "q-11111111";
+	writeJsonAtomic(join(run.runDir, "questions", `${qid}.json`), {
+		v: 1,
+		qid,
+		text: "Proceed?",
+		toolCallId: "call",
+		askedAt: 1,
+	});
+	const seq = queue.put(join(run.runDir, "outbox"), "outbox", {
+		v: 1,
+		kind: "question",
+		qid,
+		text: "Proceed?",
+	});
+	await f.runtime.start({ reason: "new" });
+	const source = present(
+		f.runtime.sources.find((source) => source.key === run.runId),
+	);
+	const confirm = source.confirm;
+	let dropped = false;
+	source.confirm = (item) => {
+		if (item.id === queue.itemId(run.runId, "outbox", seq)) {
+			assert.deepEqual(run.result().openQuestions, [{ qid, text: "Proceed?" }]);
+			dropped = true;
+		}
+		confirm(item);
+	};
+	await f.runtime.tick();
+	assert.equal(dropped, true);
+	assert.equal(queue.count(join(run.runDir, "outbox")), 0);
+	assert.equal(existsSync(f.parentFile), false);
+	assert.equal(
+		f.entries.some(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "subagent_question",
+		),
+		false,
+	);
+});
+
 test("dead pane capture and a human-closed child keep final text", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
