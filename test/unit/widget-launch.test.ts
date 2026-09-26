@@ -114,7 +114,7 @@ test("widget launch writes the same run files and uses Pi RPC without tmux", asy
 	);
 });
 
-test("widget launch removes prepared files if supervisor fails before starting", async (t) => {
+test("widget launch keeps recovery files if supervisor startup is uncertain", async (t) => {
 	const f = setup(t);
 	let released = false;
 	f.context.startSupervisor = async () => {
@@ -123,7 +123,10 @@ test("widget launch removes prepared files if supervisor fails before starting",
 	f.context.release = () => {
 		released = true;
 	};
-	await assert.rejects(launchWidgetRun(f.plan, f.context), /start failed/);
-	assert.equal(released, true);
-	assert.equal(existsSync(join(f.ownerDir, f.runId)), false);
+	await assert.rejects(
+		launchWidgetRun(f.plan, f.context),
+		/cleanup was not confirmed/,
+	);
+	assert.equal(released, false);
+	assert.equal(existsSync(join(f.ownerDir, f.runId)), true);
 });

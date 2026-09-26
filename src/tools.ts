@@ -125,9 +125,9 @@ export function registerTools(
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Start a subagent in a new tmux pane. It returns at once. The result arrives later as a message.",
+			"Start an interactive subagent. It returns at once. The result arrives later as a message.",
 		promptSnippet:
-			"subagent: start a named subagent in a tmux pane; its result arrives later as a message",
+			"subagent: start a named interactive subagent; its result arrives later as a message",
 		promptGuidelines: [...rules, ...next.split("\n")],
 		parameters: subagentParameters,
 		executionMode: "sequential",
@@ -148,12 +148,15 @@ export function registerTools(
 			);
 			const started = await runtime.spawn(draft, args.task, toolCallId);
 			const { runId, launch } = started.spec;
-			const paneId = started.pane.paneId;
+			const place =
+				started.backend.kind === "pane"
+					? `pane ${started.backend.pane.paneId}`
+					: "the subagent viewer";
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in pane ${paneId}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : " A human works with it in the pane. The result arrives when the pane closes."}`,
+						text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in ${place}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : started.backend.kind === "pane" ? " A human works with it in the pane. The result arrives when the pane closes." : " A human can work with it in the viewer. The result arrives when the run closes."}`,
 					},
 				],
 				details: {
@@ -161,7 +164,9 @@ export function registerTools(
 					name,
 					agent: args.agent,
 					profile: args.profile,
-					paneId,
+					...(started.backend.kind === "pane"
+						? { paneId: started.backend.pane.paneId }
+						: {}),
 					childSessionFile: launch.childSessionFile,
 				},
 			};

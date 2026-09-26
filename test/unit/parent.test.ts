@@ -27,6 +27,7 @@ import {
 	routableQuestions,
 } from "../../src/parent.ts";
 import * as queue from "../../src/queue.ts";
+import { writeRunBackend } from "../../src/run-backend.ts";
 import {
 	type Launch,
 	type ProcessIdentity,
@@ -438,6 +439,223 @@ function fixture(
 		activeTools: () => activeTools,
 	};
 }
+test("widget run reattaches and finishes without reading tmux panes", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	const backend = {
+		kind: "widget" as const,
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	};
+	writeRunBackend(run.runDir, backend);
+	f.living.add(333);
+	f.living.add(444);
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	assert.equal(f.lists(), 0);
+	assert.equal(f.runtime.runs.get("worker-1")?.phase, "live");
+	f.living.delete(444);
+	writeJsonAtomic(join(run.runDir, "widget-exit.json"), {
+		v: 1,
+		runId: run.runId,
+		exitCode: 0,
+		signal: null,
+	});
+	await f.runtime.tick();
+	assert.equal(run.result().status, "completed");
+});
+
+test("outside tmux auto launches a widget run without tmux calls", async (t) => {
+	const f = fixture(t, { disk: true });
+	const runtime = new Runtime(f.pi, f.ctx, {
+		...f.deps,
+		env: {},
+		invocation: () => [process.execPath, join(f.dir, "pi.js")],
+		startSupervisor: async (_spec, runDir) => {
+			f.living.add(333);
+			f.living.add(444);
+			return {
+				kind: "widget",
+				supervisor: { pid: 333, start: "supervisor" },
+				child: { pid: 444, start: "child" },
+				socket: join(runDir, "w.sock"),
+			};
+		},
+	});
+	t.after(() => runtime.onShutdown("new"));
+	writeFileSync(join(f.dir, "pi.js"), "");
+	await runtime.start({ reason: "new" });
+	const started = await runtime.spawn(
+		{
+			name: "worker-1",
+			agent: "worker",
+			profile: "quick",
+			cwd: f.dir,
+			session: "standalone",
+			autoExit: true,
+			model: { provider: "test", id: "test" },
+			thinking: "off",
+			systemPrompt: { mode: "append", text: "Task" },
+			tools: [],
+			extensions: [],
+			skills: [],
+			depth: 1,
+			nested: null,
+		},
+		"Do work",
+	);
+	assert.equal(started.backend.kind, "widget");
+	assert.equal(f.lists(), 0);
+	assert.equal(f.commands.length, 0);
+});
+
+test("display mode saves one session setting and rejects panes outside tmux", async (t) => {
+	const f = fixture(t, { disk: true });
+	const runtime = new Runtime(f.pi, f.ctx, { ...f.deps, env: {} });
+	t.after(() => runtime.onShutdown("new"));
+	await runtime.start({ reason: "new" });
+	assert.equal(runtime.displayMode(), "auto");
+	assert.throws(() => runtime.setDisplayMode("panes"), /inside tmux/);
+	runtime.setDisplayMode("widget");
+	assert.equal(runtime.displayMode(), "widget");
+	assert.equal(
+		f.entries.filter(
+			(entry) =>
+				entry.type === "custom" && entry.customType === "subagent_display_mode",
+		).length,
+		1,
+	);
+});
+
+test("lost widget supervisor stops a verified live child and records failure", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeRunBackend(run.runDir, {
+		kind: "widget",
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	});
+	f.living.add(444);
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.tick();
+	assert.equal(f.lists(), 0);
+	assert.equal(
+		existsSync(join(run.runDir, "widget-parent-failure.json")),
+		true,
+	);
+	f.living.delete(444);
+	writeJsonAtomic(join(run.runDir, "widget-exit.json"), {
+		v: 1,
+		runId: run.runId,
+		exitCode: null,
+		signal: "SIGTERM",
+	});
+	await f.runtime.tick();
+	assert.equal(run.result().status, "failed");
+});
+
+test("reused widget child PID keeps recovery files and reserves its name", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeRunBackend(run.runDir, {
+		kind: "widget",
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	});
+	const runtime = new Runtime(f.pi, f.ctx, {
+		...f.deps,
+		identity: (pid) =>
+			pid === process.pid
+				? { pid, start: "owner start" }
+				: pid === 444
+					? { pid, start: "reused child" }
+					: null,
+	});
+	t.after(() => runtime.onShutdown("new"));
+	await runtime.start({ reason: "new" });
+	await runtime.tick();
+	assert.equal(existsSync(join(run.runDir, "spec.json")), true);
+	assert.equal(existsSync(join(run.runDir, "result.json")), false);
+	assert.ok(runtime.list().reserved.includes("worker-1"));
+});
+
+test("quit stops a widget child and stores one saved result", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	const backend = {
+		kind: "widget" as const,
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	};
+	writeRunBackend(run.runDir, backend);
+	f.living.add(333);
+	f.living.add(444);
+	let stops = 0;
+	Object.assign(f.deps, {
+		connectSupervisor: async () => ({
+			status: async () => ({ childAlive: true, exitCode: null, signal: null }),
+			stop: async () => {
+				stops++;
+				f.living.delete(444);
+				writeJsonAtomic(join(run.runDir, "widget-exit.json"), {
+					v: 1,
+					runId: run.runId,
+					exitCode: null,
+					signal: "SIGTERM",
+				});
+			},
+		}),
+	});
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.onShutdown("quit");
+	assert.equal(stops, 1);
+	assert.equal(f.lists(), 0);
+	assert.match(f.stderr.join(""), /kept 1 result/);
+});
+
+test("stop verifies widget backend and saves a closed result", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	const backend = {
+		kind: "widget" as const,
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	};
+	writeRunBackend(run.runDir, backend);
+	f.living.add(333);
+	f.living.add(444);
+	let stops = 0;
+	Object.assign(f.deps, {
+		connectSupervisor: async () => ({
+			status: async () => ({ childAlive: true, exitCode: null, signal: null }),
+			stop: async () => {
+				stops++;
+				f.living.delete(444);
+				writeJsonAtomic(join(run.runDir, "widget-exit.json"), {
+					v: 1,
+					runId: run.runId,
+					exitCode: null,
+					signal: "SIGTERM",
+				});
+			},
+		}),
+	});
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.stop("worker-1");
+	await f.runtime.tick();
+	assert.equal(stops, 1);
+	assert.equal(run.result().status, "closed");
+});
 test("result stores auto-exit provenance and done rows retain agent, duration and tokens for 10 seconds", async (t) => {
 	const f = fixture(t, { disk: true });
 	const run = f.prepare("worker-1");
@@ -1778,7 +1996,12 @@ for (const failure of ["none", "before-respawn", "registry"] as const)
 				);
 			} else {
 				assert.equal(outcome.error, undefined);
-				assert.equal(outcome.value?.pane.paneId, "%99");
+				assert.equal(
+					outcome.value?.backend.kind === "pane"
+						? outcome.value.backend.pane.paneId
+						: undefined,
+					"%99",
+				);
 			}
 			await poll;
 			assert.deepEqual(f.notifications, []);

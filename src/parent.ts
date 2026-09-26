@@ -22,12 +22,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Deliverer, type Item, type Source } from "./delivery.ts";
+import { readDisplayMode, resolveDisplayMode } from "./display-mode.ts";
 import { type LaunchPlan, launchRun, type StartedRun } from "./launch.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import * as queue from "./queue.ts";
 import { readRunBackend } from "./run-backend.ts";
 import {
 	ChildStatus,
+	DisplayModeEntry,
 	Fatal,
 	type LaunchDraft,
 	LaunchState,
@@ -36,11 +38,13 @@ import {
 	type PaneFile,
 	type ProcessIdentity,
 	parseStrict,
+	type RegistryRecord,
 	ResultDetails,
 	type ResultStatus,
 	RunSpec,
 	readJsonStrict,
 	UndeliveredRecord,
+	WidgetExitRecord,
 	writeJsonAtomic,
 } from "./schema.ts";
 import {
@@ -64,22 +68,63 @@ import {
 	verifiedPane,
 } from "./tmux.ts";
 import { resultContent } from "./ui.ts";
+import { connectSupervisor } from "./widget-client.ts";
+import { launchWidgetRun, type WidgetStartedRun } from "./widget-launch.ts";
+import { startSupervisor } from "./widget-supervisor.ts";
 
 export function classifyResult(evidence: {
 	branch: SessionEntry[];
 	runId: string;
 	pane: PaneState | undefined;
 	fatal?: string | undefined;
+	stopped?: boolean;
 }): { status: ResultStatus; errorMessage?: string } {
-	const { pane, fatal, branch, runId } = evidence;
+	const { pane, fatal, branch, runId, stopped } = evidence;
 	if (pane?.dead && pane.status === null && pane.signal === null)
 		throw new Error(
 			`tmux reports pane ${pane.paneId} as dead with no exit status and no signal.`,
 		);
 	if (fatal !== undefined) return { status: "failed", errorMessage: fatal };
+	if (stopped) return { status: "closed" };
 	if (pane === undefined) return { status: "closed" };
 	if (!pane.dead) throw new Error(`Pane ${pane.paneId} is still live.`);
 	if (pane.signal !== null || pane.status !== 0) return { status: "crashed" };
+	const entries = afterMarker(branch, runId);
+	const assistant = entries === undefined ? undefined : lastAssistant(entries);
+	if (assistant === undefined) return { status: "no_output" };
+	switch (assistant.stopReason) {
+		case "error":
+			return {
+				status: "error",
+				...(assistant.errorMessage === undefined
+					? {}
+					: { errorMessage: assistant.errorMessage }),
+			};
+		case "aborted":
+		case "toolUse":
+			return { status: "aborted" };
+		case "stop":
+		case "length":
+			return { status: "completed" };
+		default:
+			throw new Error(
+				`Unexpected final assistant stop reason: ${assistant.stopReason}.`,
+			);
+	}
+}
+export function classifyWidgetResult(evidence: {
+	branch: SessionEntry[];
+	runId: string;
+	exit: WidgetExitRecord;
+	fatal?: string | undefined;
+	stopped: boolean;
+}): { status: ResultStatus; errorMessage?: string } {
+	const { branch, runId, exit, fatal, stopped } = evidence;
+	if (fatal !== undefined) return { status: "failed", errorMessage: fatal };
+	if (exit.error !== undefined)
+		return { status: "failed", errorMessage: exit.error };
+	if (stopped) return { status: "closed" };
+	if (exit.signal !== null || exit.exitCode !== 0) return { status: "crashed" };
 	const entries = afterMarker(branch, runId);
 	const assistant = entries === undefined ? undefined : lastAssistant(entries);
 	if (assistant === undefined) return { status: "no_output" };
@@ -143,7 +188,8 @@ export function defaultName(agent: string, used: ReadonlySet<string>): string {
 	return `${agent}-${n}`;
 }
 
-export interface ParentRun extends StartedRun {
+type AnyStartedRun = StartedRun | WidgetStartedRun;
+export type ParentRun = AnyStartedRun & {
 	phase: "live" | "finishing" | "finished";
 	paneCleanup: "unknown" | "pending" | "complete";
 	paneGoneAt?: number | undefined;
@@ -151,6 +197,18 @@ export interface ParentRun extends StartedRun {
 	broken?: Error;
 	sourceFailed?: boolean;
 	finishPane?: PaneState | undefined;
+};
+
+function paneOf(run: AnyStartedRun): PaneFile {
+	if (run.backend.kind !== "pane")
+		throw new Error("This subagent has no pane.");
+	return run.backend.pane;
+}
+
+function childOf(run: AnyStartedRun): ProcessIdentity {
+	return run.backend.kind === "pane"
+		? run.backend.pane.process
+		: run.backend.child;
 }
 export interface RuntimeDeps {
 	tmux: Tmux;
@@ -165,6 +223,8 @@ export interface RuntimeDeps {
 	stderr?: (text: string) => void;
 	stopProcess?: (identity: ProcessIdentity) => void;
 	invocation?: () => string[];
+	startSupervisor?: typeof startSupervisor;
+	connectSupervisor?: typeof connectSupervisor;
 	childSpec?: RunSpec;
 	requestRender?: () => void;
 }
@@ -275,11 +335,9 @@ export class Runtime {
 		const reason =
 			ctx.mode !== "tui" && !rpcChild
 				? "this mode is not the interactive Pi TUI"
-				: !rpcChild && (!this.env.TMUX || !this.env.TMUX_PANE)
-					? "Pi is not inside tmux"
-					: sessionFile === undefined
-						? "this session has no session file path"
-						: undefined;
+				: sessionFile === undefined
+					? "this session has no session file path"
+					: undefined;
 		if (reason !== undefined || sessionFile === undefined) {
 			this.pi.setActiveTools(
 				this.pi
@@ -306,21 +364,26 @@ export class Runtime {
 			.filter((name) => !name.startsWith("."))
 			.sort()) {
 			const runDir = join(this.ownerDir, name);
-			if (!existsSync(join(runDir, "pane.json"))) {
+			if (
+				!existsSync(join(runDir, "backend.json")) &&
+				!existsSync(join(runDir, "pane.json"))
+			) {
 				this.recoverIncompleteRun(runDir, name, this.ownerKey);
 				continue;
 			}
 			try {
 				const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
 				const backend = readRunBackend(runDir);
-				if (backend.kind !== "pane")
-					throw new Error(`Widget backend is not active for ${runDir}.`);
-				const pane = backend.pane;
 				if (spec.runId !== name || spec.ownerKey !== this.ownerKey)
 					throw new Error(`Run identity does not match ${runDir}.`);
-				this.attach({ runDir, spec, pane, backend });
+				this.attach(
+					backend.kind === "pane"
+						? { runDir, spec, pane: backend.pane, backend }
+						: { runDir, spec, backend },
+				);
 			} catch (error) {
 				this.notify(error);
+				this.recoverIncompleteRun(runDir, name, this.ownerKey);
 			}
 		}
 		// Prepare shutdown reconciliation before recovery can await.
@@ -401,10 +464,10 @@ export class Runtime {
 			for (const name of names)
 				if (name !== undefined) this.incompleteNames.set(name, runDir);
 		this.notify(
-			`Cannot clean subagent run ${runDir}: ${problem ?? "pane creation was attempted, but pane identity is unknown"}. Inspect its pane and process before manual cleanup.`,
+			`Cannot clean subagent run ${runDir}: ${problem ?? "backend creation was attempted, but process identity is unknown"}. Inspect its process before manual cleanup.`,
 		);
 	}
-	private attach(started: StartedRun): void {
+	private attach(started: AnyStartedRun): void {
 		const name = started.spec.launch.name;
 		if (this.runs.has(name))
 			throw new Error(`Subagent name "${name}" is already in use.`);
@@ -466,7 +529,7 @@ export class Runtime {
 		paneTail?: string,
 	): void {
 		const file = run.spec.launch.childSessionFile;
-		const live = this.alive(run.pane.process);
+		const live = this.alive(childOf(run));
 		const fatalFile = join(run.runDir, "fatal.json");
 		const fatal = existsSync(fatalFile)
 			? readJsonStrict(Fatal, fatalFile).message
@@ -485,18 +548,45 @@ export class Runtime {
 		const view = existsSync(statusFile)
 			? readJsonStrict(ChildStatus, statusFile)
 			: undefined;
+		const widgetExit =
+			run.backend.kind === "widget"
+				? readJsonStrict(WidgetExitRecord, join(run.runDir, "widget-exit.json"))
+				: undefined;
+		const widgetFailureFile = join(run.runDir, "widget-parent-failure.json");
+		const widgetFailure = existsSync(widgetFailureFile)
+			? readJsonStrict(Fatal, widgetFailureFile).message
+			: undefined;
+		const widgetStopped = existsSync(join(run.runDir, "stop-request.json"));
 		this.saveResult(run, {
 			...this.baseResult(run),
-			...classifyResult({ branch, runId: run.spec.runId, pane, fatal }),
+			...(widgetExit === undefined
+				? classifyResult({
+						branch,
+						runId: run.spec.runId,
+						pane,
+						fatal,
+						stopped: widgetStopped,
+					})
+				: classifyWidgetResult({
+						branch,
+						runId: run.spec.runId,
+						exit: widgetExit,
+						fatal: widgetFailure ?? fatal,
+						stopped: widgetStopped,
+					})),
 			text: text.content,
 			truncated: text.truncated,
 			...(fatal === undefined ? {} : { fatal }),
 			...(pane?.status == null ? {} : { exitCode: pane.status }),
 			...(pane?.signal == null ? {} : { signal: pane.signal }),
+			...(widgetExit?.exitCode == null
+				? {}
+				: { exitCode: widgetExit.exitCode }),
+			...(widgetExit?.signal == null ? {} : { signal: widgetExit.signal }),
 			...(paneTail === undefined ? {} : { paneTail }),
-			...(live && !pane
+			...(live && !pane && run.backend.kind === "pane"
 				? {
-						note: `The pane closed, but the process ${run.pane.process.pid} did not end within 30 s.`,
+						note: `The pane closed, but the process ${childOf(run).pid} did not end within 30 s.`,
 					}
 				: {}),
 			contextTokens:
@@ -527,12 +617,12 @@ export class Runtime {
 		try {
 			const pane = await verifiedPane(
 				this.tmux,
-				run.pane,
+				paneOf(run),
 				run.spec.launch.childSessionFile,
 			);
 			if (pane !== undefined) {
 				run.paneCleanup = "pending";
-				await this.tmux.run(["kill-pane", "-t", run.pane.paneId]);
+				await this.tmux.run(["kill-pane", "-t", paneOf(run).paneId]);
 			}
 		} catch (error) {
 			this.notify(error);
@@ -541,7 +631,7 @@ export class Runtime {
 		run.paneCleanup = "complete";
 		if (!this.disposed) {
 			try {
-				await this.rebalance(run.pane.paneId);
+				await this.rebalance(paneOf(run).paneId);
 			} catch (error) {
 				this.notify(error);
 			}
@@ -573,22 +663,103 @@ export class Runtime {
 	private async tickOnce(): Promise<void> {
 		try {
 			for (const run of this.runs.values()) run.paneCleanup = "unknown";
-			const server = await this.tmux.serverIdentity();
-			const panes = await this.tmux.listPanes();
-			assertServerIdentity(server, await this.tmux.serverIdentity());
+			const hasPane = [...this.runs.values()].some(
+				(run) => run.backend.kind === "pane",
+			);
+			const server = hasPane ? await this.tmux.serverIdentity() : undefined;
+			const panes = hasPane
+				? await this.tmux.listPanes()
+				: new Map<string, PaneState>();
+			if (server !== undefined)
+				assertServerIdentity(server, await this.tmux.serverIdentity());
 			if (this.disposed) return;
 			for (const run of [...this.runs.values()].sort(
 				(a, b) => a.spec.startedAt - b.spec.startedAt,
 			)) {
 				try {
-					assertServerIdentity(run.pane.server, server);
-					const pane = panes.get(run.pane.paneId);
-					assertPaneIdentity(run.pane, run.spec.launch.childSessionFile, pane);
+					if (run.backend.kind === "widget") {
+						for (const identity of [
+							run.backend.supervisor,
+							run.backend.child,
+						]) {
+							const current = this.identify(identity.pid);
+							if (current !== null && current.start !== identity.start) {
+								this.incompleteNames.set(run.spec.launch.name, run.runDir);
+								throw new Error(
+									`Widget process identity changed for subagent "${run.spec.launch.name}". Kept recovery files in ${run.runDir}.`,
+								);
+							}
+						}
+						const childLive = this.alive(run.backend.child);
+						const supervisorLive = this.alive(run.backend.supervisor);
+						if (this.acknowledged(run)) {
+							if (!childLive) this.removeRun(run);
+							continue;
+						}
+						if (run.phase === "live") {
+							if (!supervisorLive && childLive) {
+								const failureFile = join(
+									run.runDir,
+									"widget-parent-failure.json",
+								);
+								if (!existsSync(failureFile)) {
+									writeJsonAtomic(
+										failureFile,
+										parseStrict(
+											Fatal,
+											{
+												v: 1,
+												message:
+													"Widget supervisor exited while its child was running.",
+											},
+											"widget failure",
+										),
+									);
+									if (this.alive(run.backend.child))
+										(
+											this.deps.stopProcess ??
+											((identity: ProcessIdentity) =>
+												process.kill(identity.pid, "SIGTERM"))
+										)(run.backend.child);
+								}
+								continue;
+							}
+							if (childLive) {
+								const file = join(run.runDir, "status.json");
+								if (existsSync(file))
+									run.view = readJsonStrict(ChildStatus, file);
+								continue;
+							}
+							if (!existsSync(join(run.runDir, "widget-exit.json"))) {
+								if (supervisorLive) {
+									run.paneGoneAt ??= this.now();
+									if (this.now() - run.paneGoneAt < 3000) continue;
+								}
+								this.finalizeFailed(
+									run,
+									new Error("Widget child exited without an exit record."),
+								);
+								continue;
+							}
+							run.phase = "finishing";
+							this.finalizeSync(run, undefined);
+						}
+						continue;
+					}
+					if (server === undefined)
+						throw new Error("Tmux server identity is missing.");
+					assertServerIdentity(paneOf(run).server, server);
+					const pane = panes.get(paneOf(run).paneId);
+					assertPaneIdentity(
+						paneOf(run),
+						run.spec.launch.childSessionFile,
+						pane,
+					);
 					run.paneCleanup = pane === undefined ? "complete" : "pending";
 					if (this.acknowledged(run)) {
 						if (pane !== undefined) await this.closePane(run);
 						if (this.disposed) return;
-						if (run.paneCleanup === "complete" && !this.alive(run.pane.process))
+						if (run.paneCleanup === "complete" && !this.alive(childOf(run)))
 							this.removeRun(run);
 						continue;
 					}
@@ -603,11 +774,11 @@ export class Runtime {
 						if (pane === undefined) {
 							run.paneGoneAt ??= this.now();
 							if (
-								this.alive(run.pane.process) &&
+								this.alive(paneOf(run).process) &&
 								this.now() - run.paneGoneAt < 30_000
 							)
 								continue;
-						} else if (this.alive(run.pane.process)) continue;
+						} else if (this.alive(paneOf(run).process)) continue;
 						await this.finalize(run, pane);
 						if (this.disposed) return;
 					} else if (run.phase === "finished" && pane !== undefined) {
@@ -616,7 +787,11 @@ export class Runtime {
 					}
 				} catch (error) {
 					this.notify(error);
-					if (run.phase !== "finished" && !this.acknowledged(run))
+					if (
+						run.phase !== "finished" &&
+						!this.acknowledged(run) &&
+						!this.incompleteNames.has(run.spec.launch.name)
+					)
 						this.finalizeFailed(run, error);
 				}
 			}
@@ -670,6 +845,7 @@ export class Runtime {
 			items: (): RunItem[] => {
 				if (
 					this.runs.get(run.spec.launch.name) !== run ||
+					this.incompleteNames.has(run.spec.launch.name) ||
 					run.broken !== undefined
 				)
 					return [];
@@ -762,7 +938,10 @@ export class Runtime {
 					queue.deleteConsumed(join(run.runDir, "outbox"), item.seq);
 				else {
 					// Delivery and resource cleanup have separate completion states.
-					if (run.paneCleanup !== "complete" || this.alive(run.pane.process)) {
+					if (
+						(run.backend.kind === "pane" && run.paneCleanup !== "complete") ||
+						this.alive(childOf(run))
+					) {
 						const ack = parseStrict(
 							DeliveryAck,
 							{ v: 1, runId: run.spec.runId, deliveryId: item.id },
@@ -775,7 +954,7 @@ export class Runtime {
 		};
 		return source;
 	}
-	private acknowledged(run: StartedRun): boolean {
+	private acknowledged(run: AnyStartedRun): boolean {
 		const file = join(run.runDir, "delivery-ack.json");
 		if (!existsSync(file)) return false;
 		const ack = readJsonStrict(DeliveryAck, file);
@@ -787,9 +966,12 @@ export class Runtime {
 		return true;
 	}
 	private removeRun(run: ParentRun): void {
-		if (run.paneCleanup !== "complete" || this.alive(run.pane.process))
+		if (
+			(run.backend.kind === "pane" && run.paneCleanup !== "complete") ||
+			this.alive(childOf(run))
+		)
 			throw new Error(
-				`Cannot remove subagent ${run.spec.launch.name} before pane cleanup and process exit.`,
+				`Cannot remove subagent ${run.spec.launch.name} before backend cleanup and process exit.`,
 			);
 		const result = readJsonStrict(
 			ResultDetails,
@@ -827,11 +1009,27 @@ export class Runtime {
 		if (!this.enabled || this.disposed)
 			throw new Error("Subagents are off in this session.");
 	}
+	displayMode() {
+		return readDisplayMode(this.ctx.sessionManager.getBranch());
+	}
+	setDisplayMode(mode: "auto" | "panes" | "widget"): void {
+		this.requireEnabled();
+		parseStrict(DisplayModeEntry, { v: 1, mode }, "display mode");
+		if (mode === "panes")
+			resolveDisplayMode(mode, Boolean(this.env.TMUX && this.env.TMUX_PANE));
+		this.pi.appendEntry("subagent_display_mode", { v: 1, mode });
+		this.deps.requestRender?.();
+	}
 	private liveColumnPanes(exclude?: string): ColumnPane[] {
 		return [...this.runs.values()]
-			.filter((run) => run.phase === "live" && run.pane.paneId !== exclude)
+			.filter(
+				(run) =>
+					run.phase === "live" &&
+					run.backend.kind === "pane" &&
+					paneOf(run).paneId !== exclude,
+			)
 			.map((run) => ({
-				pane: run.pane,
+				pane: paneOf(run),
 				session: run.spec.launch.childSessionFile,
 			}));
 	}
@@ -839,7 +1037,7 @@ export class Runtime {
 		launch: LaunchDraft,
 		task: string,
 		toolCallId?: string,
-	): Promise<StartedRun> {
+	): Promise<AnyStartedRun> {
 		this.requireEnabled();
 		return this.launch({
 			kind: "spawn",
@@ -850,13 +1048,69 @@ export class Runtime {
 				: {}),
 		});
 	}
-	private async launch(plan: LaunchPlan): Promise<StartedRun> {
-		this.versionCheck ??= checkTmuxVersion(this.tmux);
-		await this.versionCheck;
+	async stop(name: string): Promise<void> {
+		this.requireEnabled();
+		if (this.incompleteNames.has(name))
+			throw new Error(`Subagent "${name}" needs manual recovery.`);
+		const run = this.runs.get(name);
+		if (run === undefined || run.phase !== "live")
+			throw new Error(`Subagent "${name}" is not running.`);
+		const saved = readRunBackend(run.runDir);
+		if (JSON.stringify(saved) !== JSON.stringify(run.backend))
+			throw new Error(`Backend identity changed for subagent "${name}".`);
+		const marker = join(run.runDir, "stop-request.json");
+		if (run.backend.kind === "widget") {
+			const client = await (this.deps.connectSupervisor ?? connectSupervisor)(
+				run.backend,
+				run.spec.runId,
+				run.spec.ownerKey,
+			);
+			writeJsonAtomic(marker, { v: 1, runId: run.spec.runId });
+			try {
+				await client.stop();
+			} catch (error) {
+				rmSync(marker, { force: true });
+				throw error;
+			}
+		} else {
+			const pane = await verifiedPane(
+				this.tmux,
+				run.backend.pane,
+				run.spec.launch.childSessionFile,
+			);
+			if (
+				pane === undefined ||
+				pane.dead ||
+				!this.alive(run.backend.pane.process)
+			)
+				throw new Error(`Pane identity is not live for subagent "${name}".`);
+			writeJsonAtomic(marker, { v: 1, runId: run.spec.runId });
+			try {
+				if (this.alive(run.backend.pane.process))
+					process.kill(run.backend.pane.process.pid, "SIGTERM");
+			} catch (error) {
+				rmSync(marker, { force: true });
+				throw error;
+			}
+		}
+		this.startTick();
+	}
+	private async launch(plan: LaunchPlan): Promise<AnyStartedRun> {
+		const kind =
+			this.ctx.mode === "rpc" && this.deps.childSpec !== undefined
+				? "widget"
+				: resolveDisplayMode(
+						readDisplayMode(this.ctx.sessionManager.getBranch()),
+						Boolean(this.env.TMUX && this.env.TMUX_PANE),
+					);
+		if (kind === "pane") {
+			this.versionCheck ??= checkTmuxVersion(this.tmux);
+			await this.versionCheck;
+		}
 		const runId = randomUUID();
 		this.launchingRunIds.add(runId);
 		try {
-			return await launchRun(plan, {
+			const common = {
 				runId,
 				ownerDir: this.ownerDir,
 				ownerKey: this.ownerKey,
@@ -867,14 +1121,13 @@ export class Runtime {
 				mode: this.ctx.mode,
 				ownExtensionPath: this.deps.ownExtensionPath,
 				env: this.env,
-				tmux: this.tmux,
 				identity: this.identify,
 				...(this.deps.invocation === undefined
 					? {}
 					: { invocation: this.deps.invocation }),
-				trusted: (cwd) => this.deps.trusted(cwd),
+				trusted: (cwd: string) => this.deps.trusted(cwd),
 				isDisposed: () => this.disposed,
-				reserve: (name) => {
+				reserve: (name: string) => {
 					if (this.blockedRecovery !== undefined)
 						throw new Error(
 							`Inspect unresolved subagent run ${this.blockedRecovery} before starting another subagent.`,
@@ -888,7 +1141,7 @@ export class Runtime {
 						throw new Error(`Subagent name "${name}" is already in use.`);
 					this.launching.set(name, plan);
 				},
-				release: (name) => {
+				release: (name: string) => {
 					this.launching.delete(name);
 					const run = this.runs.get(name);
 					if (run) {
@@ -899,14 +1152,24 @@ export class Runtime {
 						if (index !== -1) this.sources.splice(index, 1);
 					}
 				},
-				liveColumnPanes: (exclude) => this.liveColumnPanes(exclude),
-				commit: (run) => {
+				commit: (run: AnyStartedRun) => {
 					this.launching.delete(run.spec.launch.name);
 					this.attach(run);
 				},
-				appendRegistry: (record) => this.pi.appendEntry("subagent", record),
+				appendRegistry: (record: RegistryRecord) =>
+					this.pi.appendEntry("subagent", record),
 				startTick: () => this.startTick(),
-			});
+			};
+			return kind === "pane"
+				? await launchRun(plan, {
+						...common,
+						tmux: this.tmux,
+						liveColumnPanes: (exclude) => this.liveColumnPanes(exclude),
+					})
+				: await launchWidgetRun(plan, {
+						...common,
+						startSupervisor: this.deps.startSupervisor ?? startSupervisor,
+					});
 		} finally {
 			this.launchingRunIds.delete(runId);
 		}
@@ -980,12 +1243,21 @@ export class Runtime {
 			throw new Error(
 				`The session of "${name}" is already in use by a subagent.`,
 			);
-		const panes = await this.tmux.listPanes();
-		for (const pane of panes.values())
-			if (!pane.dead && pane.session === launch.childSessionFile)
-				throw new Error(
-					`The session of "${name}" is still open in pane ${pane.paneId}. Close that pane first.`,
-				);
+		const resumeKind =
+			this.ctx.mode === "rpc" && this.deps.childSpec !== undefined
+				? "widget"
+				: resolveDisplayMode(
+						readDisplayMode(this.ctx.sessionManager.getBranch()),
+						Boolean(this.env.TMUX && this.env.TMUX_PANE),
+					);
+		if (resumeKind === "pane") {
+			const panes = await this.tmux.listPanes();
+			for (const pane of panes.values())
+				if (!pane.dead && pane.session === launch.childSessionFile)
+					throw new Error(
+						`The session of "${name}" is still open in pane ${pane.paneId}. Close that pane first.`,
+					);
+		}
 		const spec = this.deps.childSpec;
 		if (
 			spec &&
@@ -1003,7 +1275,9 @@ export class Runtime {
 			launch,
 			initialPrompt: `Message from the parent agent:\n\n${text}`,
 		});
-		return `Resumed subagent "${name}" in pane ${started.pane.paneId}. Its result arrives as a message.`;
+		return started.backend.kind === "pane"
+			? `Resumed subagent "${name}" in pane ${started.backend.pane.paneId}. Its result arrives as a message.`
+			: `Resumed subagent "${name}" in the viewer. Its result arrives as a message.`;
 	}
 	onInput(): void {
 		this.deliverer?.onInput();
@@ -1028,7 +1302,7 @@ export class Runtime {
 		return join(this.runsRoot, "undelivered", sessionId);
 	}
 	private storeUndelivered(
-		run: StartedRun,
+		run: AnyStartedRun,
 		sessionId: string,
 		kind: "stopped" | "result",
 	): void {
@@ -1078,15 +1352,55 @@ export class Runtime {
 				.filter((id) => !id.startsWith("."))
 				.sort()) {
 				const runDir = join(ownerDir, id);
-				if (!existsSync(join(runDir, "pane.json"))) {
+				if (
+					!existsSync(join(runDir, "backend.json")) &&
+					!existsSync(join(runDir, "pane.json"))
+				) {
 					this.recoverIncompleteRun(runDir, id, name);
 					continue;
 				}
 				try {
 					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
 					const backend = readRunBackend(runDir);
-					if (backend.kind !== "pane")
-						throw new Error(`Widget backend is not active for ${runDir}.`);
+					if (backend.kind === "widget") {
+						if (this.alive(backend.child)) {
+							if (!this.alive(backend.supervisor)) {
+								const stop =
+									this.deps.stopProcess ??
+									((identity: ProcessIdentity) =>
+										process.kill(identity.pid, "SIGTERM"));
+								if (this.alive(backend.child)) stop(backend.child);
+							}
+							continue;
+						}
+						if (
+							this.alive(backend.supervisor) &&
+							!existsSync(join(runDir, "widget-exit.json"))
+						)
+							continue;
+						const started: WidgetStartedRun = { runDir, spec, backend };
+						if (this.acknowledged(started)) {
+							rmSync(runDir, { recursive: true });
+							continue;
+						}
+						if (!existsSync(join(runDir, "result.json"))) {
+							const run: ParentRun = {
+								...started,
+								phase: "live",
+								paneCleanup: "complete",
+							};
+							if (existsSync(join(runDir, "widget-exit.json")))
+								this.finalizeSync(run, undefined);
+							else
+								this.finalizeFailed(
+									run,
+									new Error("Widget child exited without an exit record."),
+								);
+						}
+						this.storeUndelivered(started, spec.spawnerSessionId, "result");
+						rmSync(runDir, { recursive: true });
+						continue;
+					}
 					const pane = backend.pane;
 					if (spec.runId !== id)
 						throw new Error(`Run identity does not match ${runDir}.`);
@@ -1238,7 +1552,7 @@ export class Runtime {
 		const errors: string[] = [];
 		let panes: Map<string, PaneState> | undefined;
 		let server: PaneFile["server"] | undefined;
-		if (runs.length) {
+		if (runs.some((run) => run.backend.kind === "pane")) {
 			try {
 				server = await this.tmux.serverIdentity();
 				panes = await this.tmux.listPanes();
@@ -1254,19 +1568,47 @@ export class Runtime {
 		for (const run of runs) {
 			let stoppingProcess = false;
 			try {
+				if (run.backend.kind === "widget") {
+					const live = this.alive(run.backend.child);
+					if (live) {
+						stoppingProcess = true;
+						if (this.alive(run.backend.supervisor)) {
+							const client = await (
+								this.deps.connectSupervisor ?? connectSupervisor
+							)(run.backend, run.spec.runId, run.spec.ownerKey);
+							writeJsonAtomic(join(run.runDir, "stop-request.json"), {
+								v: 1,
+								runId: run.spec.runId,
+							});
+							await client.stop();
+						} else {
+							const stop =
+								this.deps.stopProcess ??
+								((identity: ProcessIdentity) =>
+									process.kill(identity.pid, "SIGTERM"));
+							if (this.alive(run.backend.child)) stop(run.backend.child);
+						}
+						killed.add(run);
+						continue;
+					}
+					run.paneCleanup = "complete";
+					continue;
+				}
 				run.paneCleanup = "unknown";
 				if (panes === undefined || server === undefined)
 					throw new Error(
 						`Pane identity is unknown. Kept recovery files in ${run.runDir}.`,
 					);
-				assertServerIdentity(run.pane.server, server);
+				assertServerIdentity(paneOf(run).server, server);
 				assertPaneIdentity(
-					run.pane,
+					paneOf(run),
 					run.spec.launch.childSessionFile,
-					panes.get(run.pane.paneId),
+					panes.get(paneOf(run).paneId),
 				);
-				const live = this.alive(run.pane.process);
-				run.paneCleanup = panes.has(run.pane.paneId) ? "pending" : "complete";
+				const live = this.alive(paneOf(run).process);
+				run.paneCleanup = panes.has(paneOf(run).paneId)
+					? "pending"
+					: "complete";
 				if (live) {
 					stoppingProcess = true;
 					// Keep the terminal open while the child stops its own children.
@@ -1275,7 +1617,7 @@ export class Runtime {
 						((identity: ProcessIdentity) => {
 							process.kill(identity.pid, "SIGTERM");
 						});
-					if (this.alive(run.pane.process)) stop(run.pane.process);
+					if (this.alive(paneOf(run).process)) stop(paneOf(run).process);
 				} else if (run.paneCleanup !== "complete") {
 					const error = await this.closePane(run);
 					if (error !== undefined) throw new Error(error);
@@ -1285,8 +1627,10 @@ export class Runtime {
 				killFailed.add(run);
 				errors.push(
 					stoppingProcess
-						? `Could not stop process ${run.pane.process.pid}: ${errorText(error)}.`
-						: `Could not close pane ${run.pane.paneId}: ${errorText(error)}.`,
+						? `Could not stop process ${childOf(run).pid}: ${errorText(error)}.`
+						: run.backend.kind === "pane"
+							? `Could not close pane ${paneOf(run).paneId}: ${errorText(error)}.`
+							: `Could not close widget run ${run.spec.runId}: ${errorText(error)}.`,
 				);
 			}
 		}
@@ -1295,16 +1639,19 @@ export class Runtime {
 			this.deps.delay ??
 			((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 		while (
-			[...killed].some((run) => this.alive(run.pane.process)) &&
+			[...killed].some((run) => this.alive(childOf(run))) &&
 			this.now() < deadline
 		) {
 			await delay(Math.min(50, deadline - this.now()));
 			try {
-				const currentServer = await this.tmux.serverIdentity();
-				for (const run of killed)
-					assertServerIdentity(run.pane.server, currentServer);
-				await this.tmux.listPanes();
-				assertServerIdentity(currentServer, await this.tmux.serverIdentity());
+				if ([...killed].some((run) => run.backend.kind === "pane")) {
+					const currentServer = await this.tmux.serverIdentity();
+					for (const run of killed)
+						if (run.backend.kind === "pane")
+							assertServerIdentity(paneOf(run).server, currentServer);
+					await this.tmux.listPanes();
+					assertServerIdentity(currentServer, await this.tmux.serverIdentity());
+				}
 			} catch (error) {
 				const message = `Could not refresh panes during quit: ${errorText(error)}.`;
 				errors.push(message);
@@ -1317,9 +1664,25 @@ export class Runtime {
 		const stillLive: ParentRun[] = [];
 		for (const run of runs) {
 			try {
-				if (this.alive(run.pane.process)) {
+				if (this.alive(childOf(run))) {
 					stillLive.push(run);
 					continue;
+				}
+				if (run.backend.kind === "widget") {
+					if (run.phase === "live" || run.phase === "finishing") {
+						try {
+							if (existsSync(join(run.runDir, "widget-exit.json")))
+								this.finalizeSync(run, undefined);
+							else
+								this.finalizeFailed(
+									run,
+									new Error("Widget child exited without an exit record."),
+								);
+						} catch (error) {
+							this.finalizeFailed(run, error);
+						}
+					}
+					run.paneCleanup = "complete";
 				}
 				if (run.phase === "finishing") {
 					try {
@@ -1329,10 +1692,12 @@ export class Runtime {
 					}
 				}
 				if (killFailed.has(run)) continue;
-				if (run.paneCleanup !== "complete") {
+				if (run.backend.kind === "pane" && run.paneCleanup !== "complete") {
 					const error = await this.closePane(run);
 					if (error !== undefined) {
-						errors.push(`Could not close pane ${run.pane.paneId}: ${error}.`);
+						errors.push(
+							`Could not close pane ${paneOf(run).paneId}: ${error}.`,
+						);
 						continue;
 					}
 				}
@@ -1381,7 +1746,7 @@ export class Runtime {
 		if (notStarted.length)
 			line += ` These did not start: ${notStarted.join(", ")}.`;
 		for (const run of stillLive)
-			line += ` Subagent ${run.spec.launch.name} (pid ${run.pane.process.pid}) ${this.now() >= deadline ? "did not stop within 5 s" : "is still running"}.`;
+			line += ` Subagent ${run.spec.launch.name} (pid ${childOf(run).pid}) ${this.now() >= deadline ? "did not stop within 5 s" : "is still running"}.`;
 		for (const error of errors) line += ` ${error}`;
 		const stderr =
 			this.deps.stderr ??

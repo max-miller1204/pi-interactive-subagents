@@ -67,7 +67,7 @@ test("registered tools validate closed parameters and route calls", async () => 
 						autoExit: true,
 					},
 				},
-				pane: { paneId: "%2" },
+				backend: { kind: "pane", pane: { paneId: "%2" } },
 			};
 		},
 		message: async (...args: unknown[]) => {

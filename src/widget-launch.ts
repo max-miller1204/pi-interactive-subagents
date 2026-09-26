@@ -10,6 +10,7 @@ import {
 	renderLaunchScript,
 	systemPrompt,
 } from "./launch.ts";
+import { processAlive } from "./process.ts";
 import { writeRunBackend } from "./run-backend.ts";
 import {
 	Launch,
@@ -52,6 +53,7 @@ export async function launchWidgetRun(
 	let runDir: string | undefined;
 	let newSession: string | undefined;
 	let backend: WidgetBackend | undefined;
+	let supervisorAttempted = false;
 	try {
 		if (context.isDisposed())
 			throw new Error("Pi replaced the session during widget launch.");
@@ -167,6 +169,7 @@ export async function launchWidgetRun(
 			name,
 			phase: "widget-attempted",
 		});
+		supervisorAttempted = true;
 		backend = await context.startSupervisor(
 			spec,
 			runDir,
@@ -198,14 +201,23 @@ export async function launchWidgetRun(
 		if (backend !== undefined) {
 			try {
 				const { connectSupervisor } = await import("./widget-client.ts");
-				await (
-					await connectSupervisor(backend, context.runId, context.ownerKey)
-				).stop();
+				if (processAlive(backend.child))
+					await (
+						await connectSupervisor(backend, context.runId, context.ownerKey)
+					).stop();
+				const deadline = Date.now() + 5000;
+				while (processAlive(backend.child) && Date.now() < deadline)
+					await new Promise((done) => setTimeout(done, 20));
+				if (processAlive(backend.child))
+					throw new Error("Widget child did not stop during launch rollback.");
 			} catch (stopError) {
 				errors.push(stopError);
 			}
 		}
-		if (errors.length === 1) {
+		if (
+			errors.length === 1 &&
+			(!supervisorAttempted || backend !== undefined)
+		) {
 			if (newSession !== undefined) rmSync(newSession, { force: true });
 			if (runDir !== undefined)
 				rmSync(runDir, { recursive: true, force: true });
