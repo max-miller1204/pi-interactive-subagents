@@ -34,6 +34,7 @@ export type WidgetLaunchContext = Omit<
 	LaunchContext,
 	"tmux" | "liveColumnPanes" | "commit"
 > & {
+	rpcChild: boolean;
 	startSupervisor: typeof startSupervisor;
 	commit(run: WidgetStartedRun): void;
 };
@@ -42,7 +43,7 @@ export async function launchWidgetRun(
 	plan: LaunchPlan,
 	context: WidgetLaunchContext,
 ): Promise<WidgetStartedRun> {
-	if (context.mode !== "tui")
+	if (context.mode !== "tui" && !(context.mode === "rpc" && context.rpcChild))
 		throw new Error("Subagents need the interactive Pi TUI.");
 	if (context.spawnerSessionFile === undefined)
 		throw new Error(

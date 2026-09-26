@@ -1190,6 +1190,8 @@ export class Runtime {
 					})
 				: await launchWidgetRun(plan, {
 						...common,
+						rpcChild:
+							this.ctx.mode === "rpc" && this.deps.childSpec !== undefined,
 						startSupervisor: this.deps.startSupervisor ?? startSupervisor,
 					});
 		} finally {

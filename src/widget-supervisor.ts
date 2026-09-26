@@ -3,12 +3,15 @@ import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	mkdtempSync,
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processAlive, processIdentity } from "./process.ts";
@@ -118,7 +121,9 @@ async function run(configFile: string, runDir: string): Promise<void> {
 	if (!child.pid) throw new Error("Widget Pi process did not start.");
 	const childIdentity = processIdentity(child.pid);
 	if (!childIdentity) throw new Error("Cannot identify widget Pi process.");
-	const socket = join(runDir, "w.sock");
+	const socketAliasDir = mkdtempSync(join(tmpdir(), "pi-widget-socket-"));
+	symlinkSync(runDir, join(socketAliasDir, "run"), "dir");
+	const socket = join(socketAliasDir, "run", "w.sock");
 	const backend: WidgetBackend = {
 		kind: "widget",
 		supervisor,
@@ -130,6 +135,7 @@ async function run(configFile: string, runDir: string): Promise<void> {
 	let signal: string | null = null;
 	let rpcError: string | null = null;
 	let rpcBuffer = "";
+	let listening = false;
 	child.stdout.on("data", (chunk: Buffer) => {
 		rpcBuffer += chunk.toString("utf8");
 		if (rpcBuffer.length > 1024 * 1024) {
@@ -163,7 +169,11 @@ async function run(configFile: string, runDir: string): Promise<void> {
 			signal: exitSignal,
 			...(rpcError ? { error: rpcError } : {}),
 		});
-		server.close();
+		if (listening)
+			server.close(() =>
+				rmSync(socketAliasDir, { recursive: true, force: true }),
+			);
+		else rmSync(socketAliasDir, { recursive: true, force: true });
 	});
 	child.on("error", (error) => {
 		rpcError = error.message;
@@ -211,10 +221,30 @@ async function run(configFile: string, runDir: string): Promise<void> {
 		});
 		connection.on("close", () => clearTimeout(timer));
 	});
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(socket, () => resolve());
-	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socket, () => {
+				listening = true;
+				resolve();
+			});
+		});
+	} catch (error) {
+		if (processAlive(childIdentity)) child.kill("SIGTERM");
+		await new Promise<void>((resolve) => {
+			if (child.exitCode !== null || child.signalCode !== null)
+				return resolve();
+			const timer = setTimeout(() => {
+				if (processAlive(childIdentity)) child.kill("SIGKILL");
+				resolve();
+			}, 3000);
+			child.once("exit", () => {
+				clearTimeout(timer);
+				resolve();
+			});
+		});
+		throw error;
+	}
 	chmodSync(socket, 0o600);
 	if ((statSync(runDir).mode & 0o077) !== 0)
 		throw new Error("Widget run directory is not private.");

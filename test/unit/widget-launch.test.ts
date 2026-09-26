@@ -61,6 +61,7 @@ function setup(t: { after(fn: () => void): void }) {
 		spawnerSessionFile: parent,
 		sessionDir,
 		mode: "tui",
+		rpcChild: false,
 		ownExtensionPath: extension,
 		env: { TMUX: "old", TMUX_PANE: "%1", VALUE: "one" },
 		invocation: () => [process.execPath, cli],
@@ -112,6 +113,13 @@ test("widget launch writes the same run files and uses Pi RPC without tmux", asy
 		readFileSync(join(result.runDir, "system-prompt.md"), "utf8"),
 		/subagent/,
 	);
+});
+
+test("widget RPC child may launch a nested widget", async (t) => {
+	const f = setup(t);
+	Object.assign(f.context, { mode: "rpc", rpcChild: true });
+	const result = await launchWidgetRun(f.plan, f.context);
+	assert.equal(result.backend.kind, "widget");
 });
 
 test("widget launch keeps recovery files if supervisor startup is uncertain", async (t) => {

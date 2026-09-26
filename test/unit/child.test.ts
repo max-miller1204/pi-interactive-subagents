@@ -471,9 +471,7 @@ test("guards cancel switch and fork, and tree adds a leaf marker", (t) => {
 	});
 	assert.deepEqual(
 		f.notices,
-		Array(2).fill(
-			"This subagent cannot switch or fork its Pi session.",
-		),
+		Array(2).fill("This subagent cannot switch or fork its Pi session."),
 	);
 });
 test("status tracks working, question wait, settled and context usage", async (t) => {
