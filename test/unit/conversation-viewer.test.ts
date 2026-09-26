@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+	CURRENT_SESSION_VERSION,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
+	conversationLines,
 	createConversationViewer,
 	projectLiveRecords,
 	viewerWindow,
@@ -10,6 +17,85 @@ import {
 import type { Runtime } from "../../src/parent.ts";
 
 const runId = "6065540b-32ac-4cdd-b9d4-8610ef0a7919";
+
+test("saved viewer shows human messages and assistant tool calls", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "saved-viewer-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const file = join(root, "session.jsonl");
+	const timestamp = new Date().toISOString();
+	const entries = [
+		{
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "session",
+			timestamp,
+			cwd: root,
+		},
+		{
+			type: "custom",
+			id: "marker",
+			parentId: null,
+			timestamp,
+			customType: "subagent_child",
+			data: {
+				v: 1,
+				kind: "run",
+				runId,
+				name: "worker-1",
+				sessionId: "session",
+			},
+		},
+		{
+			type: "custom_message",
+			id: "human",
+			parentId: "marker",
+			timestamp,
+			customType: "subagent_parent_message",
+			content: "Message from the human",
+			details: {
+				deliveryId: "delivery-1",
+				kind: "message",
+				text: "Please check this",
+				source: "human",
+			},
+		},
+		{
+			type: "message",
+			id: "assistant",
+			parentId: "human",
+			timestamp,
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-1",
+						name: "read",
+						arguments: { path: "a" },
+					},
+				],
+				usage: { totalTokens: 1 },
+				stopReason: "toolUse",
+			},
+		},
+	];
+	writeFileSync(
+		file,
+		`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+	);
+	const runtime = {
+		runs: new Map(),
+		list: () => ({
+			branch: new Map([
+				["worker-1", { runId, launch: { childSessionFile: file } }],
+			]),
+		}),
+	} as unknown as Runtime;
+	assert.deepEqual(conversationLines(runtime, "worker-1"), [
+		"human: Please check this",
+		'assistant: read: {"path":"a"}',
+	]);
+});
 
 test("live projection replaces message snapshots and keeps tool activity", () => {
 	const records = [
@@ -120,5 +206,44 @@ test("viewer sends a human answer, confirms stop, and closes on Escape", async (
 	assert.ok(viewer.render(16).every((line) => visibleWidth(line) <= 16));
 	viewer.handleInput?.("\x1b");
 	assert.equal(closed, 1);
+	viewer.dispose();
+});
+
+test("viewer keeps a selected question id when that question closes", async () => {
+	const calls: unknown[][] = [];
+	let questions = ["q-11111111", "q-22222222"];
+	const runtime = {
+		list: () => ({
+			live: [{ name: "worker-1", openQuestions: questions }],
+			branch: new Map(),
+		}),
+		runs: new Map(),
+		message: async (...args: unknown[]) => {
+			calls.push(args);
+			return "Sent";
+		},
+	} as unknown as Runtime;
+	const tui = {
+		terminal: { rows: 15 },
+		requestRender: () => {},
+	} as unknown as TUI;
+	const theme = {
+		fg: (_color: string, text: string) => text,
+	} as unknown as Theme;
+	const viewer = createConversationViewer(
+		runtime,
+		"worker-1",
+		tui,
+		theme,
+		() => {},
+	);
+	viewer.render(80);
+	viewer.handleInput?.("\t");
+	viewer.handleInput?.("Y");
+	questions = ["q-22222222"];
+	viewer.render(80);
+	viewer.handleInput?.("\r");
+	await new Promise((done) => setImmediate(done));
+	assert.deepEqual(calls, [["worker-1", "Y", "q-11111111", "human"]]);
 	viewer.dispose();
 });

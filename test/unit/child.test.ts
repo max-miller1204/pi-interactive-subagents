@@ -531,6 +531,23 @@ test("child writes ordered live messages and resumes view sequence after reload"
 		2,
 	);
 });
+test("large tool output keeps the view stream readable and ordered", (t) => {
+	const f = fixture(t);
+	const child = f.start();
+	child.onToolEnd({
+		toolCallId: "image-1",
+		toolName: "image",
+		result: { data: "x".repeat(2 * 1024 * 1024) },
+		isError: false,
+	});
+	child.onMessageStart({ message: { role: "assistant", content: "Done" } });
+	const records = readViewRecords(f.runDir, 0, true, f.runId);
+	assert.deepEqual(
+		records.map((row) => row.seq),
+		[1, 2],
+	);
+	assert.match(records[0]?.text ?? "", /\[view text truncated\]$/);
+});
 test("inbox timer uses the task gate and starts at 250 ms", (t) => {
 	t.mock.timers.enable({ apis: ["setInterval"] });
 	const f = fixture(t);

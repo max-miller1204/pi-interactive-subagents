@@ -156,3 +156,27 @@ test("malformed Pi RPC output writes a failure record", async (t) => {
 	assert.match(record.error, /RPC output was malformed/);
 	assert.equal(processAlive(backend.child), false);
 });
+
+test("large valid Pi RPC image output keeps the widget child alive", async (t) => {
+	const { runDir, log } = setup(t);
+	const backend = await startSupervisor(
+		spec(runDir),
+		runDir,
+		[process.execPath, fixture],
+		{ ...process.env, WIDGET_TEST_LOG: log, WIDGET_TEST_LARGE: "1" },
+	);
+	t.after(() => {
+		if (processAlive(backend.supervisor)) process.kill(backend.supervisor.pid);
+	});
+	await until(
+		() =>
+			existsSync(log) && readFileSync(log, "utf8").includes("large-written"),
+	);
+	const client = await connectSupervisor(
+		backend,
+		spec(runDir).runId,
+		"owner-key",
+	);
+	assert.equal((await client.status()).childAlive, true);
+	await client.stop();
+});

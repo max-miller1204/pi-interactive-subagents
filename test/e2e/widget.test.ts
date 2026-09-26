@@ -126,6 +126,10 @@ test("widget viewer sends a human message to an interactive child", {
 		"human message and child reply",
 		30_000,
 	);
+	await run.waitFor(
+		() => run.screen().includes("human: #script"),
+		"saved human message in viewer",
+	);
 	assert.equal(
 		readJsonStrict(RunBackendRecord, join(active, "backend.json")).kind,
 		"widget",

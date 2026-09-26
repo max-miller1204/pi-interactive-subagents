@@ -41,6 +41,12 @@ type ViewEvent = DistributiveOmit<
 >;
 type ViewMessage = { role: string; content?: unknown };
 
+function boundedViewText(text: string): string {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.length <= 100_000) return text;
+	return `${bytes.subarray(0, 100_000).toString("utf8")}\n[view text truncated]`;
+}
+
 export interface ExitState {
 	autoExit: boolean;
 	human: boolean;
@@ -215,7 +221,12 @@ class ChildRole {
 		this.viewSeq = records.at(-1)?.seq ?? 0;
 		this.messageOrdinal = Math.max(
 			records.at(-1)?.messageOrdinal ?? 0,
-			branch.filter((entry) => entry.type === "message").length,
+			branch.filter(
+				(entry) =>
+					entry.type === "message" ||
+					(entry.type === "custom_message" &&
+						entry.customType === "subagent_parent_message"),
+			).length,
 		);
 		this.initialSeen = branch.some(
 			(entry) => entry.type === "message" && entry.message.role === "user",
@@ -531,7 +542,7 @@ class ChildRole {
 	}
 	private viewText(message: ViewMessage): string {
 		const content = message.content;
-		if (typeof content === "string") return content;
+		if (typeof content === "string") return boundedViewText(content);
 		if (!Array.isArray(content)) return "";
 		const parts = content.flatMap((part): string[] =>
 			part &&
@@ -541,21 +552,20 @@ class ChildRole {
 				? [part.text]
 				: [],
 		);
-		const text = parts.join("\n");
-		return text.length > 200_000
-			? `${text.slice(0, 200_000)}\n[view text truncated]`
-			: text;
+		return boundedViewText(parts.join("\n"));
 	}
 	private view(record: ViewEvent): void {
 		if (!this.active()) return;
 		const { spec, runDir } = this.ready();
+		const seq = this.viewSeq + 1;
 		appendViewRecord(runDir, {
 			v: 1,
 			runId: spec.runId,
-			seq: ++this.viewSeq,
+			seq,
 			messageOrdinal: this.messageOrdinal,
 			...record,
 		} as ViewRecord);
+		this.viewSeq = seq;
 	}
 	onMessageStart(event: { message: ViewMessage }): void {
 		if (!this.active()) return;
@@ -598,7 +608,7 @@ class ChildRole {
 			kind: "tool_start",
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
-			text,
+			text: boundedViewText(text),
 		});
 	}
 	onToolEnd(event: {
@@ -614,7 +624,7 @@ class ChildRole {
 			kind: "tool_end",
 			toolCallId: event.toolCallId,
 			toolName: event.toolName,
-			text,
+			text: boundedViewText(text),
 			isError: event.isError,
 		});
 	}

@@ -492,6 +492,16 @@ test("reconnected view excludes messages already saved in the child session", as
 		v: 1,
 		runId: run.runId,
 		seq: 2,
+		messageOrdinal: 1,
+		kind: "tool_start",
+		toolCallId: "live-tool",
+		toolName: "read",
+		text: "file",
+	});
+	appendViewRecord(run.runDir, {
+		v: 1,
+		runId: run.runId,
+		seq: 3,
 		messageOrdinal: 2,
 		kind: "message_update",
 		role: "assistant",
@@ -500,7 +510,7 @@ test("reconnected view excludes messages already saved in the child session", as
 	await f.runtime.start({ reason: "new" });
 	assert.deepEqual(
 		f.runtime.viewRecords("worker-1").map((row) => row.seq),
-		[2],
+		[2, 3],
 	);
 });
 
@@ -619,6 +629,9 @@ test("reused widget child PID keeps recovery files and reserves its name", async
 	await runtime.tick();
 	assert.equal(existsSync(join(run.runDir, "spec.json")), true);
 	assert.equal(existsSync(join(run.runDir, "result.json")), false);
+	assert.ok(runtime.list().reserved.includes("worker-1"));
+	await runtime.onShutdown("quit");
+	assert.equal(existsSync(join(run.runDir, "spec.json")), true);
 	assert.ok(runtime.list().reserved.includes("worker-1"));
 });
 
@@ -1353,6 +1366,39 @@ test("messages select one open question and reject stale or ambiguous answers", 
 		/Sent as the answer/,
 	);
 	await assert.rejects(f.runtime.message("unknown", "Hi"), /Unknown subagent/);
+});
+test("human input with no selected question stays a message", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	f.panes.set(run.pane.paneId, dead({ dead: false }));
+	await f.runtime.start({ reason: "new" });
+	writeJsonAtomic(join(run.runDir, "questions", "q-11111111.json"), {
+		v: 1,
+		qid: "q-11111111",
+		text: "Question?",
+		toolCallId: "call-1",
+		askedAt: 1,
+	});
+	assert.match(
+		await f.runtime.message(
+			"worker-1",
+			"Separate instruction",
+			undefined,
+			"human",
+		),
+		/Queued/,
+	);
+	assert.deepEqual(
+		queue.list(join(run.runDir, "inbox"), "inbox").map(({ item }) => item),
+		[
+			{
+				v: 1,
+				kind: "message",
+				text: "Separate instruction",
+				source: "human",
+			},
+		],
+	);
 });
 for (const explicit of [false, true])
 	test(`a delivered question accepts an ${explicit ? "explicit" : "implicit"} answer before the next tick`, async (t) => {
@@ -2323,6 +2369,35 @@ test("dead owner recovery reports and retains a no-pane attempted run", async (t
 	assert.equal(
 		f.commands.some((args) => args[0] === "kill-pane"),
 		false,
+	);
+});
+
+test("dead owner recovery retains a widget run with a reused child PID", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeRunBackend(run.runDir, {
+		kind: "widget",
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	});
+	const recovery = new Runtime(f.pi, f.ctx, {
+		...f.deps,
+		identity: (pid: number) =>
+			pid === process.pid
+				? { pid, start: "replacement owner" }
+				: pid === 444
+					? { pid, start: "reused child" }
+					: null,
+	});
+	t.after(() => recovery.onShutdown("new"));
+	await recovery.start({ reason: "startup" });
+	assert.equal(existsSync(join(run.runDir, "spec.json")), true);
+	assert.equal(existsSync(join(run.runDir, "result.json")), false);
+	assert.ok(recovery.list().reserved.includes("worker-1"));
+	assert.ok(
+		f.notifications.some((message) => message.includes("identity changed")),
 	);
 });
 

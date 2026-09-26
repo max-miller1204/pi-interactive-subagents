@@ -9,7 +9,11 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { Runtime } from "./parent.ts";
-import type { ViewRecord } from "./schema.ts";
+import {
+	ParentMessageDetails,
+	parseStrict,
+	type ViewRecord,
+} from "./schema.ts";
 import { afterMarker, readBranch } from "./session-file.ts";
 
 export function projectLiveRecords(records: readonly ViewRecord[]): string[] {
@@ -60,14 +64,20 @@ function messageText(message: unknown): string {
 	if (typeof row.content === "string") return `${row.role}: ${row.content}`;
 	if (!Array.isArray(row.content)) return `${row.role}:`;
 	const text = row.content
-		.flatMap((part): string[] =>
-			part &&
-			typeof part === "object" &&
-			"text" in part &&
-			typeof part.text === "string"
-				? [part.text]
-				: [],
-		)
+		.flatMap((part): string[] => {
+			if (!part || typeof part !== "object") return [];
+			if ("text" in part && typeof part.text === "string") return [part.text];
+			if ("type" in part && part.type === "toolCall") {
+				if (
+					!("name" in part) ||
+					typeof part.name !== "string" ||
+					!("arguments" in part)
+				)
+					throw new Error("Saved tool call is missing its name or arguments.");
+				return [`${part.name}: ${JSON.stringify(part.arguments)}`];
+			}
+			return [];
+		})
 		.join("\n");
 	return `${row.role}: ${text}`;
 }
@@ -83,9 +93,23 @@ export function conversationLines(runtime: Runtime, name: string): string[] {
 	const branch = afterMarker(readBranch(childSessionFile), runId);
 	if (branch === undefined)
 		throw new Error(`Saved conversation has no run marker for "${name}".`);
-	const lines = branch
-		.filter((entry) => entry.type === "message")
-		.map((entry) => messageText(entry.message));
+	const lines = branch.flatMap((entry): string[] => {
+		if (entry.type === "message") return [messageText(entry.message)];
+		if (
+			entry.type === "custom_message" &&
+			entry.customType === "subagent_parent_message"
+		) {
+			const details = parseStrict(
+				ParentMessageDetails,
+				entry.details,
+				"parent message",
+			);
+			return [
+				`${details.source === "human" ? "human" : "parent"}: ${details.text}`,
+			];
+		}
+		return [];
+	});
 	if (run !== undefined && run.phase !== "finished")
 		lines.push(...projectLiveRecords(runtime.viewRecords(name)));
 	return lines;
@@ -212,15 +236,10 @@ export function createConversationViewer(
 		render(rawWidth) {
 			const width = Math.max(1, rawWidth);
 			const questions = openQuestions();
-			if (
-				selectedQuestion !== undefined &&
-				!questions.includes(selectedQuestion)
-			)
-				selectedQuestion = undefined;
+			const selectedClosed =
+				selectedQuestion !== undefined && !questions.includes(selectedQuestion);
 			const header = theme.fg("accent", `Subagent ${name}`);
-			const questionLine = questions.length
-				? `Questions: ${questions.join(", ")}  Selected: ${selectedQuestion ?? "none"} (Tab to choose)`
-				: "No open questions";
+			const questionLine = `${questions.length ? `Questions: ${questions.join(", ")}` : "No open questions"}  Selected: ${selectedQuestion ?? "none"}${selectedClosed ? " (closed)" : ""} (Tab to choose)`;
 			let lines: string[];
 			try {
 				lines = conversationLines(runtime, name).flatMap((line) =>

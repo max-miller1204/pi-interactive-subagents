@@ -138,11 +138,6 @@ async function run(configFile: string, runDir: string): Promise<void> {
 	let listening = false;
 	child.stdout.on("data", (chunk: Buffer) => {
 		rpcBuffer += chunk.toString("utf8");
-		if (rpcBuffer.length > 1024 * 1024) {
-			rpcError = "Pi RPC output exceeded the size limit.";
-			child.kill("SIGTERM");
-			return;
-		}
 		let newline = rpcBuffer.indexOf("\n");
 		while (newline >= 0) {
 			const line = rpcBuffer.slice(0, newline);

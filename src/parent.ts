@@ -26,7 +26,7 @@ import { readDisplayMode, resolveDisplayMode } from "./display-mode.ts";
 import { type LaunchPlan, launchRun, type StartedRun } from "./launch.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import * as queue from "./queue.ts";
-import { readRunBackend } from "./run-backend.ts";
+import { type RunBackend, readRunBackend } from "./run-backend.ts";
 import {
 	ChildStatus,
 	DisplayModeEntry,
@@ -310,6 +310,21 @@ export class Runtime {
 		if (this.notified.has(message)) return;
 		this.notified.add(message);
 		this.ctx.ui.notify(message, "error");
+	}
+	private assertWidgetIdentity(
+		runDir: string,
+		name: string,
+		backend: Extract<RunBackend, { kind: "widget" }>,
+	): void {
+		for (const identity of [backend.supervisor, backend.child]) {
+			const current = this.identify(identity.pid);
+			if (current !== null && current.start !== identity.start) {
+				this.incompleteNames.set(name, runDir);
+				throw new Error(
+					`Widget process identity changed for subagent "${name}". Kept recovery files in ${runDir}.`,
+				);
+			}
+		}
 	}
 	async start(
 		event: Pick<SessionStartEvent, "reason">,
@@ -680,18 +695,11 @@ export class Runtime {
 			)) {
 				try {
 					if (run.backend.kind === "widget") {
-						for (const identity of [
-							run.backend.supervisor,
-							run.backend.child,
-						]) {
-							const current = this.identify(identity.pid);
-							if (current !== null && current.start !== identity.start) {
-								this.incompleteNames.set(run.spec.launch.name, run.runDir);
-								throw new Error(
-									`Widget process identity changed for subagent "${run.spec.launch.name}". Kept recovery files in ${run.runDir}.`,
-								);
-							}
-						}
+						this.assertWidgetIdentity(
+							run.runDir,
+							run.spec.launch.name,
+							run.backend,
+						);
 						const childLive = this.alive(run.backend.child);
 						const supervisorLive = this.alive(run.backend.supervisor);
 						if (this.acknowledged(run)) {
@@ -1019,13 +1027,29 @@ export class Runtime {
 			throw new Error(
 				`Subagent "${name}" has no run marker in its saved session.`,
 			);
-		const persisted = branch.filter((entry) => entry.type === "message").length;
+		const persisted = branch.filter(
+			(entry) =>
+				entry.type === "message" ||
+				(entry.type === "custom_message" &&
+					entry.customType === "subagent_parent_message"),
+		).length;
+		const savedTools = new Set(
+			branch.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "toolResult"
+					? [entry.message.toolCallId]
+					: [],
+			),
+		);
 		return readViewRecords(
 			run.runDir,
 			afterSeq,
 			this.alive(childOf(run)),
 			run.spec.runId,
-		).filter((record) => record.messageOrdinal > persisted);
+		).filter((record) =>
+			record.kind === "tool_start" || record.kind === "tool_end"
+				? !savedTools.has(record.toolCallId)
+				: record.messageOrdinal > persisted,
+		);
 	}
 	private requireEnabled(): void {
 		if (!this.enabled || this.disposed)
@@ -1224,11 +1248,11 @@ export class Runtime {
 				throw new Error(
 					`Question ${question_id} of "${name}" is not open. Open questions: ${open.join(", ") || "none"}.`,
 				);
-			if (question_id === undefined && open.length > 1)
+			if (origin === "model" && question_id === undefined && open.length > 1)
 				throw new Error(
 					`Subagent "${name}" has ${open.length} open questions: ${open.join(", ")}. Pass question_id.`,
 				);
-			const qid = question_id ?? open[0];
+			const qid = question_id ?? (origin === "model" ? open[0] : undefined);
 			queue.put(
 				join(run.runDir, "inbox"),
 				"inbox",
@@ -1399,6 +1423,9 @@ export class Runtime {
 					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
 					const backend = readRunBackend(runDir);
 					if (backend.kind === "widget") {
+						if (spec.runId !== id || spec.ownerKey !== name)
+							throw new Error(`Run identity does not match ${runDir}.`);
+						this.assertWidgetIdentity(runDir, spec.launch.name, backend);
 						if (this.alive(backend.child)) {
 							if (!this.alive(backend.supervisor)) {
 								const stop =
@@ -1605,6 +1632,11 @@ export class Runtime {
 			let stoppingProcess = false;
 			try {
 				if (run.backend.kind === "widget") {
+					this.assertWidgetIdentity(
+						run.runDir,
+						run.spec.launch.name,
+						run.backend,
+					);
 					const live = this.alive(run.backend.child);
 					if (live) {
 						stoppingProcess = true;
@@ -1700,6 +1732,18 @@ export class Runtime {
 		const stillLive: ParentRun[] = [];
 		for (const run of runs) {
 			try {
+				if (
+					run.backend.kind === "widget" &&
+					(killFailed.has(run) ||
+						this.incompleteNames.has(run.spec.launch.name))
+				)
+					continue;
+				if (run.backend.kind === "widget")
+					this.assertWidgetIdentity(
+						run.runDir,
+						run.spec.launch.name,
+						run.backend,
+					);
 				if (this.alive(childOf(run))) {
 					stillLive.push(run);
 					continue;
