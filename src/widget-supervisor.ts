@@ -46,6 +46,7 @@ export async function startSupervisor(
 	const configFile = join(runDir, `widget-start-${randomUUID()}.json`);
 	const readyFile = join(runDir, "widget-ready.json");
 	const errorFile = join(runDir, "widget-start-error.json");
+	const exitFile = join(runDir, "widget-exit.json");
 	writeFileSync(
 		configFile,
 		JSON.stringify({
@@ -82,16 +83,18 @@ export async function startSupervisor(
 				JSON.parse(readFileSync(readyFile, "utf8")),
 				"widget ready record",
 			);
-			if (
-				record.kind !== "widget" ||
-				record.supervisor.pid !== supervisor.pid ||
-				!processAlive(record.supervisor) ||
-				(!processAlive(record.child) &&
-					!existsSync(join(runDir, "widget-exit.json")))
-			)
+			if (record.kind !== "widget" || record.supervisor.pid !== supervisor.pid)
 				throw new Error(
 					"Widget supervisor returned an invalid process identity.",
 				);
+			const exited = existsSync(exitFile);
+			if (
+				!exited &&
+				(!processAlive(record.supervisor) || !processAlive(record.child))
+			) {
+				await new Promise((done) => setTimeout(done, 20));
+				continue;
+			}
 			return {
 				kind: "widget",
 				supervisor: record.supervisor,
@@ -101,7 +104,11 @@ export async function startSupervisor(
 		}
 		await new Promise((done) => setTimeout(done, 20));
 	}
-	throw new Error("Widget supervisor did not become ready.");
+	throw new Error(
+		existsSync(readyFile)
+			? "Widget supervisor exited before writing an exit record."
+			: "Widget supervisor did not become ready.",
+	);
 }
 
 async function run(configFile: string, runDir: string): Promise<void> {
