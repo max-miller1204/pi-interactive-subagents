@@ -290,6 +290,22 @@ test("autonomous result is durable once and done row expires", async (t) => {
 async function prompt(run: Scenario, steps: unknown[]) {
 	await run.sendKeys(run.parentPane, script(steps));
 }
+// The child deletes an answer file after it reads it.
+// The parent then deletes the run directory.
+// Sample the inbox on every event-loop turn.
+// Observe the file before deletion.
+async function inboxAnswer(dir: string, qid: string) {
+	const inbox = join(dir, "inbox");
+	const deadline = Date.now() + 20_000;
+	while (Date.now() < deadline) {
+		const found = queue
+			.list(inbox, "inbox")
+			.find((item) => item.item.kind === "answer" && item.item.qid === qid);
+		if (found) return found;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	throw new Error(`Timed out waiting for answer file ${qid} after 20000 ms.`);
+}
 async function parentMessages(file: string) {
 	return existsSync(file)
 		? messages(readBranch(file), "subagent_parent_message")
@@ -565,13 +581,7 @@ test("parallel questions pair reverse-order answers by qid", async (t) => {
 		[qids[0], "Answer first"],
 	] as const) {
 		assert.ok(qid);
-		const inboxFile = run.waitFor(
-			() =>
-				queue
-					.list(join(active.path, "inbox"), "inbox")
-					.find((item) => item.item.kind === "answer" && item.item.qid === qid),
-			`answer file ${qid}`,
-		);
+		const inboxFile = inboxAnswer(active.path, qid);
 		await prompt(run, [
 			steer(answer, "worker", qid),
 			{ say: "Answer sent." },
@@ -660,13 +670,7 @@ test("an answer passes two earlier queued instructions without reordering them",
 	const instructionIds = blocked.map((item) =>
 		queue.itemId(active.spec.runId, "inbox", item.seq),
 	);
-	const pendingAnswer = run.waitFor(
-		() =>
-			queue
-				.list(join(active.path, "inbox"), "inbox")
-				.find((item) => item.item.kind === "answer" && item.item.qid === qid),
-		"answer behind instruction on disk",
-	);
+	const pendingAnswer = inboxAnswer(active.path, qid);
 	await prompt(run, [
 		steer("Answer now", "worker", qid),
 		{ say: "Answer queued." },
