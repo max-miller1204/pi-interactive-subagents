@@ -197,7 +197,7 @@ function checkDisposed(context: LaunchContext, name: string): void {
 	}
 }
 
-function canonicalLaunch(
+export function canonicalLaunch(
 	plan: LaunchPlan,
 	ownExtensionPath: string,
 ): LaunchDraft {
@@ -228,7 +228,10 @@ function canonicalLaunch(
 	return value;
 }
 
-function systemPrompt(spec: RunSpec): string {
+export function systemPrompt(
+	spec: RunSpec,
+	backend: "pane" | "widget" = "pane",
+): string {
 	const launch = spec.launch;
 	return [
 		launch.systemPrompt.text,
@@ -241,7 +244,9 @@ function systemPrompt(spec: RunSpec): string {
 		...(launch.autoExit
 			? []
 			: [
-					"A human works with you in this pane. The parent receives your result when the human closes the pane.",
+					backend === "pane"
+						? "A human works with you in this pane. The parent receives your result when the human closes the pane."
+						: "A human can work with you in the subagent viewer. The parent receives your result when the human closes the run.",
 				]),
 		"",
 	].join("\n");

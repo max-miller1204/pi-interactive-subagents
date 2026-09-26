@@ -135,6 +135,7 @@ export const LaunchState = Obj({
 	phase: Type.Union([
 		Type.Literal("preparing"),
 		Type.Literal("pane-attempted"),
+		Type.Literal("widget-attempted"),
 		Type.Literal("cleanup-confirmed"),
 	]),
 });

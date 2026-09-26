@@ -158,6 +158,18 @@ for (const mode of ["print", "json", "rpc"] as const)
 			},
 		]);
 	});
+test("RPC child with a valid run spec enables its subagent role", async (t) => {
+	const h = await createRuntimeHarness(t, {
+		child: true,
+		mode: "rpc",
+		disabled: "tmux",
+	});
+	assert.equal(
+		h.notices.some((notice) => notice.message.startsWith("Subagents are off")),
+		false,
+	);
+	assert.ok(h.session.getActiveToolNames().includes("ask_question"));
+});
 for (const disabled of ["tmux", "session"] as const)
 	test(`TUI parent without ${disabled} disables spawn tools`, async (t) => {
 		const h = await createRuntimeHarness(t, { disabled });

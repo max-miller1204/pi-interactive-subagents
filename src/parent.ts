@@ -271,10 +271,11 @@ export class Runtime {
 	): Promise<void> {
 		this.ctx = ctx;
 		const sessionFile = ctx.sessionManager.getSessionFile();
+		const rpcChild = ctx.mode === "rpc" && this.deps.childSpec !== undefined;
 		const reason =
-			ctx.mode !== "tui"
+			ctx.mode !== "tui" && !rpcChild
 				? "this mode is not the interactive Pi TUI"
-				: !this.env.TMUX || !this.env.TMUX_PANE
+				: !rpcChild && (!this.env.TMUX || !this.env.TMUX_PANE)
 					? "Pi is not inside tmux"
 					: sessionFile === undefined
 						? "this session has no session file path"
