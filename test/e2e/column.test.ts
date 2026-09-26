@@ -68,6 +68,71 @@ async function geometry(run: Scenario) {
 	});
 }
 
+test("a root sibling starts when the newest child has a nested child", async (t) => {
+	const run = await scenario(t, {
+		agents: {
+			worker:
+				"---\ndescription: Nested column worker.\ntools: []\nauto-exit: false\nspawns: [scout]\n---\nComplete the task.\n",
+			scout:
+				"---\ndescription: Nested column scout.\ntools: []\nauto-exit: false\n---\nComplete the task.\n",
+		},
+		prompt: script([spawn("a"), spawn("b"), { say: "Root ready." }]),
+	});
+	const a = await child(run, "a");
+	const b = await child(run, "b");
+	await run.waitFor(
+		async () =>
+			(await run.capture(b.pane.paneId)).includes("Column child b ready."),
+		"newest child ready",
+	);
+	await run.sendKeys(
+		b.pane.paneId,
+		script([
+			{
+				call: "subagent",
+				args: {
+					agent: "scout",
+					profile: "test",
+					name: "g",
+					task: script([{ say: "Nested child ready." }]),
+				},
+			},
+			{ say: "Nested row ready." },
+		]),
+	);
+	const g = await child(run, "g");
+	const before = await geometry(run);
+	const frozenIds = [run.parentPane, b.pane.paneId, g.pane.paneId];
+	await run.sendKeys(
+		run.parentPane,
+		script([spawn("c"), { say: "Third root child ready." }]),
+	);
+	const launch = await run.waitFor(
+		() =>
+			run
+				.readParent()
+				.flatMap((entry) =>
+					entry.type === "message" &&
+					entry.message.role === "toolResult" &&
+					entry.message.toolName === "subagent"
+						? [entry.message]
+						: [],
+				)[2],
+		"third root launch result",
+	);
+	assert.notEqual(launch.isError, true, JSON.stringify(launch.content));
+	const c = await child(run, "c");
+	assert.deepEqual(
+		(await geometry(run)).filter((pane) => frozenIds.includes(pane.id)),
+		before.filter((pane) => frozenIds.includes(pane.id)),
+	);
+	const tmux = createTmux(run.socket);
+	for (const entry of [a, b, g, c])
+		assert.ok(
+			await verifiedPane(tmux, entry.pane, entry.spec.launch.childSessionFile),
+		);
+});
+
 test("separate row subtrees reject column resizing during launch, rollback, and cleanup", async (t) => {
 	const run = await scenario(t, {
 		agents: {

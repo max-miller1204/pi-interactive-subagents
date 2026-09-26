@@ -1,8 +1,4 @@
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	Theme,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
 	Text,
@@ -175,16 +171,6 @@ export function createWidget(
 			return lines;
 		},
 	};
-}
-export function registerWidget(
-	ctx: ExtensionContext,
-	runtime: ViewRuntime,
-): void {
-	ctx.ui.setWidget(
-		"subagents",
-		(tui, theme) => createWidget(runtime, tui, theme),
-		{ placement: "aboveEditor" },
-	);
 }
 function detailsOf<T>(details: unknown): T {
 	if (details === null || typeof details !== "object")

@@ -34,6 +34,7 @@ import {
 	Catalog,
 	Launch,
 	LaunchDraft,
+	LaunchState,
 	PaneFile,
 	parseStrict,
 	RunSpec,
@@ -327,7 +328,6 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 			events.push("release");
 			names.delete(name);
 		},
-		newestLivePane: () => (vertical ? "%8" : undefined),
 		liveColumnPanes: () =>
 			vertical
 				? [
@@ -397,12 +397,18 @@ function transaction(t: { after(fn: () => void): void }, vertical = false) {
 					assert.ok(names.has(plan.launch.name));
 					assert.deepEqual(readdirSync(runDir).sort(), [
 						"inbox",
+						"launch-state.json",
 						"launch.sh",
 						"outbox",
 						"questions",
 						"spec.json",
 						"system-prompt.md",
 					]);
+					assert.equal(
+						readJsonStrict(LaunchState, join(runDir, "launch-state.json"))
+							.phase,
+						"pane-attempted",
+					);
 					assert.equal(statSync(runDir).mode & 0o777, 0o700);
 					assert.equal(statSync(join(runDir, "launch.sh")).mode & 0o777, 0o700);
 					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
@@ -627,8 +633,7 @@ for (const command of [
 			const killed =
 				command === "resize-pane" ||
 				(command === "display-message" && cause === "disposed");
-			const retained =
-				!killed && !(command === "split-window" && cause === "failure");
+			const retained = !killed;
 			assert.equal(
 				f.calls.some((args) => args[0] === "kill-pane"),
 				killed,
@@ -759,6 +764,27 @@ test("unverified pre-PID rollback retains files, session and reserved name", asy
 	assert.equal(existsSync(f.runDir), true);
 	const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
 	assert.equal(existsSync(spec.launch.childSessionFile), true);
+	assert.equal(
+		readJsonStrict(LaunchState, join(f.runDir, "launch-state.json")).phase,
+		"pane-attempted",
+	);
+	assert.equal(f.names.has(f.plan.launch.name), true);
+});
+
+test("failed child session removal keeps rollback files and name", async (t) => {
+	const f = transaction(t);
+	f.context.tmux.serverIdentity = async () => {
+		const spec = readJsonStrict(RunSpec, join(f.runDir, "spec.json"));
+		rmSync(spec.launch.childSessionFile);
+		mkdirSync(spec.launch.childSessionFile);
+		throw new Error("server identity failed");
+	};
+	await assert.rejects(launchRun(f.plan, f.context), /server identity failed/);
+	assert.equal(existsSync(f.runDir), true);
+	assert.equal(
+		readJsonStrict(LaunchState, join(f.runDir, "launch-state.json")).phase,
+		"cleanup-confirmed",
+	);
 	assert.equal(f.names.has(f.plan.launch.name), true);
 });
 

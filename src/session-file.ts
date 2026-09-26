@@ -190,17 +190,20 @@ function validateExtractionFields(
 		typeof message.errorMessage === "string", "assistant errorMessage");
 }
 
+export class IncompleteSessionError extends Error {}
+
 export function readBranch(path: string): SessionEntry[] {
 	const file = realpathSync(path);
 	const text = readFileSync(file, "utf8");
 	if (!text.endsWith("\n")) {
-		throw new Error(`${file}: missing final newline.`);
+		throw new IncompleteSessionError(`${file}: missing final newline.`);
 	}
-	const lines = text.split("\n");
+	const lines = text.slice(0, -1).split("\n");
 	const byId = new Map<string, SessionEntry>();
 	let leaf: SessionEntry | undefined;
 	for (const [index, line] of lines.entries()) {
-		if (line === "" && index !== 0) continue;
+		if (line === "" && index !== 0)
+			throw new Error(`${file}: line ${index + 1} is blank.`);
 		let value: unknown;
 		if (line !== "") {
 			try {

@@ -646,6 +646,74 @@ test("tick calls never overlap", async (t) => {
 	assert.equal(calls, 2);
 });
 
+test("quit keeps the child terminal until graceful shutdown finishes", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
+	f.living.add(run.pane.process.pid);
+	let signaled = false;
+	let closed = false;
+	f.deps.stopProcess = (identity) => {
+		assert.deepEqual(identity, run.pane.process);
+		assert.equal(closed, false);
+		signaled = true;
+	};
+	f.deps.delay = async (ms) => {
+		assert.equal(signaled, true);
+		assert.equal(closed, false);
+		f.advance(ms);
+		f.living.delete(run.pane.process.pid);
+	};
+	const original = f.deps.tmux.run;
+	f.deps.tmux.run = async (args) => {
+		if (args[0] === "kill-pane") {
+			assert.equal(
+				f.living.has(run.pane.process.pid),
+				false,
+				"terminal closed before process cleanup",
+			);
+			closed = true;
+		}
+		return original(args);
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.onShutdown("quit");
+	assert.equal(signaled, true);
+	assert.equal(closed, true);
+	assert.equal(existsSync(run.runDir), false);
+});
+
+test("quit refreshes pane state to reap a child after graceful shutdown", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	f.panes.set(
+		run.pane.paneId,
+		dead({ dead: false, session: run.spec.launch.childSessionFile }),
+	);
+	f.living.add(run.pane.process.pid);
+	let signaled = false;
+	let reaped = false;
+	f.deps.stopProcess = () => {
+		signaled = true;
+	};
+	const listPanes = f.deps.tmux.listPanes;
+	f.deps.tmux.listPanes = async () => {
+		if (signaled) {
+			reaped = true;
+			f.living.delete(run.pane.process.pid);
+		}
+		return listPanes();
+	};
+	await f.runtime.start({ reason: "new" });
+	await f.runtime.onShutdown("quit");
+	assert.equal(reaped, true);
+	assert.equal(existsSync(run.runDir), false);
+	assert.doesNotMatch(present(f.stderr[0]), /did not stop/);
+});
+
 test("quit stops children and stores notices until durable confirmation", async (t) => {
 	const f = fixture(t, { disk: true });
 	const run = f.prepare("worker-1");
@@ -654,11 +722,8 @@ test("quit stops children and stores notices until durable confirmation", async 
 		dead({ dead: false, session: run.spec.launch.childSessionFile }),
 	);
 	f.living.add(run.pane.process.pid);
-	const original = f.deps.tmux.run;
-	f.deps.tmux.run = async (args) => {
-		const output = await original(args);
-		if (args[0] === "kill-pane") f.living.delete(run.pane.process.pid);
-		return output;
+	f.deps.stopProcess = (identity) => {
+		f.living.delete(identity.pid);
 	};
 	await f.runtime.start({ reason: "new" });
 	await f.runtime.onShutdown("quit");
@@ -736,6 +801,10 @@ test("quit waits no more than five seconds and keeps files for live children", a
 	await f.runtime.start({ reason: "new" });
 	await f.runtime.onShutdown("quit");
 	assert.equal(waited, 5000);
+	assert.equal(
+		f.commands.some((args) => args[0] === "kill-pane"),
+		false,
+	);
 	assert.equal(existsSync(run.runDir), true);
 	assert.match(
 		present(f.stderr[0]),
@@ -1030,6 +1099,45 @@ test("messages select one open question and reject stale or ambiguous answers", 
 	);
 	await assert.rejects(f.runtime.message("unknown", "Hi"), /Unknown subagent/);
 });
+for (const explicit of [false, true])
+	test(`a delivered question accepts an ${explicit ? "explicit" : "implicit"} answer before the next tick`, async (t) => {
+		const f = fixture(t, { disk: true });
+		const run = f.prepare("worker-1");
+		const qid = "q-11111111";
+		f.panes.set(
+			run.pane.paneId,
+			dead({ dead: false, session: run.spec.launch.childSessionFile }),
+		);
+		f.pi.appendEntry("subagent", {
+			v: 1,
+			kind: "spawn",
+			runId: run.runId,
+			launch: run.spec.launch,
+		});
+		writeJsonAtomic(join(run.runDir, "questions", `${qid}.json`), {
+			v: 1,
+			qid,
+			text: "Proceed?",
+			toolCallId: "ask",
+			askedAt: 1,
+		});
+		queue.put(join(run.runDir, "outbox"), "outbox", {
+			v: 1,
+			kind: "question",
+			qid,
+			text: "Proceed?",
+		});
+		await f.runtime.start({ reason: "new" });
+		await f.runtime.tick();
+		assert.equal(present(f.sent[0]).customType, "subagent_question");
+		assert.equal(queue.count(join(run.runDir, "outbox")), 1);
+		await f.runtime.message("worker-1", "Yes", explicit ? qid : undefined);
+		assert.deepEqual(
+			queue.list(join(run.runDir, "inbox"), "inbox").map(({ item }) => item),
+			[{ v: 1, kind: "answer", qid, text: "Yes" }],
+		);
+	});
+
 test("a reconciliation error does not prevent quit from stopping children", async (t) => {
 	const f = fixture(t);
 	const run = f.prepare("worker-1");
@@ -1174,6 +1282,7 @@ test("an acknowledged result still reports a later pane identity mismatch", asyn
 	await f.runtime.tick();
 	await f.runtime.tick();
 	assert.equal(existsSync(join(run.runDir, "delivery-ack.json")), true);
+	const result = run.result();
 	f.deps.tmux.run = execute;
 	present(f.panes.get(run.pane.paneId)).pid++;
 	await f.runtime.tick();
@@ -1183,6 +1292,7 @@ test("an acknowledged result still reports a later pane identity mismatch", asyn
 	);
 	assert.equal(existsSync(run.runDir), true);
 	assert.equal(f.sent.length, 1);
+	assert.deepEqual(run.result(), result);
 	assert.ok(
 		f.notifications.some((message) => message.includes("identity mismatch")),
 	);
@@ -1875,6 +1985,8 @@ test("uncommitted launches are skipped and disabled modes remove only subagent t
 	rmSync(join(run.runDir, "pane.json"));
 	await f.runtime.start({ reason: "new" });
 	assert.equal(f.runtime.runs.size, 0);
+	assert.equal(existsSync(run.runDir), true);
+	assert.ok(f.notifications.some((message) => message.includes(run.runDir)));
 	const disabled = fixture(t);
 	Object.assign(disabled.ctx, { mode: "rpc" });
 	await disabled.runtime.start({ reason: "new" });
@@ -1885,3 +1997,207 @@ test("uncommitted launches are skipped and disabled modes remove only subagent t
 		/Subagents are off/,
 	);
 });
+
+for (const phase of [
+	"preparing",
+	"cleanup-confirmed",
+	"pane-attempted",
+] as const) {
+	test(`startup handles a no-pane run in ${phase} phase`, async (t) => {
+		const f = fixture(t);
+		const run = f.prepare("worker-1");
+		rmSync(join(run.runDir, "pane.json"));
+		f.panes.clear();
+		writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+			v: 1,
+			runId: run.runId,
+			ownerKey: f.runtime.ownerKey,
+			name: "worker-1",
+			phase,
+		});
+		await f.runtime.start({ reason: "new" });
+		assert.equal(existsSync(run.runDir), phase === "pane-attempted");
+		assert.equal(
+			existsSync(run.spec.launch.childSessionFile),
+			phase === "pane-attempted",
+		);
+		assert.ok(f.notifications.some((message) => message.includes(run.runDir)));
+		assert.equal(
+			f.commands.some((args) => args[0] === "kill-pane"),
+			false,
+		);
+		if (phase === "pane-attempted") {
+			assert.deepEqual(f.runtime.list().reserved, ["worker-1"]);
+			await assert.rejects(
+				f.runtime.message("worker-1", "Hello"),
+				(error: unknown) =>
+					error instanceof Error && error.message.includes(run.runDir),
+			);
+			const { childSessionFile: _session, ...draft } = run.spec.launch;
+			await assert.rejects(f.runtime.spawn(draft, "task"), /already in use/);
+		}
+	});
+}
+
+test("dead owner recovery reports and retains a no-pane attempted run", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	f.panes.clear();
+	writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+		v: 1,
+		runId: run.runId,
+		ownerKey: f.runtime.ownerKey,
+		name: "worker-1",
+		phase: "pane-attempted",
+	});
+	const recovery = new Runtime(f.pi, f.ctx, {
+		...f.deps,
+		identity: (pid: number) =>
+			pid === process.pid ? { pid, start: "replacement owner" } : null,
+	});
+	t.after(() => recovery.onShutdown("new"));
+	await recovery.start({ reason: "startup" });
+	assert.equal(existsSync(run.runDir), true);
+	assert.ok(f.notifications.some((message) => message.includes(run.runDir)));
+	assert.equal(
+		f.commands.some((args) => args[0] === "kill-pane"),
+		false,
+	);
+});
+
+for (const phase of ["preparing", "cleanup-confirmed"] as const) {
+	test(`dead owner removes a no-pane run after ${phase}`, async (t) => {
+		const f = fixture(t);
+		const run = f.prepare("worker-1");
+		rmSync(join(run.runDir, "pane.json"));
+		f.panes.clear();
+		writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+			v: 1,
+			runId: run.runId,
+			ownerKey: f.runtime.ownerKey,
+			name: "worker-1",
+			phase,
+		});
+		const recovery = new Runtime(f.pi, f.ctx, {
+			...f.deps,
+			identity: (pid: number) =>
+				pid === process.pid ? { pid, start: "replacement owner" } : null,
+		});
+		t.after(() => recovery.onShutdown("new"));
+		await recovery.start({ reason: "startup" });
+		assert.equal(existsSync(run.runDir), false);
+		assert.equal(existsSync(run.spec.launch.childSessionFile), false);
+		assert.ok(f.notifications.some((message) => message.includes(run.runDir)));
+		assert.equal(
+			f.commands.some((args) => args[0] === "kill-pane"),
+			false,
+		);
+	});
+}
+
+test("safe resume recovery keeps its existing child session", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeJsonAtomic(join(run.runDir, "spec.json"), {
+		...run.spec,
+		kind: "resume",
+	});
+	writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+		v: 1,
+		runId: run.runId,
+		ownerKey: f.runtime.ownerKey,
+		name: "worker-1",
+		phase: "cleanup-confirmed",
+	});
+	await f.runtime.start({ reason: "new" });
+	assert.equal(existsSync(run.runDir), false);
+	assert.equal(existsSync(run.spec.launch.childSessionFile), true);
+});
+
+test("a mismatched marker with no valid spec blocks all launches", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	rmSync(join(run.runDir, "spec.json"));
+	writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+		v: 1,
+		runId: randomUUID(),
+		ownerKey: f.runtime.ownerKey,
+		name: "worker-1",
+		phase: "preparing",
+	});
+	await f.runtime.start({ reason: "new" });
+	const { childSessionFile: _session, ...draft } = run.spec.launch;
+	await assert.rejects(
+		f.runtime.spawn({ ...draft, name: "other-1" }, "task"),
+		/Inspect unresolved subagent run/,
+	);
+	assert.equal(existsSync(run.runDir), true);
+});
+
+test("a name mismatch reserves both identity-valid names", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeJsonAtomic(join(run.runDir, "launch-state.json"), {
+		v: 1,
+		runId: run.runId,
+		ownerKey: f.runtime.ownerKey,
+		name: "other-1",
+		phase: "preparing",
+	});
+	await f.runtime.start({ reason: "new" });
+	assert.deepEqual(f.runtime.list().reserved.sort(), ["other-1", "worker-1"]);
+	assert.equal(existsSync(run.runDir), true);
+});
+
+test("a corrupt launch state retains its run and reports the path", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeFileSync(join(run.runDir, "launch-state.json"), "{broken");
+	await f.runtime.start({ reason: "new" });
+	assert.equal(existsSync(run.runDir), true);
+	assert.ok(f.notifications.some((message) => message.includes(run.runDir)));
+	assert.ok(
+		f.notifications.some((message) => message.includes("invalid launch state")),
+	);
+});
+
+test("an incomplete run with no name blocks new launches", async (t) => {
+	const f = fixture(t);
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	rmSync(join(run.runDir, "spec.json"));
+	await f.runtime.start({ reason: "new" });
+	const { childSessionFile: _session, ...draft } = run.spec.launch;
+	await assert.rejects(
+		f.runtime.spawn(draft, "task"),
+		/Inspect unresolved subagent run/,
+	);
+});
+
+for (const mismatch of ["process", "server"] as const) {
+	test(`a finished result survives a later ${mismatch} identity error before delivery`, async (t) => {
+		const f = fixture(t);
+		const run = f.prepare("worker-1");
+		await f.runtime.start({ reason: "new" });
+		await f.runtime.tick();
+		const result = run.result();
+		assert.equal(result.status, "completed");
+		assert.equal(existsSync(join(run.runDir, "delivery-ack.json")), false);
+		if (mismatch === "process") present(f.panes.get(run.pane.paneId)).pid++;
+		else {
+			const server = await f.deps.tmux.serverIdentity();
+			server.process.start = "different server";
+			f.deps.tmux.serverIdentity = async () => server;
+		}
+		await f.runtime.tick();
+		assert.deepEqual(run.result(), result);
+		assert.ok(
+			f.notifications.some((message) => message.includes("identity mismatch")),
+		);
+	});
+}

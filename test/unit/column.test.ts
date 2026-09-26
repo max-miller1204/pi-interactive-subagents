@@ -336,6 +336,14 @@ test("column balance changes only owned heights and preserves multiple user pane
 	assert.equal(f.calls.filter((args) => args[0] === "list-panes").length, 4);
 });
 
+test("column balance permits unrelated empty panes", async () => {
+	const f = fixture();
+	for (const key of ["before", "middle", "after"] as const)
+		f.state[key] = f.state[key].replace("%1\t101\t", "%1\t0\t");
+	await balancePaneColumn(f.tmux, ["%3", "%4", "%5"]);
+	assert.equal(f.calls.filter((args) => args[0] === "resize-pane").length, 2);
+});
+
 test("zero or one remaining child needs no layout command", async () => {
 	const f = fixture();
 	await balancePaneColumn(f.tmux, []);

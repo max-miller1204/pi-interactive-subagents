@@ -207,14 +207,41 @@ test("tool error lines show the diagnostic and not an undefined success label", 
 	}
 });
 
+function renderResultMessage(
+	render: MessageRenderer,
+	details: ResultDetails,
+	theme: Theme,
+	expanded: boolean,
+	content: string,
+	width: number,
+): string {
+	const component = render(
+		{
+			role: "custom",
+			customType: "subagent_result",
+			content,
+			details,
+			display: true,
+			timestamp: 0,
+		},
+		{ expanded, outputPad: 0 },
+		theme,
+	);
+	assert.ok(component);
+	return component.render(width).join("\n");
+}
+
 test("closed human results show success while auto-exit closure remains a warning", () => {
-	const renderers = new Map<string, any>();
+	const renderers = new Map<string, MessageRenderer>();
 	registerRenderers({
-		registerMessageRenderer: (name: string, fn: any) => renderers.set(name, fn),
+		registerMessageRenderer: (name: string, fn: MessageRenderer) =>
+			renderers.set(name, fn),
 	} as unknown as ExtensionAPI);
 	const theme = {
 		fg: (color: string, value: string) => `${color}:${value}`,
-	} as any;
+	} as Theme;
+	const render = renderers.get("subagent_result");
+	assert.ok(render);
 	const details: ResultDetails = {
 		...baseResult,
 		name: "worker-1",
@@ -225,22 +252,15 @@ test("closed human results show success while auto-exit closure remains a warnin
 	};
 	for (const autoExit of [false, true]) {
 		const d = { ...details, autoExit };
-		const collapsed = renderers
-			.get("subagent_result")(
-				{ content: "wrong", details: d },
-				{ expanded: false },
-				theme,
-			)
-			.render(120)
-			.join("\n");
-		const expanded = renderers
-			.get("subagent_result")(
-				{ content: "wrong", details: d },
-				{ expanded: true },
-				theme,
-			)
-			.render(120)
-			.join("\n");
+		const collapsed = renderResultMessage(
+			render,
+			d,
+			theme,
+			false,
+			"wrong",
+			120,
+		);
+		const expanded = renderResultMessage(render, d, theme, true, "wrong", 120);
 		assert.match(collapsed, new RegExp(autoExit ? "warning:" : "success:"));
 		assert.match(
 			expanded,
@@ -253,14 +273,7 @@ test("closed human results show success while auto-exit closure remains a warnin
 	}
 	const noText = { ...details, autoExit: false, text: "" };
 	assert.match(
-		renderers
-			.get("subagent_result")(
-				{ content: "wrong", details: noText },
-				{ expanded: true },
-				theme,
-			)
-			.render(120)
-			.join("\n"),
+		renderResultMessage(render, noText, theme, true, "wrong", 120),
 		/warning:.*closed/,
 	);
 	assert.doesNotMatch(resultContent(noText), /by a human/);
@@ -320,9 +333,10 @@ for (const kind of ["message", "answer"] as const)
 	});
 
 test("message renderers use details and reveal extended result fields", () => {
-	const renderers = new Map<string, any>();
+	const renderers = new Map<string, MessageRenderer>();
 	registerRenderers({
-		registerMessageRenderer: (name: string, fn: any) => renderers.set(name, fn),
+		registerMessageRenderer: (name: string, fn: MessageRenderer) =>
+			renderers.set(name, fn),
 	} as unknown as ExtensionAPI);
 	for (const name of [
 		"subagent_result",
@@ -336,17 +350,26 @@ test("message renderers use details and reveal extended result fields", () => {
 	const theme = {
 		fg: (_color: string, value: string) => value,
 		bg: (_color: string, value: string) => value,
-	} as any;
+	} as Theme;
+	const render = renderers.get("subagent_result");
+	assert.ok(render);
 	const details: ResultDetails = { ...baseResult, undelivered: ["Unseen"] };
-	const message = { content: "This content must not be read", details };
-	const collapsed = renderers
-		.get("subagent_result")(message, { expanded: false, outputPad: 0 }, theme)
-		.render(100)
-		.join("\n");
-	const expanded = renderers
-		.get("subagent_result")(message, { expanded: true, outputPad: 0 }, theme)
-		.render(100)
-		.join("\n");
+	const collapsed = renderResultMessage(
+		render,
+		details,
+		theme,
+		false,
+		"This content must not be read",
+		100,
+	);
+	const expanded = renderResultMessage(
+		render,
+		details,
+		theme,
+		true,
+		"This content must not be read",
+		100,
+	);
 	assert.match(collapsed, /one/);
 	assert.doesNotMatch(collapsed, /four|\/child|This content/);
 	assert.match(expanded, /four/);

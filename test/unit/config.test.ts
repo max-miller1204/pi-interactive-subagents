@@ -24,7 +24,6 @@ import {
 	discoverAgents,
 	loadProfiles,
 	projectConfigAllowed,
-	trustFlag,
 } from "../../src/config.ts";
 
 function put(file: string, text: string) {
@@ -100,6 +99,18 @@ const profile = (changes = {}) => ({
 	},
 });
 
+test("an agent symlink to a directory replaces the lower agent with an error", (t) => {
+	const f = fixture(t);
+	f.agent("package", "scout.md", markdown());
+	mkdirSync(join(f.agentDir, "agents"));
+	const file = join(f.agentDir, "agents/scout.md");
+	symlinkSync(f.cwd, file);
+	const entry = discoverAgents(f.ctx, f.own, f.agentDir).agents.get("scout");
+	assert.ok(entry && "error" in entry);
+	assert.equal(entry.scope, "user");
+	assert.match(entry.error, /not a regular file/);
+});
+
 for (const scope of ["user", "project"] as const) {
 	test(`broken ${scope} agent symlink stays isolated through catalog resolution`, (t) => {
 		const f = fixture(t);
@@ -154,9 +165,13 @@ for (const [label, text, expected] of [
 	[
 		"unknown field",
 		markdown("description: Scout\ntools: []\nname: scout"),
-		/\/name/,
+		/unknown field "name"/,
 	],
-	["wrong type", markdown("description: Scout\ntools: read"), /\/tools/],
+	[
+		"wrong type",
+		markdown("description: Scout\ntools: read"),
+		/field "tools" must be a list/,
+	],
 	[
 		"bad YAML",
 		markdown("description: [broken\ntools: []"),
@@ -208,7 +223,7 @@ for (const [label, text, expected] of [
 	[
 		"bad tool name",
 		markdown("description: Scout\ntools: [bad.tool]"),
-		/pattern/,
+		/letters, digits, underscores, or dashes/,
 	],
 	[
 		"empty skills",
@@ -252,6 +267,77 @@ for (const [label, text, expected] of [
 		assert.equal(entry.scope, "user");
 		assert.match(entry.error, expected);
 		assert.ok(entry.error.startsWith(`${file}:`));
+	});
+}
+
+for (const [label, fields, message] of [
+	[
+		"unknown field",
+		"description: Scout\ntools: []\nname: scout",
+		'unknown field "name".',
+	],
+	[
+		"wrong field type",
+		"description: Scout\ntools: read",
+		'field "tools" must be a list.',
+	],
+	[
+		"invalid session value",
+		"description: Scout\ntools: []\nsession: bad",
+		'field "session" must be "standalone" or "fork".',
+	],
+	[
+		"invalid boolean value",
+		"description: Scout\ntools: []\nauto-exit: 'yes'",
+		'field "auto-exit" must be true or false.',
+	],
+	[
+		"missing required field",
+		"tools: []",
+		'missing required field "description".',
+	],
+	[
+		"invalid skills mode",
+		"description: Scout\ntools: []\nskills: some",
+		'field "skills" must be "all", "none", or a nonempty list of skill names.',
+	],
+	[
+		"duplicate skills",
+		"description: Scout\ntools: []\nskills: [code, code]",
+		'field "skills" has duplicate items.',
+	],
+	[
+		"invalid tool name",
+		"description: Scout\ntools: [bad.tool]",
+		'field "tools[0]" must contain only letters, digits, underscores, or dashes.',
+	],
+	[
+		"empty description",
+		"description: ''\ntools: []",
+		'field "description" must contain at least 1 character.',
+	],
+	[
+		"long description",
+		`description: ${"a".repeat(301)}\ntools: []`,
+		'field "description" must contain at most 300 characters.',
+	],
+	[
+		"empty skills list",
+		"description: Scout\ntools: []\nskills: []",
+		'field "skills" must contain at least 1 item.',
+	],
+	[
+		"invalid spawn name",
+		"description: Scout\ntools: []\nspawns: [Bad]",
+		'field "spawns[0]" must be an agent name with 1 to 32 lowercase letters, digits, or dashes.',
+	],
+] as const) {
+	test(`agent frontmatter explains ${label}`, (t) => {
+		const f = fixture(t);
+		const file = f.agent("user", "scout.md", markdown(fields));
+		const entry = discoverAgents(f.ctx, f.own, f.agentDir).agents.get("scout");
+		assert.ok(entry && "error" in entry);
+		assert.equal(entry.error, `${file}: ${message}`);
 	});
 }
 for (const tool of [
@@ -592,19 +678,4 @@ test("thinking validation uses the model's supported levels", (t) => {
 		() => loadProfiles(f.ctx, f.agentDir),
 		/thinking level "high" is not supported/,
 	);
-});
-test("trustFlag uses current context for equal real cwd and saved trust elsewhere", (t) => {
-	const f = fixture(t);
-	const alias = join(f.root, "alias");
-	symlinkSync(f.cwd, alias);
-	const other = join(f.root, "other");
-	mkdirSync(other);
-	assert.equal(trustFlag(f.ctx, alias, f.agentDir), "--approve");
-	f.ctx.isProjectTrusted = () => false;
-	assert.equal(trustFlag(f.ctx, alias, f.agentDir), "--no-approve");
-	assert.equal(trustFlag(f.ctx, other, f.agentDir), "--no-approve");
-	new ProjectTrustStore(f.agentDir).set(other, true);
-	assert.equal(trustFlag(f.ctx, other, f.agentDir), "--approve");
-	new ProjectTrustStore(f.agentDir).set(other, false);
-	assert.equal(trustFlag(f.ctx, other, f.agentDir), "--no-approve");
 });

@@ -1,0 +1,9 @@
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!biome.json
+!src/**
+!test/**
+!scripts/**
+!agents/**

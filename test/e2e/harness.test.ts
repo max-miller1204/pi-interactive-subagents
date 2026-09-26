@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { scenario, terminateWindow, trackedResource } from "./harness.ts";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
+import {
+	readBranch,
+	scenario,
+	terminateWindow,
+	trackedResource,
+	waitFor,
+} from "./harness.ts";
 
 for (const failure of [
 	"acquisition",
@@ -254,5 +268,67 @@ test("failed parent reports extension load error and cleanup removes its window"
 	assert.match(
 		readFileSync(run.stderrFile, "utf8") + (await run.capture()),
 		/Test extension failed at load/,
+	);
+});
+
+test("session polling waits for a record newline without accepting partial JSON", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "session-poll-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const file = join(dir, "session.jsonl");
+	const header = JSON.stringify({
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: "test",
+		timestamp: new Date().toISOString(),
+		cwd: dir,
+	});
+	writeFileSync(file, header.slice(0, 8));
+	let reads = 0;
+	const branch = await waitFor(
+		() => {
+			if (++reads === 2) writeFileSync(file, `${header}\n`);
+			return readBranch(file);
+		},
+		"committed session record",
+		1000,
+	);
+	assert.deepEqual(branch, []);
+	assert.equal(reads, 2);
+});
+
+test("session polling rejects complete invalid JSON immediately", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "session-poll-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const file = join(dir, "session.jsonl");
+	writeFileSync(file, "{invalid}\n");
+	let reads = 0;
+	await assert.rejects(
+		waitFor(
+			() => {
+				reads++;
+				return readBranch(file);
+			},
+			"invalid session",
+			1000,
+		),
+		/not valid JSON/,
+	);
+	assert.equal(reads, 1);
+});
+
+test("session polling reports an unfinished write at its deadline", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "session-poll-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const file = join(dir, "session.jsonl");
+	writeFileSync(file, "{");
+	await assert.rejects(
+		waitFor(() => readBranch(file), "unfinished session", 60),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /Timed out waiting for unfinished session/);
+			assert.ok(error.cause instanceof Error);
+			assert.match(error.cause.message, /missing final newline/);
+			return true;
+		},
 	);
 });

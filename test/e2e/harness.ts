@@ -14,7 +14,10 @@ import { join, resolve } from "node:path";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { readBranch as productionReadBranch } from "../../src/session-file.ts";
+import {
+	IncompleteSessionError,
+	readBranch as productionReadBranch,
+} from "../../src/session-file.ts";
 
 const exec = promisify(execFile);
 const repo = resolve(import.meta.dirname, "../..");
@@ -56,13 +59,22 @@ export async function waitFor<T>(
 	deadlineMs = 20_000,
 ): Promise<NonNullable<T>> {
 	const until = Date.now() + deadlineMs;
+	let incomplete: IncompleteSessionError | undefined;
 	while (Date.now() < until) {
-		const result = await test();
-		if (result) return result;
+		try {
+			const result = await test();
+			incomplete = undefined;
+			if (result) return result;
+		} catch (error) {
+			// Live session files can be observed before the writer adds the newline.
+			if (!(error instanceof IncompleteSessionError)) throw error;
+			incomplete = error;
+		}
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 	throw new Error(
 		`Timed out waiting for ${description} after ${deadlineMs} ms.`,
+		{ cause: incomplete },
 	);
 }
 export async function terminateWindow(

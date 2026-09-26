@@ -38,10 +38,12 @@
   "scripts": {
     "postinstall": "node scripts/patch-pi-declarations.mjs",
     "typecheck": "tsc",
-    "lint": "biome check .",
+    "lint": "biome check --error-on-warnings .",
     "test:unit": "node --test test/unit/*.test.ts",
     "test:sdk": "node --test test/sdk/*.test.ts",
     "test:e2e": "node scripts/run-tests.mjs --isolated-tmux --test --test-concurrency=1 test/e2e/*.test.ts",
+    "test:docker": "docker build -f test/evidence/Dockerfile -t pi-subagents-evidence . && docker run --rm --init --network none pi-subagents-evidence",
+    "test:record": "node scripts/run-tests.mjs --isolated-tmux --test test/evidence/record.test.ts",
     "check:pi-version": "node scripts/check-pi-version.mjs",
     "test": "npm run check:pi-version && npm run typecheck && npm run lint && npm run test:unit && npm run test:sdk"
   }

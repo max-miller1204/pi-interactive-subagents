@@ -6,6 +6,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -507,7 +508,7 @@ test("owner death at 2000 ms stops timers without shutdown or inbox delivery", (
 	assert.equal(f.notices.length, 0);
 	t.mock.timers.tick(1);
 	assert.deepEqual(f.notices, [
-		`The parent Pi process ended without a quit. This pane is now a normal Pi session. Its result is not delivered. Session: ${f.file}`,
+		`The parent Pi process ended without a quit. Continue work in this pane. Parent messaging and auto-exit are off. Session switching and forking remain blocked. Session: ${f.file}`,
 	]);
 	assert.equal(f.shutdowns(), 0);
 	assert.equal(f.statuses.at(-1), "subagent worker-1 · auto-exit off");
@@ -522,14 +523,112 @@ test("owner death at 2000 ms stops timers without shutdown or inbox delivery", (
 	assert.equal(f.sent.length, 0);
 	assert.equal(f.notices.length, 1);
 });
-test("a missing run directory with a live owner throws", (t) => {
+for (const timer of ["pump", "owner"] as const)
+	test(`${timer} timer failure writes the exact fatal and stops both timers`, (t) => {
+		t.mock.timers.enable({ apis: ["setInterval"] });
+		const f = fixture(t);
+		const child = f.start();
+		const notify = t.mock.method(f.ctx.ui, "notify");
+		const pump = t.mock.method(f.runtime.deliverer, "pump");
+		let message: string;
+		if (timer === "pump") {
+			const corrupt = join(f.runDir, "inbox", "unexpected.json");
+			writeFileSync(corrupt, "{}");
+			message = `Unexpected file ${corrupt} in a subagent directory.`;
+			f.runtime.deliverer.onAgentStart();
+		} else {
+			const moved = join(f.root, "moved");
+			renameSync(f.runDir, moved);
+			symlinkSync(moved, f.runDir);
+			message = `The subagent run directory changed: ${f.runDir}.`;
+		}
+		assert.doesNotThrow(() =>
+			t.mock.timers.tick(timer === "pump" ? 250 : 2000),
+		);
+		assert.deepEqual(readJsonStrict(Fatal, join(f.runDir, "fatal.json")), {
+			v: 1,
+			message,
+		});
+		assert.deepEqual(
+			notify.mock.calls.map((call) => call.arguments),
+			[[message, "error"]],
+		);
+		assert.equal(f.shutdowns(), 1);
+		assert.deepEqual(
+			child.onInput({ source: "interactive", text: "Continue" }),
+			{
+				action: "handled",
+			},
+		);
+		assert.deepEqual(child.onToolCall(), { block: true, reason: message });
+		assert.deepEqual(present(f.runtime.sources[0]).items(), []);
+		const pumps = pump.mock.callCount();
+		t.mock.timers.tick(6000);
+		assert.equal(pump.mock.callCount(), pumps);
+		assert.equal(f.shutdowns(), 1);
+		assert.deepEqual(f.notices, [message]);
+	});
+
+for (const failure of ["missing run directory", "blocked fatal file"] as const)
+	test(`${failure} reports both errors and shuts down without escaping the timer`, (t) => {
+		t.mock.timers.enable({ apis: ["setInterval"] });
+		const f = fixture(t);
+		const child = f.start();
+		const notify = t.mock.method(f.ctx.ui, "notify");
+		const pump =
+			failure === "missing run directory"
+				? t.mock.method(f.runtime.deliverer, "pump", () => {})
+				: t.mock.method(f.runtime.deliverer, "pump");
+		if (failure === "missing run directory")
+			rmSync(f.runDir, { recursive: true });
+		else {
+			mkdirSync(join(f.runDir, "fatal.json"));
+			writeFileSync(join(f.runDir, "inbox", "unexpected.json"), "{}");
+		}
+		assert.doesNotThrow(() => t.mock.timers.tick(2000));
+		assert.equal(f.shutdowns(), 1);
+		assert.equal(f.notices.length, 2);
+		assert.match(
+			present(f.notices[0]),
+			failure === "missing run directory"
+				? /ENOENT/
+				: /Unexpected file .*unexpected.json/,
+		);
+		assert.match(
+			present(f.notices[1]),
+			/Could not write the subagent fatal record: /,
+		);
+		assert.match(
+			present(f.notices[1]),
+			failure === "missing run directory" ? /ENOENT/ : /EISDIR/,
+		);
+		assert.deepEqual(
+			notify.mock.calls.map((call) => call.arguments[1]),
+			["error", "error"],
+		);
+		assert.equal(child.onToolCall()?.reason, f.notices[0]);
+		const pumps = pump.mock.callCount();
+		assert.doesNotThrow(() => t.mock.timers.tick(6000));
+		assert.equal(pump.mock.callCount(), pumps);
+		assert.equal(f.shutdowns(), 1);
+		assert.equal(f.notices.length, 2);
+	});
+
+test("a failed shutdown request still throws after a timer failure stops both timers", (t) => {
 	t.mock.timers.enable({ apis: ["setInterval"] });
 	const f = fixture(t);
-	const child = f.start();
-	t.mock.method(f.runtime.deliverer, "pump", () => {});
-	rmSync(f.runDir, { recursive: true });
-	assert.throws(() => t.mock.timers.tick(2000), /ENOENT|run directory/);
-	child.dispose();
+	f.start();
+	const pump = t.mock.method(f.runtime.deliverer, "pump");
+	f.ctx.shutdown = () => {
+		throw new Error("Shutdown request failed.");
+	};
+	writeFileSync(join(f.runDir, "inbox", "unexpected.json"), "{}");
+	assert.throws(() => t.mock.timers.tick(250), {
+		message: "Shutdown request failed.",
+	});
+	const pumps = pump.mock.callCount();
+	assert.doesNotThrow(() => t.mock.timers.tick(6000));
+	assert.equal(pump.mock.callCount(), pumps);
 });
 
 function exitState(): ExitState {

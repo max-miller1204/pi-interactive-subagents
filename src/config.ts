@@ -16,6 +16,7 @@ import {
 	ProjectTrustStore,
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import {
 	type AgentDef,
 	AgentFrontmatter,
@@ -65,19 +66,6 @@ export function projectConfigAllowed(
 	);
 }
 
-export function trustFlag(
-	ctx: TrustContext,
-	cwd: string,
-	agentDir = getAgentDir(),
-): "--approve" | "--no-approve" {
-	const realCwd = realpathSync(cwd);
-	const trusted =
-		realCwd === realpathSync(ctx.cwd)
-			? ctx.isProjectTrusted()
-			: new ProjectTrustStore(agentDir).get(realCwd) === true;
-	return trusted ? "--approve" : "--no-approve";
-}
-
 function agentFiles(directory: string): string[] {
 	if (!existsSync(directory)) return [];
 	return readdirSync(directory, { withFileTypes: true })
@@ -88,6 +76,69 @@ function agentFiles(directory: string): string[] {
 		)
 		.map((entry) => entry.name)
 		.sort();
+}
+
+function parseAgentFrontmatter(value: unknown, file: string): AgentFrontmatter {
+	try {
+		return parseStrict(AgentFrontmatter, value, file);
+	} catch (error) {
+		const errors = [...Value.Errors(AgentFrontmatter, value)];
+		const first = errors[0];
+		if (!first) throw error;
+		const issue =
+			first.instancePath === "/skills" &&
+			typeof value === "object" &&
+			value !== null &&
+			"skills" in value &&
+			Array.isArray(value.skills)
+				? (errors.find(
+						(item) =>
+							item.schemaPath.startsWith("#/properties/skills/anyOf/2") &&
+							item.keyword !== "type",
+					) ?? first)
+				: first;
+		const field = issue.instancePath.slice(1).replace(/\/(\d+)/g, "[$1]");
+		let message: string;
+		if (
+			issue.keyword === "boolean" &&
+			issue.schemaPath === "#/additionalProperties"
+		)
+			message = `unknown field "${field}".`;
+		else if (issue.keyword === "required")
+			message = `missing required field "${String(issue.params.requiredProperties[0])}".`;
+		else if (field === "session")
+			message = 'field "session" must be "standalone" or "fork".';
+		else if (field === "system-prompt")
+			message = 'field "system-prompt" must be "append" or "replace".';
+		else if (field === "skills" && issue.keyword === "const")
+			message =
+				'field "skills" must be "all", "none", or a nonempty list of skill names.';
+		else if (issue.keyword === "type") {
+			const type = issue.params.type;
+			const expected =
+				type === "array"
+					? "a list"
+					: type === "boolean"
+						? "true or false"
+						: type === "string"
+							? "text"
+							: String(type);
+			message = `field "${field}" must be ${expected}.`;
+		} else if (issue.keyword === "uniqueItems")
+			message = `field "${field}" has duplicate items.`;
+		else if (issue.keyword === "minLength")
+			message = `field "${field}" must contain at least ${issue.params.limit} character${issue.params.limit === 1 ? "" : "s"}.`;
+		else if (issue.keyword === "maxLength")
+			message = `field "${field}" must contain at most ${issue.params.limit} characters.`;
+		else if (issue.keyword === "minItems")
+			message = `field "${field}" must contain at least ${issue.params.limit} item${issue.params.limit === 1 ? "" : "s"}.`;
+		else if (issue.keyword === "pattern" && field.startsWith("tools["))
+			message = `field "${field}" must contain only letters, digits, underscores, or dashes.`;
+		else if (issue.keyword === "pattern" && field.startsWith("spawns["))
+			message = `field "${field}" must be an agent name with 1 to 32 lowercase letters, digits, or dashes.`;
+		else message = `field "${field}" ${issue.message}.`;
+		throw new Error(`${file}: ${message}`, { cause: error });
+	}
 }
 
 export function discoverAgents(
@@ -110,14 +161,15 @@ export function discoverAgents(
 			const name = filename.slice(0, -3);
 			let file = join(realpathSync(directory), filename);
 			try {
-				if (!statSync(file).isFile()) continue;
+				if (!statSync(file).isFile())
+					throw new Error("the agent path is not a regular file.");
 				file = realpathSync(file);
 				if (!AGENT_FILE.test(filename))
 					throw new Error(
 						"an agent file name must be 1 to 32 lowercase letters, digits or dashes, and end in .md.",
 					);
 				const parsed = parseFrontmatter(readFileSync(file, "utf8"));
-				const fm = parseStrict(AgentFrontmatter, parsed.frontmatter, file);
+				const fm = parseAgentFrontmatter(parsed.frontmatter, file);
 				const body = parsed.body.trim();
 				if (!body) throw new Error("the agent body (system prompt) is empty.");
 				for (const tool of fm.tools) {
