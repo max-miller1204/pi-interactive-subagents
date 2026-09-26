@@ -145,13 +145,45 @@ test("declaration patch resolves a hoisted Pi AI package without a directory arg
 	mkdirSync(scriptDir, { recursive: true });
 	const copiedScript = join(scriptDir, "patch.mjs");
 	writeFileSync(copiedScript, readFileSync(script, "utf8"));
+	const env = { ...process.env };
+	delete env.npm_config_omit;
 	const result = spawnSync(process.execPath, [copiedScript], {
 		cwd: tmpdir(),
+		env,
 		encoding: "utf8",
 		timeout: 5_000,
 	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /Patched 41 of 41/);
+});
+
+function runCopiedScript(t: TestContext, env: NodeJS.ProcessEnv) {
+	const root = mkdtempSync(join(tmpdir(), "pi-declarations-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const copiedScript = join(root, "patch.mjs");
+	writeFileSync(copiedScript, readFileSync(script, "utf8"));
+	return spawnSync(process.execPath, [copiedScript], {
+		cwd: root,
+		env,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+}
+
+test("declaration patch skips when npm omits dev dependencies", (t) => {
+	const env = { ...process.env };
+	env.npm_config_omit = "dev";
+	const result = runCopiedScript(t, env);
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /Skipped the Pi AI declaration patch/);
+});
+
+test("declaration patch fails when Pi AI is missing and dev dependencies are installed", (t) => {
+	const env = { ...process.env };
+	delete env.npm_config_omit;
+	const result = runCopiedScript(t, env);
+	assert.notEqual(result.status, 0);
+	assert.match(result.stderr, /Cannot find package '@earendil-works\/pi-ai'/);
 });
 
 for (const change of ["missing", "extra", "renamed"] as const) {
