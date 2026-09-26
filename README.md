@@ -446,6 +446,8 @@ The pinned Pi packages are 0.87.1.
 | `npm run test:docker` | Build a Linux image and run both suites with networking disabled. |
 | `EVIDENCE_DIR=artifacts/recording npm run test:record` | Record an asserted Pi and tmux workflow. |
 
+Project-local [end-to-end test skills](.agents/TEST_COVERAGE.md) map each feature to its private-tmux checks. Pi discovers the skills in `.agents/skills/`.
+
 `npm run test:e2e` starts `tmux -L pi-subagents-test-<pid>`.
 It does not use your default tmux server.
 It stops that private server when the run ends.
