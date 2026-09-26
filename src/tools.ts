@@ -9,6 +9,10 @@ import {
 	type ResolveLaunchOptions,
 	resolveLaunch,
 } from "./catalog.ts";
+import {
+	type ConversationViewer,
+	createConversationViewer,
+} from "./conversation-viewer.ts";
 import { defaultName, type Runtime } from "./parent.ts";
 import type { Catalog } from "./schema.ts";
 import { registerToolRenderers } from "./ui.ts";
@@ -290,4 +294,69 @@ export function registerCommand(
 			}
 		},
 	});
+}
+
+export function registerSubagentsCommand(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+): { close(): void } {
+	let viewer: ConversationViewer | undefined;
+	pi.registerCommand("subagents", {
+		description: "View subagents and choose the session display mode.",
+		async handler(_args, ctx) {
+			for (;;) {
+				const listing = runtime.list();
+				const rows = [
+					`Mode: ${runtime.displayMode()}`,
+					...listing.live.map((run) => `Run: ${run.name} (${run.phase})`),
+					...[...listing.branch]
+						.filter(([name]) => !listing.live.some((run) => run.name === name))
+						.map(([name]) => `Run: ${name} (finished)`),
+					"Close",
+				];
+				const selection = await ctx.ui.select("Subagents", rows);
+				if (selection === undefined || selection === "Close") return;
+				if (selection.startsWith("Mode: ")) {
+					const mode = await ctx.ui.select("Display mode for new subagents", [
+						"auto",
+						"panes",
+						"widget",
+					]);
+					if (mode === undefined) continue;
+					try {
+						runtime.setDisplayMode(mode as "auto" | "panes" | "widget");
+					} catch (error) {
+						ctx.ui.notify(
+							error instanceof Error ? error.message : String(error),
+							"error",
+						);
+					}
+					continue;
+				}
+				const match = /^Run: ([a-z0-9][a-z0-9-]*) \(/.exec(selection);
+				if (match === null)
+					throw new Error(`Invalid subagent selection: ${selection}.`);
+				const name = match[1] as string;
+				await ctx.ui.custom<void>(
+					(tui, theme, _keybindings, done) => {
+						viewer = createConversationViewer(runtime, name, tui, theme, () =>
+							done(),
+						);
+						return viewer;
+					},
+					{
+						overlay: true,
+						overlayOptions: { width: "90%", maxHeight: "90%", margin: 1 },
+					},
+				);
+				viewer = undefined;
+			}
+		},
+	});
+	return {
+		close() {
+			viewer?.close();
+			viewer = undefined;
+		},
+	};
 }

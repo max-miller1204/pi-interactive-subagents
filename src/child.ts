@@ -226,6 +226,13 @@ class ChildRole {
 			const data = parseStrict(ChildEntry, entry.data, "child entry");
 			if (data.runId === spec.runId && data.kind === "human") this.human = true;
 		}
+		if (
+			spec.initialPrompt.startsWith("Message from the human:") &&
+			!this.human
+		) {
+			this.human = true;
+			this.append({ v: 1, kind: "human", runId: spec.runId });
+		}
 		for (const name of readdirSync(join(runDir, "questions")).filter(
 			(name) => !name.startsWith("."),
 		)) {
@@ -350,6 +357,12 @@ class ChildRole {
 					);
 				if (!entry) throw new Error(`Missing inbox item ${item.id}.`);
 				const message = entry.item;
+				if (message.source === "human" && !this.human) {
+					this.human = true;
+					this.append({ v: 1, kind: "human", runId: spec.runId });
+					this.statusBar();
+					this.writeStatus();
+				}
 				if (message.kind === "answer") {
 					const waiter = this.waiters.get(message.qid);
 					if (waiter)
@@ -367,14 +380,15 @@ class ChildRole {
 						display: true,
 						content:
 							message.kind === "answer"
-								? `Answer from the parent agent to question ${message.qid}, which you withdrew:\n\n${message.text}`
-								: `Message from the parent agent:\n\n${message.text}`,
+								? `Answer from the ${message.source === "human" ? "human" : "parent agent"} to question ${message.qid}, which you withdrew:\n\n${message.text}`
+								: `Message from the ${message.source === "human" ? "human" : "parent agent"}:\n\n${message.text}`,
 						details: parseStrict(
 							ParentMessageDetails,
 							{
 								deliveryId: item.id,
 								kind: message.kind,
 								text: message.text,
+								...(message.source === "human" ? { source: "human" } : {}),
 								...(message.kind === "answer" ? { qid: message.qid } : {}),
 							},
 							"parent message details",
@@ -645,7 +659,7 @@ class ChildRole {
 	}
 	private guardSession(): { cancel: true } {
 		this.ctx.ui.notify(
-			"This pane is a subagent. Pi cannot switch or fork its session.",
+			"This subagent cannot switch or fork its Pi session.",
 			"error",
 		);
 		return { cancel: true };

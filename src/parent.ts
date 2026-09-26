@@ -492,6 +492,7 @@ export class Runtime {
 			name: launch.name,
 			agent: launch.agent,
 			profile: launch.profile,
+			backend: run.backend.kind,
 			autoExit: launch.autoExit,
 			status: "failed",
 			text: "",
@@ -1199,6 +1200,7 @@ export class Runtime {
 		name: string,
 		text: string,
 		question_id?: string,
+		origin: "model" | "human" = "model",
 	): Promise<string> {
 		this.requireEnabled();
 		const incomplete = this.incompleteNames.get(name);
@@ -1229,8 +1231,19 @@ export class Runtime {
 				join(run.runDir, "inbox"),
 				"inbox",
 				qid === undefined
-					? { v: 1, kind: "message", text }
-					: { v: 1, kind: "answer", qid, text },
+					? {
+							v: 1,
+							kind: "message",
+							text,
+							...(origin === "human" ? { source: "human" as const } : {}),
+						}
+					: {
+							v: 1,
+							kind: "answer",
+							qid,
+							text,
+							...(origin === "human" ? { source: "human" as const } : {}),
+						},
 			);
 			return qid === undefined
 				? `Queued for "${name}". It reads the message at its next step.`
@@ -1294,7 +1307,7 @@ export class Runtime {
 		const started = await this.launch({
 			kind: "resume",
 			launch,
-			initialPrompt: `Message from the parent agent:\n\n${text}`,
+			initialPrompt: `Message from the ${origin === "human" ? "human" : "parent agent"}:\n\n${text}`,
 		});
 		return started.backend.kind === "pane"
 			? `Resumed subagent "${name}" in pane ${started.backend.pane.paneId}. Its result arrives as a message.`

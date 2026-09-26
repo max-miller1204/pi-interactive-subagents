@@ -421,6 +421,26 @@ test("argv input leaves auto-exit on, later human input persists takeover once",
 	f.start();
 	assert.equal(f.statuses.at(-1), "subagent worker-1 · auto-exit off");
 });
+test("a human inbox message keeps its sender and disables auto-exit", (t) => {
+	const f = fixture(t);
+	f.start();
+	queue.put(join(f.runDir, "inbox"), "inbox", {
+		v: 1,
+		kind: "message",
+		text: "Check this",
+		source: "human",
+	});
+	f.runtime.deliverer.pump();
+	assert.equal(
+		readJsonStrict(ChildStatus, join(f.runDir, "status.json")).human,
+		true,
+	);
+	assert.ok(
+		f.entries.some(
+			(entry) => entry.type === "custom" && entry.data?.kind === "human",
+		),
+	);
+});
 test("wrong first input reports takeover and restored user messages count as initial input", (t) => {
 	const f = fixture(t);
 	let child = f.start();
@@ -452,7 +472,7 @@ test("guards cancel switch and fork, and tree adds a leaf marker", (t) => {
 	assert.deepEqual(
 		f.notices,
 		Array(2).fill(
-			"This pane is a subagent. Pi cannot switch or fork its session.",
+			"This subagent cannot switch or fork its Pi session.",
 		),
 	);
 });

@@ -212,12 +212,14 @@ export const InboxItem = Type.Union([
 		v: Type.Literal(1),
 		kind: Type.Literal("message"),
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 	Obj({
 		v: Type.Literal(1),
 		kind: Type.Literal("answer"),
 		qid: Qid,
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 ]);
 export const ParentMessageDetails = Type.Union([
@@ -225,12 +227,14 @@ export const ParentMessageDetails = Type.Union([
 		deliveryId: Type.String({ minLength: 1 }),
 		kind: Type.Literal("message"),
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 	Obj({
 		deliveryId: Type.String({ minLength: 1 }),
 		kind: Type.Literal("answer"),
 		qid: Qid,
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 ]);
 export const OutboxItem = Type.Union([
@@ -281,6 +285,9 @@ export const ResultDetails = Obj({
 	name: Name,
 	agent: AgentName,
 	profile: Name,
+	backend: Type.Optional(
+		Type.Union([Type.Literal("pane"), Type.Literal("widget")]),
+	),
 	autoExit: Type.Boolean(),
 	status: ResultStatus,
 	text: Type.String(),
