@@ -51,6 +51,17 @@ if (process.argv.length > 3) {
 		"Usage: node scripts/patch-pi-declarations.mjs [pi-ai-directory]",
 	);
 }
+// Pi installs this package with `npm install --omit=dev`.
+// That install has no local @earendil-works/pi-ai package to patch.
+const devDependenciesOmitted = (process.env.npm_config_omit ?? "")
+	.split(",")
+	.some((name) => name.trim() === "dev");
+if (process.argv.length === 2 && devDependenciesOmitted) {
+	console.log(
+		"Skipped the Pi AI declaration patch. npm omitted dev dependencies.",
+	);
+	process.exit(0);
+}
 const packageDir = process.argv[2]
 	? resolve(process.argv[2])
 	: resolve(
