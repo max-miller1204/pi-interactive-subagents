@@ -6,6 +6,7 @@ import {
 	matchesKey,
 	type TUI,
 	truncateToWidth,
+	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { Runtime } from "./parent.ts";
@@ -234,7 +235,17 @@ export function createConversationViewer(
 			tui.requestRender();
 		},
 		render(rawWidth) {
-			const width = Math.max(1, rawWidth);
+			if (rawWidth < 6) return [];
+			const width = rawWidth;
+			const innerWidth = width - 4;
+			const height = Math.max(11, Math.floor(tui.terminal.rows * 0.7));
+			const row = (content: string) => {
+				const clipped = truncateToWidth(content, innerWidth);
+				return `${theme.fg("border", "│")} ${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))} ${theme.fg("border", "│")}`;
+			};
+			const top = theme.fg("border", `╭${"─".repeat(width - 2)}╮`);
+			const bottom = theme.fg("border", `╰${"─".repeat(width - 2)}╯`);
+			const divider = row(theme.fg("border", "─".repeat(innerWidth)));
 			const questions = openQuestions();
 			const selectedClosed =
 				selectedQuestion !== undefined && !questions.includes(selectedQuestion);
@@ -243,7 +254,7 @@ export function createConversationViewer(
 			let lines: string[];
 			try {
 				lines = conversationLines(runtime, name).flatMap((line) =>
-					wrapTextWithAnsi(line, width),
+					wrapTextWithAnsi(line, innerWidth),
 				);
 			} catch (error) {
 				lines = [
@@ -254,30 +265,32 @@ export function createConversationViewer(
 				];
 			}
 			lineCount = lines.length;
-			pageSize = Math.max(1, Math.min(30, tui.terminal.rows - 9));
+			pageSize = height - 10;
 			const window = viewerWindow(lines, pageSize, scrollTop);
 			const footer = confirmStop
 				? "Stop this subagent? y/n"
 				: "Esc close  PgUp/PgDn scroll  End latest  Tab question  Ctrl-X stop";
 			return [
-				truncateToWidth(header, width),
-				truncateToWidth(theme.fg("muted", questionLine), width),
-				...window.lines.map((line) => truncateToWidth(line, width)),
-				truncateToWidth(
+				top,
+				row(header),
+				row(theme.fg("muted", questionLine)),
+				divider,
+				...Array.from({ length: pageSize }, (_, index) =>
+					row(window.lines[index] ?? ""),
+				),
+				divider,
+				row(
 					theme.fg(
 						"muted",
 						scrollTop === null
 							? "Latest"
 							: `Scrolled to ${window.top + 1}/${lineCount}`,
 					),
-					width,
 				),
-				truncateToWidth(
-					theme.fg(confirmStop ? "warning" : "muted", footer),
-					width,
-				),
-				...(note ? [truncateToWidth(note, width)] : []),
-				...input.render(width).map((line) => truncateToWidth(line, width)),
+				row(theme.fg(confirmStop ? "warning" : "muted", footer)),
+				row(note),
+				row(input.render(innerWidth)[0] ?? ""),
+				bottom,
 			];
 		},
 	};

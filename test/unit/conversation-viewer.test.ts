@@ -158,6 +158,41 @@ test("viewer follows the end until a user scrolls up", () => {
 	});
 });
 
+test("viewer covers a fixed bordered rectangle so parent text stays outside", () => {
+	const runtime = {
+		list: () => ({
+			live: [{ name: "worker-1", openQuestions: [] }],
+			branch: new Map(),
+		}),
+		runs: new Map(),
+	} as unknown as Runtime;
+	const tui = {
+		terminal: { rows: 30 },
+		requestRender: () => {},
+	} as unknown as TUI;
+	const theme = {
+		fg: (_color: string, text: string) => text,
+	} as unknown as Theme;
+	const viewer = createConversationViewer(
+		runtime,
+		"worker-1",
+		tui,
+		theme,
+		() => {},
+	);
+	const lines = viewer.render(80);
+	assert.equal(lines.length, 21);
+	assert.equal(lines[0], `╭${"─".repeat(78)}╮`);
+	assert.equal(lines.at(-1), `╰${"─".repeat(78)}╯`);
+	assert.ok(lines.every((line) => visibleWidth(line) === 80));
+	assert.ok(
+		lines
+			.slice(1, -1)
+			.every((line) => line.startsWith("│ ") && line.endsWith(" │")),
+	);
+	viewer.dispose();
+});
+
 test("viewer sends a human answer, confirms stop, and closes on Escape", async () => {
 	const calls: unknown[][] = [];
 	let stops = 0;
