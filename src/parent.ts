@@ -68,6 +68,7 @@ import {
 	verifiedPane,
 } from "./tmux.ts";
 import { resultContent } from "./ui.ts";
+import { readViewRecords } from "./view-stream.ts";
 import { connectSupervisor } from "./widget-client.ts";
 import { launchWidgetRun, type WidgetStartedRun } from "./widget-launch.ts";
 import { startSupervisor } from "./widget-supervisor.ts";
@@ -1004,6 +1005,26 @@ export class Runtime {
 			reserved: [...this.incompleteNames.keys()],
 			branch: this.fold().names,
 		};
+	}
+	viewRecords(name: string, afterSeq = 0) {
+		const run = this.runs.get(name);
+		if (run === undefined)
+			throw new Error(`Subagent "${name}" has no active run.`);
+		const branch = afterMarker(
+			readBranch(run.spec.launch.childSessionFile),
+			run.spec.runId,
+		);
+		if (branch === undefined)
+			throw new Error(
+				`Subagent "${name}" has no run marker in its saved session.`,
+			);
+		const persisted = branch.filter((entry) => entry.type === "message").length;
+		return readViewRecords(
+			run.runDir,
+			afterSeq,
+			this.alive(childOf(run)),
+			run.spec.runId,
+		).filter((record) => record.messageOrdinal > persisted);
 	}
 	private requireEnabled(): void {
 		if (!this.enabled || this.disposed)

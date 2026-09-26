@@ -208,6 +208,10 @@ export function createSubagentsExtension(
 	pi.on("message_end", (event) => {
 		runtime?.child?.onMessageEnd(event);
 	});
+	pi.on("message_start", (event) => runtime?.child?.onMessageStart(event));
+	pi.on("message_update", (event) => runtime?.child?.onMessageUpdate(event));
+	pi.on("tool_execution_start", (event) => runtime?.child?.onToolStart(event));
+	pi.on("tool_execution_end", (event) => runtime?.child?.onToolEnd(event));
 	pi.on("tool_call", () => runtime?.startup?.onToolCall());
 	pi.on("session_before_switch", () => runtime?.child?.onBeforeSwitch());
 	pi.on("session_before_fork", () => runtime?.child?.onBeforeFork());

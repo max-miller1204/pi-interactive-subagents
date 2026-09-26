@@ -39,6 +39,7 @@ import {
 } from "../../src/schema.ts";
 import { readBranch } from "../../src/session-file.ts";
 import { createTmux, type PaneState } from "../../src/tmux.ts";
+import { appendViewRecord } from "../../src/view-stream.ts";
 import { tmuxLayout } from "../fixtures/tmux-layout.ts";
 
 function present<T>(value: T | undefined): T {
@@ -465,6 +466,42 @@ test("widget run reattaches and finishes without reading tmux panes", async (t) 
 	});
 	await f.runtime.tick();
 	assert.equal(run.result().status, "completed");
+});
+test("reconnected view excludes messages already saved in the child session", async (t) => {
+	const f = fixture(t, { disk: true });
+	const run = f.prepare("worker-1");
+	rmSync(join(run.runDir, "pane.json"));
+	writeRunBackend(run.runDir, {
+		kind: "widget",
+		supervisor: { pid: 333, start: "supervisor" },
+		child: { pid: 444, start: "child" },
+		socket: join(run.runDir, "w.sock"),
+	});
+	f.living.add(333);
+	f.living.add(444);
+	appendViewRecord(run.runDir, {
+		v: 1,
+		runId: run.runId,
+		seq: 1,
+		messageOrdinal: 1,
+		kind: "message_end",
+		role: "assistant",
+		text: "Result text",
+	});
+	appendViewRecord(run.runDir, {
+		v: 1,
+		runId: run.runId,
+		seq: 2,
+		messageOrdinal: 2,
+		kind: "message_update",
+		role: "assistant",
+		text: "New text",
+	});
+	await f.runtime.start({ reason: "new" });
+	assert.deepEqual(
+		f.runtime.viewRecords("worker-1").map((row) => row.seq),
+		[2],
+	);
 });
 
 test("outside tmux auto launches a widget run without tmux calls", async (t) => {

@@ -37,6 +37,7 @@ import {
 	readJsonStrict,
 	writeJsonAtomic,
 } from "../../src/schema.ts";
+import { readViewRecords } from "../../src/view-stream.ts";
 
 function present<T>(value: T | undefined | null): T {
 	assert.ok(value !== undefined && value !== null);
@@ -476,6 +477,41 @@ test("status tracks working, question wait, settled and context usage", async (t
 	assert.equal(status().contextTokens, null);
 	child.onAgentSettled();
 	assert.equal(status().state, "waiting");
+});
+test("child writes ordered live messages and resumes view sequence after reload", (t) => {
+	const f = fixture(t);
+	let child = f.start();
+	child.onMessageStart({
+		message: { role: "assistant", content: [{ type: "text", text: "" }] },
+	});
+	child.onMessageUpdate({
+		message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+	});
+	child.onToolStart({
+		toolCallId: "call-1",
+		toolName: "read",
+		args: { path: "a" },
+	});
+	child.onToolEnd({
+		toolCallId: "call-1",
+		toolName: "read",
+		result: { content: "done" },
+		isError: false,
+	});
+	child.onMessageEnd({
+		message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+	});
+	assert.deepEqual(
+		readViewRecords(f.runDir, 0, true, f.runId).map((row) => row.seq),
+		[1, 2, 3, 4, 5],
+	);
+	child.dispose();
+	child = f.start();
+	child.onMessageStart({ message: { role: "user", content: "More" } });
+	assert.equal(
+		readViewRecords(f.runDir, 5, true, f.runId)[0]?.messageOrdinal,
+		2,
+	);
 });
 test("inbox timer uses the task gate and starts at 250 ms", (t) => {
 	t.mock.timers.enable({ apis: ["setInterval"] });

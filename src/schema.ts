@@ -166,6 +166,47 @@ export const WidgetExitRecord = Obj({
 	signal: Type.Union([Type.String(), Type.Null()]),
 	error: Type.Optional(Type.String({ minLength: 1 })),
 });
+const ViewBase = {
+	v: Type.Literal(1),
+	runId: Type.String({ format: "uuid" }),
+	seq: Type.Integer({ minimum: 1 }),
+	messageOrdinal: Type.Integer({ minimum: 0 }),
+};
+export const ViewRecord = Type.Union([
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_start"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_update"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_end"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("tool_start"),
+		toolCallId: Type.String({ minLength: 1 }),
+		toolName: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("tool_end"),
+		toolCallId: Type.String({ minLength: 1 }),
+		toolName: Type.String({ minLength: 1 }),
+		text: Type.String(),
+		isError: Type.Boolean(),
+	}),
+]);
 export const InboxItem = Type.Union([
 	Obj({
 		v: Type.Literal(1),
@@ -371,6 +412,7 @@ export type LaunchState = Static<typeof LaunchState>;
 export type PaneFile = Static<typeof PaneFile>;
 export type RunBackendRecord = Static<typeof RunBackendRecord>;
 export type WidgetExitRecord = Static<typeof WidgetExitRecord>;
+export type ViewRecord = Static<typeof ViewRecord>;
 export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;
 export type ParentMessageDetails = Static<typeof ParentMessageDetails>;
