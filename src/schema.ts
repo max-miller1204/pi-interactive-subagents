@@ -158,6 +158,13 @@ export const RunBackendRecord = Type.Union([
 		socket: AbsPath,
 	}),
 ]);
+export const WidgetExitRecord = Obj({
+	v: Type.Literal(1),
+	runId: Type.String({ format: "uuid" }),
+	exitCode: Type.Union([Type.Integer(), Type.Null()]),
+	signal: Type.Union([Type.String(), Type.Null()]),
+	error: Type.Optional(Type.String({ minLength: 1 })),
+});
 export const InboxItem = Type.Union([
 	Obj({
 		v: Type.Literal(1),
@@ -362,6 +369,7 @@ export type RunSpec = Static<typeof RunSpec>;
 export type LaunchState = Static<typeof LaunchState>;
 export type PaneFile = Static<typeof PaneFile>;
 export type RunBackendRecord = Static<typeof RunBackendRecord>;
+export type WidgetExitRecord = Static<typeof WidgetExitRecord>;
 export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;
 export type ParentMessageDetails = Static<typeof ParentMessageDetails>;
