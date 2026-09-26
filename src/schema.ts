@@ -13,6 +13,16 @@ import { Value } from "typebox/value";
 export const MAX_DEPTH = 3;
 export const NAME_PATTERN = "^[a-z0-9][a-z0-9-]{0,39}$";
 
+export const DisplayMode = Type.Union([
+	Type.Literal("auto"),
+	Type.Literal("panes"),
+	Type.Literal("widget"),
+]);
+export const DisplayModeEntry = Type.Object(
+	{ v: Type.Literal(1), mode: DisplayMode },
+	{ additionalProperties: false },
+);
+
 const Obj = <P extends TProperties>(p: P) =>
 	Type.Object(p, { additionalProperties: false });
 const Rec = <V extends TSchema>(
@@ -334,6 +344,7 @@ export type ProcessIdentity = Static<typeof ProcessIdentity>;
 export type AgentDef = Static<typeof AgentDef>;
 export type ProfileDef = Static<typeof ProfileDef>;
 export type ToolSource = Static<typeof ToolSource>;
+export type DisplayMode = Static<typeof DisplayMode>;
 export type Catalog = Static<typeof Catalog>;
 export type LaunchDraft = Static<typeof LaunchDraft>;
 export type Launch = Static<typeof Launch>;

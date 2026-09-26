@@ -92,6 +92,15 @@ function marker(
 		name: "worker",
 	});
 }
+
+test("reader rejects an invalid display mode record", (t) => {
+	const f = fixture(t);
+	const file = f.put([
+		f.header,
+		custom("mode", null, "subagent_display_mode", { v: 1, mode: "unknown" }),
+	]);
+	assert.throws(() => readBranch(file), /subagent_display_mode|mode/);
+});
 function assistant(
 	id: string,
 	parentId: string | null,

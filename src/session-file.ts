@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	ChildEntry,
+	DisplayModeEntry,
 	type Launch,
 	parseStrict,
 	RegistryRecord,
@@ -144,6 +145,8 @@ function validateExtractionFields(
 				parseStrict(RegistryRecord, entry.data, where);
 			if (entry.customType === "subagent_child")
 				parseStrict(ChildEntry, entry.data, where);
+			if (entry.customType === "subagent_display_mode")
+				parseStrict(DisplayModeEntry, entry.data, where);
 		} else deliveryId(entry.details);
 	}
 	if (entry.type !== "message") return;
