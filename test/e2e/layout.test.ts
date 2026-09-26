@@ -399,16 +399,13 @@ test("19.3.27: killed test parent leaves an open orphan and one stopped recovery
 		"undelivered",
 		child.spec.spawnerSessionId,
 	);
-	await run.waitFor(
-		() => existsSync(folder) && readdirSync(folder).length === 1,
-		"one stopped recovery record",
-	);
-	const files = readdirSync(folder);
-	assert.deepEqual(files, [`${child.spec.runId}.json`]);
-	const record = readJsonStrict(
-		UndeliveredRecord,
-		join(folder, files[0] as string),
-	);
+	const recordName = `${child.spec.runId}.json`;
+	const recordFile = join(folder, recordName);
+	// A lone temporary file also makes the directory length 1.
+	// Wait for the renamed record. Then require that exact file.
+	await run.waitFor(() => existsSync(recordFile), "stopped recovery record");
+	assert.deepEqual(readdirSync(folder), [recordName]);
+	const record = readJsonStrict(UndeliveredRecord, recordFile);
 	assert.equal(record.kind, "stopped");
 	assert.deepEqual(record.launch, child.spec.launch);
 	assert.equal(record.runId, child.spec.runId);

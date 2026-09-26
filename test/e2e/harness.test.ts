@@ -135,8 +135,10 @@ for (const failure of ["diagnostic", "retention"] as const)
 test("scenario retains files when external pane identity cannot be proved", async (t) => {
 	let root: string | undefined;
 	t.after(() => {
-		if (root !== undefined && existsSync(root))
-			rmSync(root, { recursive: true });
+		if (root === undefined || !existsSync(root)) return;
+		// macOS can report ENOTEMPTY while the killed pane's last files settle.
+		// Retry the removal. A directory that remains is still an error.
+		rmSync(root, { recursive: true, maxRetries: 5, retryDelay: 100 });
 	});
 	await t.test("retained scenario", async (t) => {
 		const run = await scenario(t, { prompt: "Retained session." });
