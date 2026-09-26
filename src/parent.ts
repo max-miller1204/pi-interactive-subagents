@@ -25,6 +25,7 @@ import { Deliverer, type Item, type Source } from "./delivery.ts";
 import { type LaunchPlan, launchRun, type StartedRun } from "./launch.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import * as queue from "./queue.ts";
+import { readRunBackend } from "./run-backend.ts";
 import {
 	ChildStatus,
 	Fatal,
@@ -32,7 +33,7 @@ import {
 	LaunchState,
 	MAX_DEPTH,
 	OpenQuestion,
-	PaneFile,
+	type PaneFile,
 	type ProcessIdentity,
 	parseStrict,
 	ResultDetails,
@@ -310,10 +311,13 @@ export class Runtime {
 			}
 			try {
 				const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
-				const pane = readJsonStrict(PaneFile, join(runDir, "pane.json"));
+				const backend = readRunBackend(runDir);
+				if (backend.kind !== "pane")
+					throw new Error(`Widget backend is not active for ${runDir}.`);
+				const pane = backend.pane;
 				if (spec.runId !== name || spec.ownerKey !== this.ownerKey)
 					throw new Error(`Run identity does not match ${runDir}.`);
-				this.attach({ runDir, spec, pane });
+				this.attach({ runDir, spec, pane, backend });
 			} catch (error) {
 				this.notify(error);
 			}
@@ -1079,7 +1083,10 @@ export class Runtime {
 				}
 				try {
 					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
-					const pane = readJsonStrict(PaneFile, join(runDir, "pane.json"));
+					const backend = readRunBackend(runDir);
+					if (backend.kind !== "pane")
+						throw new Error(`Widget backend is not active for ${runDir}.`);
+					const pane = backend.pane;
 					if (spec.runId !== id)
 						throw new Error(`Run identity does not match ${runDir}.`);
 					if (this.alive(pane.process)) continue;
@@ -1093,7 +1100,7 @@ export class Runtime {
 						await this.tmux.run(["kill-pane", "-t", pane.paneId]);
 						if (this.disposed) return;
 					}
-					if (this.acknowledged({ runDir, spec, pane })) {
+					if (this.acknowledged({ runDir, spec, pane, backend })) {
 						rmSync(runDir, { recursive: true });
 						continue;
 					}
@@ -1101,7 +1108,7 @@ export class Runtime {
 						? "result"
 						: "stopped";
 					this.storeUndelivered(
-						{ runDir, spec, pane },
+						{ runDir, spec, pane, backend },
 						spec.spawnerSessionId,
 						kind,
 					);

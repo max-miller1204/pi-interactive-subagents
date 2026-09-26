@@ -148,6 +148,16 @@ export const PaneFile = Obj({
 	process: ProcessIdentity,
 	server: TmuxServerIdentity,
 });
+export const RunBackendRecord = Type.Union([
+	Obj({ v: Type.Literal(1), kind: Type.Literal("pane"), pane: PaneFile }),
+	Obj({
+		v: Type.Literal(1),
+		kind: Type.Literal("widget"),
+		supervisor: ProcessIdentity,
+		child: ProcessIdentity,
+		socket: AbsPath,
+	}),
+]);
 export const InboxItem = Type.Union([
 	Obj({
 		v: Type.Literal(1),
@@ -351,6 +361,7 @@ export type Launch = Static<typeof Launch>;
 export type RunSpec = Static<typeof RunSpec>;
 export type LaunchState = Static<typeof LaunchState>;
 export type PaneFile = Static<typeof PaneFile>;
+export type RunBackendRecord = Static<typeof RunBackendRecord>;
 export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;
 export type ParentMessageDetails = Static<typeof ParentMessageDetails>;

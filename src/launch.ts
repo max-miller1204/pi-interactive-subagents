@@ -10,6 +10,7 @@ import { isAbsolute, join } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { processIdentity } from "./process.ts";
+import { type RunBackend, writeRunBackend } from "./run-backend.ts";
 import {
 	Launch,
 	LaunchDraft,
@@ -157,6 +158,7 @@ export interface StartedRun {
 	runDir: string;
 	spec: RunSpec;
 	pane: PaneFile;
+	backend: RunBackend;
 }
 
 // The runtime checks the tmux version once before it supplies this context.
@@ -492,7 +494,9 @@ export async function launchRun(
 			checkDisposed(context, name);
 		}
 		writeJsonAtomic(join(runDir, "pane.json"), pane);
-		const result = { runDir, spec, pane };
+		const backend: RunBackend = { kind: "pane", pane };
+		writeRunBackend(runDir, backend);
+		const result = { runDir, spec, pane, backend };
 		context.commit(result);
 		context.appendRegistry(
 			parseStrict(
