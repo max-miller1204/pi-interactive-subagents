@@ -18,7 +18,11 @@ import { type RuntimeDeps as ParentDeps, Runtime } from "./parent.ts";
 import { processAlive, processIdentity } from "./process.ts";
 import { MAX_DEPTH } from "./schema.ts";
 import { createTmux } from "./tmux.ts";
-import { registerCommand, registerTools } from "./tools.ts";
+import {
+	registerCommand,
+	registerSubagentsCommand,
+	registerTools,
+} from "./tools.ts";
 import { createWidget, registerRenderers } from "./ui.ts";
 
 export interface RuntimeDeps extends ParentDeps {
@@ -59,6 +63,7 @@ interface ActiveRuntime {
 	parent?: Runtime;
 	startup?: ChildStartup;
 	child?: ReturnType<typeof installChildRole>;
+	closeViewer?: () => void;
 	disposed: boolean;
 	startupCompletion: Promise<void>;
 	shutdown(reason: Parameters<Runtime["onShutdown"]>[0]): Promise<void>;
@@ -82,6 +87,7 @@ export function createSubagentsExtension(
 			startupCompletion: completion.promise,
 			async shutdown(reason) {
 				current.disposed = true;
+				current.closeViewer?.();
 				const errors: unknown[] = [];
 				try {
 					await current.parent?.onShutdown(reason);
@@ -144,6 +150,8 @@ export function createSubagentsExtension(
 						});
 			registerTools(pi, parent, () => catalog, undefined, spec);
 			registerCommand(pi, parent, () => catalog, undefined, spec);
+			if (ctx.mode === "tui")
+				current.closeViewer = registerSubagentsCommand(pi, parent).close;
 			if (
 				spec !== undefined &&
 				(spec.launch.nested === null || spec.launch.depth >= MAX_DEPTH)
@@ -208,9 +216,19 @@ export function createSubagentsExtension(
 	pi.on("message_end", (event) => {
 		runtime?.child?.onMessageEnd(event);
 	});
+	pi.on("message_start", (event) => runtime?.child?.onMessageStart(event));
+	pi.on("message_update", (event) => runtime?.child?.onMessageUpdate(event));
+	pi.on("tool_execution_start", (event) => runtime?.child?.onToolStart(event));
+	pi.on("tool_execution_end", (event) => runtime?.child?.onToolEnd(event));
 	pi.on("tool_call", () => runtime?.startup?.onToolCall());
-	pi.on("session_before_switch", () => runtime?.child?.onBeforeSwitch());
-	pi.on("session_before_fork", () => runtime?.child?.onBeforeFork());
+	pi.on("session_before_switch", () => {
+		runtime?.closeViewer?.();
+		return runtime?.child?.onBeforeSwitch();
+	});
+	pi.on("session_before_fork", () => {
+		runtime?.closeViewer?.();
+		return runtime?.child?.onBeforeFork();
+	});
 	pi.on("session_tree", () => {
 		runtime?.child?.onTree();
 	});

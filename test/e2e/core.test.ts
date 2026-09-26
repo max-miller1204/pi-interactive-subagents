@@ -10,6 +10,7 @@ import {
 	OpenQuestion,
 	parseStrict,
 	ResultDetails,
+	RunBackendRecord,
 	RunSpec,
 	readJsonStrict,
 	UndeliveredRecord,
@@ -25,6 +26,67 @@ import {
 const agent = (autoExit = true) =>
 	`---\ndescription: E2E worker.\ntools: []\nauto-exit: ${autoExit}\n---\nAnswer the task.\n`;
 const script = (steps: unknown[]) => `#script ${JSON.stringify(steps)}`;
+
+test("explicit widget mode starts a widget inside tmux", async (t) => {
+	const run = await scenario(t, {
+		agents: { worker: agent() },
+		prompt: script([{ say: "Ready to set mode." }]),
+	});
+	const screen = () =>
+		run.tmux(["capture-pane", "-p", "-J", "-t", run.parentPane]);
+	await run.waitFor(
+		() =>
+			existsSync(run.parentFile) &&
+			run
+				.readParent()
+				.some(
+					(entry) =>
+						entry.type === "message" && entry.message.role === "assistant",
+				),
+		"parent idle",
+	);
+	await run.sendKeys(run.parentPane, "/subagents");
+	await run.waitFor(
+		async () => (await screen()).includes("Mode: auto"),
+		"mode menu",
+	);
+	await run.tmux(["send-keys", "-t", run.parentPane, "Enter"]);
+	await run.waitFor(
+		async () => (await screen()).includes("Display mode for new subagents"),
+		"mode choices",
+	);
+	await run.tmux(["send-keys", "-t", run.parentPane, "Down", "Down", "Enter"]);
+	await run.waitFor(
+		async () => (await screen()).includes("Mode: widget"),
+		"widget mode selection",
+	);
+	await run.tmux(["send-keys", "-t", run.parentPane, "Escape"]);
+	await run.waitFor(
+		async () => !(await screen()).includes("Mode: widget"),
+		"main editor",
+	);
+	await run.sendKeys(
+		run.parentPane,
+		script([spawn(script([{ say: "Widget in tmux." }]))]),
+	);
+	const active = await liveRun(run);
+	const backend = await run.waitFor(
+		() =>
+			existsSync(join(active.path, "backend.json"))
+				? readJsonStrict(RunBackendRecord, join(active.path, "backend.json"))
+				: undefined,
+		"widget backend in tmux",
+	);
+	assert.equal(backend.kind, "widget");
+	assert.equal(existsSync(join(active.path, "pane.json")), false);
+	assert.equal(
+		(
+			await run.tmux(["list-panes", "-t", run.parentPane, "-F", "#{pane_id}"])
+		).split("\n").length,
+		1,
+	);
+	assert.equal((await result(run)).status, "completed");
+});
 const spawn = (task: string, name = "worker") => ({
 	call: "subagent",
 	args: { agent: "worker", profile: "test", task, name },
@@ -831,7 +893,12 @@ test("reload reattaches a waiting child and delivers its result once", async (t)
 
 function otherSessions(run: Scenario, child: string): string[] {
 	return readdirSync(run.root, { recursive: true, encoding: "utf8" })
-		.filter((name) => typeof name === "string" && name.endsWith(".jsonl"))
+		.filter(
+			(name) =>
+				typeof name === "string" &&
+				name.endsWith(".jsonl") &&
+				!name.endsWith("view.jsonl"),
+		)
 		.map((name) => join(run.root, name))
 		.filter((file) => file !== run.parentFile && file !== child);
 }

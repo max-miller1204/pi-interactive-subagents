@@ -37,6 +37,7 @@ import {
 	readJsonStrict,
 	writeJsonAtomic,
 } from "../../src/schema.ts";
+import { readViewRecords } from "../../src/view-stream.ts";
 
 function present<T>(value: T | undefined | null): T {
 	assert.ok(value !== undefined && value !== null);
@@ -420,6 +421,26 @@ test("argv input leaves auto-exit on, later human input persists takeover once",
 	f.start();
 	assert.equal(f.statuses.at(-1), "subagent worker-1 · auto-exit off");
 });
+test("a human inbox message keeps its sender and disables auto-exit", (t) => {
+	const f = fixture(t);
+	f.start();
+	queue.put(join(f.runDir, "inbox"), "inbox", {
+		v: 1,
+		kind: "message",
+		text: "Check this",
+		source: "human",
+	});
+	f.runtime.deliverer.pump();
+	assert.equal(
+		readJsonStrict(ChildStatus, join(f.runDir, "status.json")).human,
+		true,
+	);
+	assert.ok(
+		f.entries.some(
+			(entry) => entry.type === "custom" && entry.data?.kind === "human",
+		),
+	);
+});
 test("wrong first input reports takeover and restored user messages count as initial input", (t) => {
 	const f = fixture(t);
 	let child = f.start();
@@ -450,9 +471,7 @@ test("guards cancel switch and fork, and tree adds a leaf marker", (t) => {
 	});
 	assert.deepEqual(
 		f.notices,
-		Array(2).fill(
-			"This pane is a subagent. Pi cannot switch or fork its session.",
-		),
+		Array(2).fill("This subagent cannot switch or fork its Pi session."),
 	);
 });
 test("status tracks working, question wait, settled and context usage", async (t) => {
@@ -476,6 +495,58 @@ test("status tracks working, question wait, settled and context usage", async (t
 	assert.equal(status().contextTokens, null);
 	child.onAgentSettled();
 	assert.equal(status().state, "waiting");
+});
+test("child writes ordered live messages and resumes view sequence after reload", (t) => {
+	const f = fixture(t);
+	let child = f.start();
+	child.onMessageStart({
+		message: { role: "assistant", content: [{ type: "text", text: "" }] },
+	});
+	child.onMessageUpdate({
+		message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+	});
+	child.onToolStart({
+		toolCallId: "call-1",
+		toolName: "read",
+		args: { path: "a" },
+	});
+	child.onToolEnd({
+		toolCallId: "call-1",
+		toolName: "read",
+		result: { content: "done" },
+		isError: false,
+	});
+	child.onMessageEnd({
+		message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+	});
+	assert.deepEqual(
+		readViewRecords(f.runDir, 0, true, f.runId).map((row) => row.seq),
+		[1, 2, 3, 4, 5],
+	);
+	child.dispose();
+	child = f.start();
+	child.onMessageStart({ message: { role: "user", content: "More" } });
+	assert.equal(
+		readViewRecords(f.runDir, 5, true, f.runId)[0]?.messageOrdinal,
+		2,
+	);
+});
+test("large tool output keeps the view stream readable and ordered", (t) => {
+	const f = fixture(t);
+	const child = f.start();
+	child.onToolEnd({
+		toolCallId: "image-1",
+		toolName: "image",
+		result: { data: "x".repeat(2 * 1024 * 1024) },
+		isError: false,
+	});
+	child.onMessageStart({ message: { role: "assistant", content: "Done" } });
+	const records = readViewRecords(f.runDir, 0, true, f.runId);
+	assert.deepEqual(
+		records.map((row) => row.seq),
+		[1, 2],
+	);
+	assert.match(records[0]?.text ?? "", /\[view text truncated\]$/);
 });
 test("inbox timer uses the task gate and starts at 250 ms", (t) => {
 	t.mock.timers.enable({ apis: ["setInterval"] });

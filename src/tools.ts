@@ -9,6 +9,10 @@ import {
 	type ResolveLaunchOptions,
 	resolveLaunch,
 } from "./catalog.ts";
+import {
+	type ConversationViewer,
+	createConversationViewer,
+} from "./conversation-viewer.ts";
 import { defaultName, type Runtime } from "./parent.ts";
 import type { Catalog } from "./schema.ts";
 import { registerToolRenderers } from "./ui.ts";
@@ -125,9 +129,9 @@ export function registerTools(
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Start a subagent in a new tmux pane. It returns at once. The result arrives later as a message.",
+			"Start an interactive subagent. It returns at once. The result arrives later as a message.",
 		promptSnippet:
-			"subagent: start a named subagent in a tmux pane; its result arrives later as a message",
+			"subagent: start a named interactive subagent; its result arrives later as a message",
 		promptGuidelines: [...rules, ...next.split("\n")],
 		parameters: subagentParameters,
 		executionMode: "sequential",
@@ -148,12 +152,15 @@ export function registerTools(
 			);
 			const started = await runtime.spawn(draft, args.task, toolCallId);
 			const { runId, launch } = started.spec;
-			const paneId = started.pane.paneId;
+			const place =
+				started.backend.kind === "pane"
+					? `pane ${started.backend.pane.paneId}`
+					: "the subagent viewer";
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in pane ${paneId}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : " A human works with it in the pane. The result arrives when the pane closes."}`,
+						text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in ${place}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : started.backend.kind === "pane" ? " A human works with it in the pane. The result arrives when the pane closes." : " A human can work with it in the viewer. The result arrives when the run closes."}`,
 					},
 				],
 				details: {
@@ -161,7 +168,9 @@ export function registerTools(
 					name,
 					agent: args.agent,
 					profile: args.profile,
-					paneId,
+					...(started.backend.kind === "pane"
+						? { paneId: started.backend.pane.paneId }
+						: {}),
 					childSessionFile: launch.childSessionFile,
 				},
 			};
@@ -285,4 +294,69 @@ export function registerCommand(
 			}
 		},
 	});
+}
+
+export function registerSubagentsCommand(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+): { close(): void } {
+	let viewer: ConversationViewer | undefined;
+	pi.registerCommand("subagents", {
+		description: "View subagents and choose the session display mode.",
+		async handler(_args, ctx) {
+			for (;;) {
+				const listing = runtime.list();
+				const rows = [
+					`Mode: ${runtime.displayMode()}`,
+					...listing.live.map((run) => `Run: ${run.name} (${run.phase})`),
+					...[...listing.branch]
+						.filter(([name]) => !listing.live.some((run) => run.name === name))
+						.map(([name]) => `Run: ${name} (finished)`),
+					"Close",
+				];
+				const selection = await ctx.ui.select("Subagents", rows);
+				if (selection === undefined || selection === "Close") return;
+				if (selection.startsWith("Mode: ")) {
+					const mode = await ctx.ui.select("Display mode for new subagents", [
+						"auto",
+						"panes",
+						"widget",
+					]);
+					if (mode === undefined) continue;
+					try {
+						runtime.setDisplayMode(mode as "auto" | "panes" | "widget");
+					} catch (error) {
+						ctx.ui.notify(
+							error instanceof Error ? error.message : String(error),
+							"error",
+						);
+					}
+					continue;
+				}
+				const match = /^Run: ([a-z0-9][a-z0-9-]*) \(/.exec(selection);
+				if (match === null)
+					throw new Error(`Invalid subagent selection: ${selection}.`);
+				const name = match[1] as string;
+				await ctx.ui.custom<void>(
+					(tui, theme, _keybindings, done) => {
+						viewer = createConversationViewer(runtime, name, tui, theme, () =>
+							done(),
+						);
+						return viewer;
+					},
+					{
+						overlay: true,
+						overlayOptions: { width: "90%", maxHeight: "90%", margin: 1 },
+					},
+				);
+				viewer = undefined;
+			}
+		},
+	});
+	return {
+		close() {
+			viewer?.close();
+			viewer = undefined;
+		},
+	};
 }

@@ -158,13 +158,30 @@ for (const mode of ["print", "json", "rpc"] as const)
 			},
 		]);
 	});
-for (const disabled of ["tmux", "session"] as const)
+test("RPC child with a valid run spec enables its subagent role", async (t) => {
+	const h = await createRuntimeHarness(t, {
+		child: true,
+		mode: "rpc",
+		disabled: "tmux",
+	});
+	assert.equal(
+		h.notices.some((notice) => notice.message.startsWith("Subagents are off")),
+		false,
+	);
+	assert.ok(h.session.getActiveToolNames().includes("ask_question"));
+});
+for (const disabled of ["session"] as const)
 	test(`TUI parent without ${disabled} disables spawn tools`, async (t) => {
 		const h = await createRuntimeHarness(t, { disabled });
 		assert.deepEqual(h.session.getActiveToolNames(), []);
 		assert.equal(h.notices.length, 1);
 		assert.equal(h.notices[0]?.type, "info");
 	});
+test("TUI parent outside tmux keeps subagent tools active", async (t) => {
+	const h = await createRuntimeHarness(t, { disabled: "tmux" });
+	assert.ok(h.session.getActiveToolNames().includes("subagent"));
+	assert.equal(h.notices.length, 0);
+});
 test("valid TUI parent registers tools, command, renderers and one widget before its file exists", async (t) => {
 	const h = await createRuntimeHarness(t);
 	assert.deepEqual(h.session.getActiveToolNames().toSorted(), [
@@ -910,7 +927,11 @@ test("a prompt settled during suspended recovery does not block ready notices", 
 		release.resolve();
 		await startup;
 	}
-	await until(() => snapshots >= 3, "The enabled parent did not tick twice.");
+	await until(
+		() => h.messages("subagent_notice").length === 1,
+		"The enabled parent did not deliver the ready notice.",
+	);
+	assert.equal(snapshots, 1);
 	assert.equal(
 		h.messages("subagent_notice").length,
 		1,
@@ -919,6 +940,10 @@ test("a prompt settled during suspended recovery does not block ready notices", 
 	assert.equal(h.faux.state.callCount, 1);
 	assert.equal(h.events.filter((event) => event === "agent_start").length, 1);
 	assert.equal(h.events.filter((event) => event === "agent_settled").length, 1);
+	await until(
+		() => !existsSync(noticeFile),
+		"The ready notice was not acknowledged.",
+	);
 	assert.equal(existsSync(noticeFile), false);
 	h.assertNoErrors();
 });

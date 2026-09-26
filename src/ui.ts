@@ -38,7 +38,7 @@ export function resultContent(details: ResultDetails): string {
 			state = "ended without output";
 			break;
 		case "closed":
-			state = `was closed in its pane${!details.autoExit && details.text.length > 0 ? " by a human" : ""}`;
+			state = `was closed in its ${details.backend === "widget" ? "viewer" : "pane"}${!details.autoExit && details.text.length > 0 ? " by a human" : ""}`;
 			break;
 		case "failed":
 			state = `could not start: ${details.errorMessage}`;
@@ -266,7 +266,7 @@ export function registerRenderers(
 			return new Text(
 				theme.fg(
 					"accent",
-					`Parent message: ${d.kind}${d.kind === "answer" ? ` ${d.qid}` : ""}`,
+					`${d.source === "human" ? "Human" : "Parent"} message: ${d.kind}${d.kind === "answer" ? ` ${d.qid}` : ""}`,
 				) + (expanded ? `\n${d.text}` : ""),
 				0,
 				0,

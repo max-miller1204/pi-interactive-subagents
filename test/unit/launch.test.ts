@@ -37,6 +37,7 @@ import {
 	LaunchState,
 	PaneFile,
 	parseStrict,
+	RunBackendRecord,
 	RunSpec,
 	readJsonStrict,
 } from "../../src/schema.ts";
@@ -469,6 +470,11 @@ test("launch transaction prepares private files, preserves focus and commits pan
 	assert.ok(f.names.has("scout-1"));
 	assert.equal(f.calls.length, 0);
 	const result = await pending;
+	assert.deepEqual(result.backend, { kind: "pane", pane: result.pane });
+	assert.deepEqual(
+		readJsonStrict(RunBackendRecord, join(f.runDir, "backend.json")),
+		{ v: 1, kind: "pane", pane: result.pane },
+	);
 	assert.deepEqual(f.calls, [
 		[
 			"split-window",

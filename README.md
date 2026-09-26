@@ -1,7 +1,7 @@
 # pi-interactive-subagents
 
 Interactive subagents for [Pi](https://pi.dev).
-Each subagent runs in its own tmux pane.
+Each subagent runs in a tmux pane or a Pi conversation viewer.
 The parent starts it and keeps working.
 The result comes back later as a message.
 A status line above the editor shows each live subagent.
@@ -17,8 +17,7 @@ It needs Pi 0.87.
 ## Requirements
 
 Install Pi 0.87.
-Install tmux 3.3 or newer.
-Start Pi inside tmux.
+Install tmux 3.3 or newer if you want pane mode.
 Use a saved Pi session.
 Do not pass `--no-session`.
 A different Pi version stops Pi at startup with this error:
@@ -27,8 +26,8 @@ A different Pi version stops Pi at startup with this error:
 pi-interactive-subagents 4 needs Pi 0.87. This Pi is <version>. Install Pi 0.87, or update pi-interactive-subagents.
 ```
 
-Print mode, JSON mode, and RPC mode turn subagent tools off.
-Pi outside tmux turns them off.
+Print mode and JSON mode turn subagent tools off.
+RPC mode turns them off for the parent. A widget child uses RPC mode to run its task.
 Pi shows one notice that names the reason.
 
 ## Install
@@ -64,10 +63,24 @@ Replace `provider/model-id` with a model that this Pi can use.
 `thinking` must be a level that model supports.
 The allowed levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 
-Start tmux.
-Start Pi inside that tmux session.
+Start Pi in a terminal.
 Ask Pi to spawn the bundled `scout` agent with the `quick` profile.
-Pi opens a pane, runs the task, and returns the result in the parent session.
+Pi opens a tmux pane when tmux is active. Otherwise, Pi starts a widget child.
+Pi returns the result in the parent session.
+
+Run `/subagents` to view a child conversation or change the display mode.
+The mode applies to new subagents in the current Pi session.
+`auto` is the default. It uses panes inside tmux and the widget outside tmux.
+Choose `widget` to use the conversation viewer inside tmux.
+Choose `panes` to require tmux. A launch outside tmux then fails with an error.
+Changing the mode does not move a running subagent.
+
+In the `/subagents` menu, select a run to open its conversation.
+Type a message and press Enter to send it to the child.
+Press Tab to choose an open question before you send an answer.
+Press Ctrl-X, then `y`, to stop the child.
+Press Esc to close the viewer. The child keeps running.
+Use PgUp, PgDn, and End to move through the conversation.
 
 ## Tools
 
@@ -101,7 +114,7 @@ When you omit `name`, Pi uses `<agent>-1`, then `<agent>-2`, and so on.
 The default is the current directory.
 Unknown fields are rejected.
 
-The tool returns as soon as the pane starts.
+The tool returns as soon as the subagent starts.
 Do not poll, sleep, or call `subagents_list` to wait.
 End the turn.
 The result starts a new turn.
@@ -119,7 +132,7 @@ subagent_message({
 ```
 
 A message to a live subagent waits until that subagent can read it.
-A message to a finished subagent resumes that subagent in a new pane.
+A message to a finished subagent resumes it in the current display mode.
 Resume keeps the original tools, extensions, skills, model, thinking level, and prompt.
 Pass `question_id` to answer one open question.
 The id looks like `q-1a2b3c4d`.
@@ -298,14 +311,15 @@ A spawn past depth 3 throws.
 
 ## Lifecycle
 
-`auto-exit: true` closes the pane when the subagent finishes a normal turn.
+`auto-exit: true` closes the subagent when it finishes a normal turn.
 It stays open while a question is unanswered, a nested subagent is still running, a message is still unread, or a delivery is still in progress.
 An abort or a tool call does not close it.
 A fatal startup error closes it with a failed result.
 
-Set `auto-exit: false` when a human should keep the pane.
-The parent receives the result when the human closes the pane.
+Set `auto-exit: false` when a human should keep the subagent open.
+The parent receives the result when the human stops the subagent.
 If a human types into an `auto-exit: true` pane, auto-exit turns off for that run.
+A message sent from the widget viewer also turns auto-exit off for that run.
 
 A question blocks inside `ask_question`.
 The subagent cannot exit with that question still open.
@@ -327,25 +341,25 @@ Statuses:
 | `error` | The model returned an error. |
 | `aborted` | The turn was interrupted. |
 | `crashed` | The process exited with a code or a signal. |
-| `closed` | The pane was closed. |
+| `closed` | The subagent was stopped. |
 | `no_output` | The process ended with no assistant reply. |
 | `failed` | The subagent could not start. |
 
-A `closed` result for `auto-exit: false` is the normal human ending when the pane has final text.
+A `closed` result for `auto-exit: false` is the normal human ending when the subagent has final text.
 
 ## Reload, new, resume, fork, and quit
 
 `/reload`, `/new`, `/resume`, and `/fork` do not stop children.
-The new runtime reads the run files and keeps the panes.
+The new runtime reads the run files and reconnects to the live subagents.
 Results still arrive.
 A result for a run that this session does not know yet is adopted.
 The name stays usable with `subagent_message`.
 
 `/tree` to a point before a spawn hides that name on the branch.
-The live pane stays up and can still deliver.
+The live subagent stays up and can still deliver.
 
 Only a real quit stops children.
-Quit closes each verified child pane.
+Quit stops each verified child.
 Each child then stops its own children.
 Pi writes a line to stderr that names the stopped subagents.
 Open the same session again.
@@ -357,8 +371,8 @@ If quit happens before the session has any assistant reply, Pi says the session 
 The stderr line then lists the child session files.
 
 A parent crash does not quit the children.
-Each child shows an error and stays open.
-You can continue work in that pane.
+Each child stays open. A pane child shows an error.
+You can continue work in the pane or reopen the widget viewer after recovery.
 Parent messaging and auto-exit stop.
 Session switching and forking remain blocked.
 The next Pi startup records the stopped runs.
@@ -382,17 +396,22 @@ Each run has a directory under that owner.
 | File | Role |
 | --- | --- |
 | `spec.json` | The launch record. The child reads it at startup. |
+| `backend.json` | The selected pane or widget backend and its process identity. |
 | `launch-state.json` | The launch phase used to clean incomplete runs after restart. |
 | `system-prompt.md` | The child system prompt. |
 | `launch.sh` | The pane command. It deletes itself after it starts. |
-| `pane.json` | The tmux pane and process identity. It exists after a completed launch. |
+| `pane.json` | A legacy pane record. New runs use `backend.json`. |
+| `widget-start-*.json` | The private widget supervisor start request. |
+| `widget-ready.json` | The supervisor and child identities and socket path. |
+| `widget-exit.json` | The child exit code or signal. |
+| `view.jsonl` | A bounded stream of child conversation updates for the viewer. |
 | `inbox/` | Messages from the parent to the child. |
 | `outbox/` | Questions from the child to the parent. |
 | `questions/` | Open questions. |
 | `status.json` | `starting`, `working`, or `waiting`, plus question and human flags. |
 | `fatal.json` | The startup or child timer error. |
 | `result.json` | The result waiting for delivery. |
-| `delivery-ack.json` | Proof that the result was saved while pane cleanup is still pending. |
+| `delivery-ack.json` | Proof that the result was saved while backend cleanup is still pending. |
 
 Quit and crash recovery files are in `subagent-runs/undelivered/<sessionId>/`.
 Pi deletes a queue file only after the receiving session has saved that delivery.
@@ -403,7 +422,7 @@ Then read the child session file named in the result.
 A bad JSON file throws and names its path.
 Do not delete a run directory while its pane or process is still alive.
 An incomplete run with a verified `preparing` or `cleanup-confirmed` phase is removed at startup.
-An attempted pane without `pane.json` needs manual recovery.
+An attempted launch without `backend.json` needs manual recovery.
 Pi reports its run directory and reserves its name until the pane and process are checked.
 An older run without `launch-state.json` also needs manual recovery.
 After manual cleanup, reload Pi to clear the reservation.
@@ -412,7 +431,7 @@ After manual cleanup, reload Pi to clear the reservation.
 
 The sandbox stops at extension granularity.
 A parent crash leaves children open in their current sessions.
-No process adopts those live panes.
+The parent cannot receive messages from those subagents until it restarts.
 A message sent after the child decides to exit is listed, not delivered.
 A prompt that starts with `/` can race one delivery.
 A prompt preflight longer than 30 seconds can race one delivery.

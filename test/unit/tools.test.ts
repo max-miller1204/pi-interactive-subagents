@@ -14,7 +14,46 @@ import type { Runtime } from "../../src/parent.ts";
 import type { LaunchDraft } from "../../src/schema.ts";
 import { type AgentDef, Catalog, parseStrict } from "../../src/schema.ts";
 import type { LaunchResolver } from "../../src/tools.ts";
-import { registerCommand, registerTools } from "../../src/tools.ts";
+import {
+	registerCommand,
+	registerSubagentsCommand,
+	registerTools,
+} from "../../src/tools.ts";
+
+test("/subagents shows session mode and saves a new choice", async () => {
+	let handler:
+		| ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
+		| undefined;
+	const pi = {
+		registerCommand: (name: string, command: { handler: typeof handler }) => {
+			if (name === "subagents") handler = command.handler;
+		},
+	} as unknown as ExtensionAPI;
+	let mode = "auto";
+	const runtime = {
+		displayMode: () => mode,
+		setDisplayMode: (choice: string) => {
+			mode = choice;
+		},
+		list: () => ({ live: [], launching: [], reserved: [], branch: new Map() }),
+	} as unknown as Runtime;
+	registerSubagentsCommand(pi, runtime);
+	assert.ok(handler);
+	const titles: string[] = [];
+	const answers = ["Mode: auto", "widget", "Close"];
+	const ctx = {
+		ui: {
+			select: async (title: string) => {
+				titles.push(title);
+				return answers.shift();
+			},
+			notify: () => {},
+		},
+	} as unknown as ExtensionCommandContext;
+	await handler("", ctx);
+	assert.equal(mode, "widget");
+	assert.match(titles[0] ?? "", /Subagents/);
+});
 
 type CapturedTool = Pick<
 	ToolDefinition,
@@ -67,7 +106,7 @@ test("registered tools validate closed parameters and route calls", async () => 
 						autoExit: true,
 					},
 				},
-				pane: { paneId: "%2" },
+				backend: { kind: "pane", pane: { paneId: "%2" } },
 			};
 		},
 		message: async (...args: unknown[]) => {

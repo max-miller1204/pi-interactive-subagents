@@ -13,6 +13,16 @@ import { Value } from "typebox/value";
 export const MAX_DEPTH = 3;
 export const NAME_PATTERN = "^[a-z0-9][a-z0-9-]{0,39}$";
 
+export const DisplayMode = Type.Union([
+	Type.Literal("auto"),
+	Type.Literal("panes"),
+	Type.Literal("widget"),
+]);
+export const DisplayModeEntry = Type.Object(
+	{ v: Type.Literal(1), mode: DisplayMode },
+	{ additionalProperties: false },
+);
+
 const Obj = <P extends TProperties>(p: P) =>
 	Type.Object(p, { additionalProperties: false });
 const Rec = <V extends TSchema>(
@@ -125,6 +135,7 @@ export const LaunchState = Obj({
 	phase: Type.Union([
 		Type.Literal("preparing"),
 		Type.Literal("pane-attempted"),
+		Type.Literal("widget-attempted"),
 		Type.Literal("cleanup-confirmed"),
 	]),
 });
@@ -138,17 +149,77 @@ export const PaneFile = Obj({
 	process: ProcessIdentity,
 	server: TmuxServerIdentity,
 });
+export const RunBackendRecord = Type.Union([
+	Obj({ v: Type.Literal(1), kind: Type.Literal("pane"), pane: PaneFile }),
+	Obj({
+		v: Type.Literal(1),
+		kind: Type.Literal("widget"),
+		supervisor: ProcessIdentity,
+		child: ProcessIdentity,
+		socket: AbsPath,
+	}),
+]);
+export const WidgetExitRecord = Obj({
+	v: Type.Literal(1),
+	runId: Type.String({ format: "uuid" }),
+	exitCode: Type.Union([Type.Integer(), Type.Null()]),
+	signal: Type.Union([Type.String(), Type.Null()]),
+	error: Type.Optional(Type.String({ minLength: 1 })),
+});
+const ViewBase = {
+	v: Type.Literal(1),
+	runId: Type.String({ format: "uuid" }),
+	seq: Type.Integer({ minimum: 1 }),
+	messageOrdinal: Type.Integer({ minimum: 0 }),
+};
+export const ViewRecord = Type.Union([
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_start"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_update"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("message_end"),
+		role: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("tool_start"),
+		toolCallId: Type.String({ minLength: 1 }),
+		toolName: Type.String({ minLength: 1 }),
+		text: Type.String(),
+	}),
+	Obj({
+		...ViewBase,
+		kind: Type.Literal("tool_end"),
+		toolCallId: Type.String({ minLength: 1 }),
+		toolName: Type.String({ minLength: 1 }),
+		text: Type.String(),
+		isError: Type.Boolean(),
+	}),
+]);
 export const InboxItem = Type.Union([
 	Obj({
 		v: Type.Literal(1),
 		kind: Type.Literal("message"),
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 	Obj({
 		v: Type.Literal(1),
 		kind: Type.Literal("answer"),
 		qid: Qid,
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 ]);
 export const ParentMessageDetails = Type.Union([
@@ -156,12 +227,14 @@ export const ParentMessageDetails = Type.Union([
 		deliveryId: Type.String({ minLength: 1 }),
 		kind: Type.Literal("message"),
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 	Obj({
 		deliveryId: Type.String({ minLength: 1 }),
 		kind: Type.Literal("answer"),
 		qid: Qid,
 		text: Type.String({ minLength: 1 }),
+		source: Type.Optional(Type.Literal("human")),
 	}),
 ]);
 export const OutboxItem = Type.Union([
@@ -212,6 +285,9 @@ export const ResultDetails = Obj({
 	name: Name,
 	agent: AgentName,
 	profile: Name,
+	backend: Type.Optional(
+		Type.Union([Type.Literal("pane"), Type.Literal("widget")]),
+	),
 	autoExit: Type.Boolean(),
 	status: ResultStatus,
 	text: Type.String(),
@@ -334,12 +410,16 @@ export type ProcessIdentity = Static<typeof ProcessIdentity>;
 export type AgentDef = Static<typeof AgentDef>;
 export type ProfileDef = Static<typeof ProfileDef>;
 export type ToolSource = Static<typeof ToolSource>;
+export type DisplayMode = Static<typeof DisplayMode>;
 export type Catalog = Static<typeof Catalog>;
 export type LaunchDraft = Static<typeof LaunchDraft>;
 export type Launch = Static<typeof Launch>;
 export type RunSpec = Static<typeof RunSpec>;
 export type LaunchState = Static<typeof LaunchState>;
 export type PaneFile = Static<typeof PaneFile>;
+export type RunBackendRecord = Static<typeof RunBackendRecord>;
+export type WidgetExitRecord = Static<typeof WidgetExitRecord>;
+export type ViewRecord = Static<typeof ViewRecord>;
 export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;
 export type ParentMessageDetails = Static<typeof ParentMessageDetails>;

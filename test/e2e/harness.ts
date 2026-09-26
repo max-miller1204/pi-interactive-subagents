@@ -353,7 +353,12 @@ export async function scenario(
 			t.diagnostic(`Keep ${root} for recovery. ${retentionReasons.join(" ")}`);
 		else {
 			try {
-				rmSync(root, { recursive: true, force: true });
+				rmSync(root, {
+					recursive: true,
+					force: true,
+					maxRetries: 20,
+					retryDelay: 50,
+				});
 			} catch (error) {
 				errors.push(
 					new Error(`Cannot remove test directory ${root}.`, { cause: error }),

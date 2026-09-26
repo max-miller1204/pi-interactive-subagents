@@ -1,5 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import {
+	existsSync,
+	readdirSync,
+	realpathSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
@@ -11,6 +17,7 @@ import { Type } from "typebox";
 import type { Deliverer, Item, Source } from "./delivery.ts";
 import { processAlive } from "./process.ts";
 import * as queue from "./queue.ts";
+import type { ViewRecord } from "./schema.ts";
 import {
 	ChildEntry,
 	ChildStatus,
@@ -23,6 +30,22 @@ import {
 	writeJsonAtomic,
 } from "./schema.ts";
 import { afterMarker, lastAssistant } from "./session-file.ts";
+import { appendViewRecord, readViewRecords } from "./view-stream.ts";
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+	? Omit<T, K>
+	: never;
+type ViewEvent = DistributiveOmit<
+	ViewRecord,
+	"v" | "runId" | "seq" | "messageOrdinal"
+>;
+type ViewMessage = { role: string; content?: unknown };
+
+function boundedViewText(text: string): string {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.length <= 100_000) return text;
+	return `${bytes.subarray(0, 100_000).toString("utf8")}\n[view text truncated]`;
+}
 
 export interface ExitState {
 	autoExit: boolean;
@@ -152,6 +175,9 @@ class ChildRole {
 	private human = false;
 	private state: ChildStatus["state"] = "starting";
 	private contextTokens: number | null = null;
+	private viewSeq = 0;
+	private messageOrdinal = 0;
+	private lastViewUpdateAt = 0;
 	private pumpTimer: ReturnType<typeof setInterval> | undefined;
 	private ownerTimer: ReturnType<typeof setInterval> | undefined;
 	constructor(
@@ -188,6 +214,20 @@ class ChildRole {
 		const branch = afterMarker(ctx.sessionManager.getBranch(), spec.runId);
 		if (branch === undefined)
 			throw new Error(`Missing run marker ${spec.runId}.`);
+		const viewFile = join(runDir, "view.jsonl");
+		if (!existsSync(viewFile))
+			writeFileSync(viewFile, "", { flag: "wx", mode: 0o600 });
+		const records = readViewRecords(runDir, 0, true, spec.runId);
+		this.viewSeq = records.at(-1)?.seq ?? 0;
+		this.messageOrdinal = Math.max(
+			records.at(-1)?.messageOrdinal ?? 0,
+			branch.filter(
+				(entry) =>
+					entry.type === "message" ||
+					(entry.type === "custom_message" &&
+						entry.customType === "subagent_parent_message"),
+			).length,
+		);
 		this.initialSeen = branch.some(
 			(entry) => entry.type === "message" && entry.message.role === "user",
 		);
@@ -196,6 +236,13 @@ class ChildRole {
 				continue;
 			const data = parseStrict(ChildEntry, entry.data, "child entry");
 			if (data.runId === spec.runId && data.kind === "human") this.human = true;
+		}
+		if (
+			spec.initialPrompt.startsWith("Message from the human:") &&
+			!this.human
+		) {
+			this.human = true;
+			this.append({ v: 1, kind: "human", runId: spec.runId });
 		}
 		for (const name of readdirSync(join(runDir, "questions")).filter(
 			(name) => !name.startsWith("."),
@@ -321,6 +368,12 @@ class ChildRole {
 					);
 				if (!entry) throw new Error(`Missing inbox item ${item.id}.`);
 				const message = entry.item;
+				if (message.source === "human" && !this.human) {
+					this.human = true;
+					this.append({ v: 1, kind: "human", runId: spec.runId });
+					this.statusBar();
+					this.writeStatus();
+				}
 				if (message.kind === "answer") {
 					const waiter = this.waiters.get(message.qid);
 					if (waiter)
@@ -338,14 +391,15 @@ class ChildRole {
 						display: true,
 						content:
 							message.kind === "answer"
-								? `Answer from the parent agent to question ${message.qid}, which you withdrew:\n\n${message.text}`
-								: `Message from the parent agent:\n\n${message.text}`,
+								? `Answer from the ${message.source === "human" ? "human" : "parent agent"} to question ${message.qid}, which you withdrew:\n\n${message.text}`
+								: `Message from the ${message.source === "human" ? "human" : "parent agent"}:\n\n${message.text}`,
 						details: parseStrict(
 							ParentMessageDetails,
 							{
 								deliveryId: item.id,
 								kind: message.kind,
 								text: message.text,
+								...(message.source === "human" ? { source: "human" } : {}),
 								...(message.kind === "answer" ? { qid: message.qid } : {}),
 							},
 							"parent message details",
@@ -486,10 +540,93 @@ class ChildRole {
 		this.state = "working";
 		this.writeStatus();
 	}
-	onMessageEnd(event: { message: { role: string } }): void {
+	private viewText(message: ViewMessage): string {
+		const content = message.content;
+		if (typeof content === "string") return boundedViewText(content);
+		if (!Array.isArray(content)) return "";
+		const parts = content.flatMap((part): string[] =>
+			part &&
+			typeof part === "object" &&
+			"text" in part &&
+			typeof part.text === "string"
+				? [part.text]
+				: [],
+		);
+		return boundedViewText(parts.join("\n"));
+	}
+	private view(record: ViewEvent): void {
+		if (!this.active()) return;
+		const { spec, runDir } = this.ready();
+		const seq = this.viewSeq + 1;
+		appendViewRecord(runDir, {
+			v: 1,
+			runId: spec.runId,
+			seq,
+			messageOrdinal: this.messageOrdinal,
+			...record,
+		} as ViewRecord);
+		this.viewSeq = seq;
+	}
+	onMessageStart(event: { message: ViewMessage }): void {
+		if (!this.active()) return;
+		this.messageOrdinal++;
+		this.view({
+			kind: "message_start",
+			role: event.message.role,
+			text: this.viewText(event.message),
+		});
+	}
+	onMessageUpdate(event: { message: ViewMessage }): void {
+		const now = Date.now();
+		if (now - this.lastViewUpdateAt < 50) return;
+		this.lastViewUpdateAt = now;
+		this.view({
+			kind: "message_update",
+			role: event.message.role,
+			text: this.viewText(event.message),
+		});
+	}
+	onMessageEnd(event: { message: ViewMessage }): void {
+		this.view({
+			kind: "message_end",
+			role: event.message.role,
+			text: this.viewText(event.message),
+		});
 		if (!this.active() || event.message.role !== "assistant") return;
 		this.contextTokens = this.ctx.getContextUsage()?.tokens ?? null;
 		this.writeStatus();
+	}
+	onToolStart(event: {
+		toolCallId: string;
+		toolName: string;
+		args: unknown;
+	}): void {
+		const text = JSON.stringify(event.args);
+		if (text === undefined)
+			throw new Error("Tool arguments cannot be shown in the view stream.");
+		this.view({
+			kind: "tool_start",
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			text: boundedViewText(text),
+		});
+	}
+	onToolEnd(event: {
+		toolCallId: string;
+		toolName: string;
+		result: unknown;
+		isError: boolean;
+	}): void {
+		const text = JSON.stringify(event.result);
+		if (text === undefined)
+			throw new Error("Tool result cannot be shown in the view stream.");
+		this.view({
+			kind: "tool_end",
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			text: boundedViewText(text),
+			isError: event.isError,
+		});
 	}
 	get wasInterrupted(): boolean {
 		return this.interrupted;
@@ -532,7 +669,7 @@ class ChildRole {
 	}
 	private guardSession(): { cancel: true } {
 		this.ctx.ui.notify(
-			"This pane is a subagent. Pi cannot switch or fork its session.",
+			"This subagent cannot switch or fork its Pi session.",
 			"error",
 		);
 		return { cancel: true };
