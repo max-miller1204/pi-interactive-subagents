@@ -5,7 +5,7 @@ Use the skill for the feature you change. Run its command from the repository ro
 | Feature | Skill | Main end-to-end evidence |
 | --- | --- | --- |
 | Spawn, task order, result, status | `e2e-spawn-and-results` | `core.test.ts`, `provider.test.ts` |
-| Widget launch, viewer, message, question, stop, nested spawn, resume, reload, crash | `e2e-spawn-and-results`, `e2e-messages-and-questions`, `e2e-session-recovery`, `e2e-failures-and-cleanup` | `widget.test.ts` |
+| Widget launch, display mode, viewer, message, question, stop, nested spawn, resume, reload, crash | `e2e-widget-and-display-mode` | `widget.test.ts`, `core.test.ts` |
 | Steering, inbox order, questions, answers | `e2e-messages-and-questions` | `core.test.ts` |
 | Columns, nested panes, sibling launches | `e2e-pane-layout-and-nesting` | `column.test.ts`, `layout.test.ts`, `pane-start.test.ts` |
 | Reload, new session, fork, resume, quit | `e2e-session-recovery` | `core.test.ts`, `lifecycle.test.ts` |
