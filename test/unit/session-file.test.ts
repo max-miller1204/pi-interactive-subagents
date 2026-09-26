@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs, {
-	appendFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -440,10 +439,19 @@ test("reader rejects non-session headers and unsupported versions", (t) => {
 	assert.throws(() => readBranch(f.parent), /not a Pi session/);
 });
 
-test("reader accepts empty lines after the header but never skips corrupt entries", (t) => {
+test("reader rejects blank lines after the header", (t) => {
 	const f = fixture(t);
-	appendFileSync(f.parent, `\n${JSON.stringify(custom("root", null))}\n\n`);
-	assert.deepEqual(readBranch(f.parent), [custom("root", null)]);
+	for (const tail of ["\n", `\n${JSON.stringify(custom("root", null))}\n`]) {
+		writeFileSync(f.parent, `${JSON.stringify(f.header)}\n${tail}`);
+		assert.throws(() => readBranch(f.parent), {
+			message: `${f.parent}: line 2 is blank.`,
+		});
+	}
+	assert.deepEqual(readBranch(f.put([f.header])), []);
+});
+
+test("reader never skips corrupt entries", (t) => {
+	const f = fixture(t);
 	for (const entry of [
 		null,
 		[],

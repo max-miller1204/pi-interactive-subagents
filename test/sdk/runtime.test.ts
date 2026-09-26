@@ -383,6 +383,36 @@ for (const fault of [
 			assert.equal(h.widgets.length, 0);
 	});
 
+test("child inbox timer failure blocks SDK input and tools with the original error", async (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	const h = await createRuntimeHarness(t, { child: true });
+	const corrupt = join(h.runDir, "inbox", "unexpected.json");
+	writeFileSync(corrupt, "{}");
+	const message = `Unexpected file ${corrupt} in a subagent directory.`;
+	assert.doesNotThrow(() => t.mock.timers.tick(250));
+	assert.deepEqual(readJsonStrict(Fatal, join(h.runDir, "fatal.json")), {
+		v: 1,
+		message,
+	});
+	assert.deepEqual(h.notices, [{ message, type: "error" }]);
+	assert.equal(h.shutdowns, 1);
+	await h.session.prompt("Continue after failure");
+	assert.equal(h.faux.state.callCount, 0);
+	assert.deepEqual(
+		await h.session.extensionRunner.emitToolCall({
+			type: "tool_call",
+			toolCallId: "blocked",
+			toolName: "ask_question",
+			input: { question: "Continue?" },
+		}),
+		{ block: true, reason: message },
+	);
+	t.mock.timers.tick(6000);
+	assert.equal(h.shutdowns, 1);
+	assert.deepEqual(h.notices, [{ message, type: "error" }]);
+	h.assertNoErrors();
+});
+
 for (const fault of ["directory", "spec", "session"] as const)
 	test(`invalid child ${fault} cannot construct or start the parent role`, async (t) => {
 		let parentIdentityCalls = 0;
@@ -1440,6 +1470,24 @@ test("agent_before_settle injects a late inbox item and continues once", async (
 	]);
 	await h.session.prompt(h.spec.initialPrompt);
 	assert.equal(h.faux.state.callCount, 2);
+	assert.equal(h.messages("subagent_parent_message").length, 1);
+	assert.equal(queue.count(join(h.runDir, "inbox")), 0);
+});
+
+test("an idle child receives parent messages after reload", {
+	timeout: 20_000,
+}, async (t) => {
+	const h = await createRuntimeHarness(t, { child: true });
+	h.faux.setResponses([fauxAssistantMessage("Task complete.")]);
+	await h.session.prompt(h.spec.initialPrompt);
+	await h.session.extensionRunner.emit({
+		type: "session_start",
+		reason: "reload",
+	});
+	h.assertNoErrors();
+	h.faux.setResponses([fauxAssistantMessage("Continued after reload.")]);
+	inbox(h, "Continue after reload");
+	await idle(h, 2);
 	assert.equal(h.messages("subagent_parent_message").length, 1);
 	assert.equal(queue.count(join(h.runDir, "inbox")), 0);
 });

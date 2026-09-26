@@ -220,6 +220,32 @@ async function childPane(run: Scenario) {
 	}, "child pane");
 }
 
+for (const prefix of ["- Check the code.", "@missing-file", "/quit"]) {
+	test(`task text starting with ${prefix} stays a prompt`, async (t) => {
+		const task = `${prefix}\n${script([{ say: "Literal task received." }])}`;
+		const run = await scenario(t, {
+			agents: { worker: agent() },
+			prompt: script([
+				spawn(task),
+				{ say: "Parent done." },
+				{ say: "Result received." },
+			]),
+		});
+		const details = await result(run);
+		assert.equal(details.status, "completed");
+		assert.equal(details.text, "Literal task received.");
+		const user = readBranch(details.childSessionFile).find(
+			(entry) => entry.type === "message" && entry.message.role === "user",
+		);
+		assert.ok(user?.type === "message" && user.message.role === "user");
+		assert.ok(
+			JSON.stringify(user.message.content).includes(
+				JSON.stringify(task).slice(1, -1),
+			),
+		);
+	});
+}
+
 test("autonomous result is durable once and done row expires", async (t) => {
 	const run = await scenario(t, {
 		agents: { worker: agent() },
@@ -325,18 +351,6 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 	});
 	const file = await childFile(run);
 	const active = await liveRun(run);
-	const queued = await run.waitFor(
-		() =>
-			queue
-				.list(join(active.path, "inbox"), "inbox")
-				.find(
-					(item) =>
-						item.item.kind === "message" &&
-						item.item.text === "Immediate steer.",
-				),
-		"immediate steer file",
-	);
-	const deliveryId = queue.itemId(active.spec.runId, "inbox", queued.seq);
 	await run.waitFor(
 		async () => (await parentMessages(file)).length === 1,
 		"child steer",
@@ -359,6 +373,15 @@ test("task precedes an immediate steer in the child branch", async (t) => {
 	);
 	const parentMessage = (await parentMessages(file))[0];
 	assert.ok(parentMessage);
+	const deliveryId = String(parentMessage.details.deliveryId);
+	assert.equal(
+		queue.itemId(
+			active.spec.runId,
+			"inbox",
+			deliveryId.slice(`${active.spec.runId}:inbox:`.length),
+		),
+		deliveryId,
+	);
 	assert.deepEqual(parentMessage.details, {
 		deliveryId,
 		kind: "message",
@@ -458,23 +481,11 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 			`child idle before steer ${index + 1}`,
 		);
 		const before = readBranch(file).length;
-		const queued = run.waitFor(
-			() =>
-				queue
-					.list(join(active.path, "inbox"), "inbox")
-					.find(
-						(item) => item.item.kind === "message" && item.item.text === text,
-					),
-			`steer file ${index + 1}`,
-		);
 		await prompt(run, [
 			steer(text),
 			{ say: `Sent ${index}.` },
 			{ say: "Result received." },
 		]);
-		const item = await queued;
-		assert.deepEqual(item.item, { v: 1, kind: "message", text });
-		const deliveryId = queue.itemId(active.spec.runId, "inbox", item.seq);
 		await run.waitFor(
 			() => {
 				const branch = readBranch(file);
@@ -493,6 +504,17 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 			},
 			`child settles after steer ${index + 1}`,
 		);
+		const delivered = (await parentMessages(file))[index];
+		assert.ok(delivered);
+		const deliveryId = String(delivered.details.deliveryId);
+		assert.equal(
+			queue.itemId(
+				active.spec.runId,
+				"inbox",
+				deliveryId.slice(`${active.spec.runId}:inbox:`.length),
+			),
+			deliveryId,
+		);
 		const matching = (await parentMessages(file)).filter(
 			(entry) => entry.details.deliveryId === deliveryId,
 		);
@@ -508,6 +530,8 @@ test("three steers persist in sequence in an interactive child", async (t) => {
 		steers.map((entry) => entry.details.text),
 		["First steer", "Second steer", "Third steer"],
 	);
+	const deliveryIds = steers.map((entry) => entry.details.deliveryId);
+	assert.deepEqual(deliveryIds, [...deliveryIds].sort());
 	assert.equal(
 		new Set(steers.map((entry) => entry.details.deliveryId)).size,
 		3,
@@ -1465,7 +1489,7 @@ test("quit behind a hanging parent saves one finished result notice", async (t) 
 	const run = await scenario(t, {
 		agents: { worker: agent(false) },
 		prompt: script([
-			spawn("Finished behind hang."),
+			spawn(script([{ say: "ack: Finished behind hang." }])),
 			{ hang: true },
 			{ say: "Unexpected turn." },
 		]),

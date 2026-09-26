@@ -40,7 +40,7 @@ export class Deliverer {
 	private readonly held = new Set<string>();
 	private promptStarting: { since: number } | null = null;
 	private runActive: boolean;
-	private taskStarted = false;
+	private taskStarted: boolean;
 	private broken: Error | undefined;
 	private disposed = false;
 	private readonly pi: ExtensionAPI;
@@ -48,13 +48,12 @@ export class Deliverer {
 	private readonly sources: Source[];
 	private readonly isDisposed: () => boolean;
 	private readonly isReady: () => boolean;
-	private readonly child: boolean;
 	constructor(
 		pi: ExtensionAPI,
 		ctx: ExtensionContext,
 		sources: Source[],
 		isDisposed: () => boolean,
-		child: boolean,
+		waitForTask: boolean,
 		isReady: () => boolean,
 	) {
 		this.pi = pi;
@@ -62,7 +61,7 @@ export class Deliverer {
 		this.sources = sources;
 		this.isDisposed = isDisposed;
 		this.isReady = isReady;
-		this.child = child;
+		this.taskStarted = !waitForTask;
 		this.runActive = !ctx.isIdle();
 	}
 	get offeredCount(): number {
@@ -119,7 +118,7 @@ export class Deliverer {
 	private mode(): "run" | "idle" | "busy" {
 		if (this.promptStarting) return "busy";
 		if (this.runActive) return "run";
-		if (!this.ctx.isIdle() || (this.child && !this.taskStarted)) return "busy";
+		if (!this.ctx.isIdle() || !this.taskStarted) return "busy";
 		return "idle";
 	}
 	pump(): void {

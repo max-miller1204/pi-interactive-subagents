@@ -879,7 +879,11 @@ test("19.3.24: project agents stay unavailable until private project trust", asy
 		"trusted startup",
 	);
 	await prompt(run, [
-		spawn("Trusted project output.", "trusted", "project-worker"),
+		spawn(
+			script([{ say: "Trusted project output." }]),
+			"trusted",
+			"project-worker",
+		),
 		{ say: "Trusted worker started." },
 		{ say: "Trusted result received." },
 	]);
@@ -1049,7 +1053,7 @@ test("pane recovery proves server and pane identity before cleanup", async (t) =
 				extensionPaths: [toolExtension],
 				agents: { worker: agent("auto-exit: false\n") },
 				prompt: script([
-					spawn("Recovery session output."),
+					spawn(script([{ say: "ack: Recovery session output." }])),
 					{ say: "Recovery worker started." },
 					{ say: "Recovery result received." },
 				]),

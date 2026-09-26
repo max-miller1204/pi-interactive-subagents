@@ -117,6 +117,17 @@ export const RunSpec = Obj({
 	initialPrompt: Type.String({ minLength: 1 }),
 	launch: Launch,
 });
+export const LaunchState = Obj({
+	v: Type.Literal(1),
+	runId: Type.String({ format: "uuid" }),
+	ownerKey: Type.String({ minLength: 1 }),
+	name: Name,
+	phase: Type.Union([
+		Type.Literal("preparing"),
+		Type.Literal("pane-attempted"),
+		Type.Literal("cleanup-confirmed"),
+	]),
+});
 export const TmuxServerIdentity = Obj({
 	socket: AbsPath,
 	process: ProcessIdentity,
@@ -327,6 +338,7 @@ export type Catalog = Static<typeof Catalog>;
 export type LaunchDraft = Static<typeof LaunchDraft>;
 export type Launch = Static<typeof Launch>;
 export type RunSpec = Static<typeof RunSpec>;
+export type LaunchState = Static<typeof LaunchState>;
 export type PaneFile = Static<typeof PaneFile>;
 export type TmuxServerIdentity = Static<typeof TmuxServerIdentity>;
 export type InboxItem = Static<typeof InboxItem>;

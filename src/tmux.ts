@@ -53,7 +53,7 @@ function parsePane(line: string): PaneState {
 		!paneId ||
 		!/^%[0-9]+$/.test(paneId) ||
 		!pidText ||
-		!/^[1-9][0-9]*$/.test(pidText) ||
+		!/^(0|[1-9][0-9]*)$/.test(pidText) ||
 		(deadText !== "0" && deadText !== "1") ||
 		statusText === undefined ||
 		(statusText !== "" && !/^[0-9]+$/.test(statusText)) ||
@@ -261,10 +261,10 @@ async function paneGeometry(
 			!/^%[0-9]+$/.test(paneId) ||
 			seen.has(paneId) ||
 			session === undefined ||
-			[pid, width, height].some(
+			[width, height].some(
 				(value) => value === undefined || !/^[1-9][0-9]*$/.test(value),
 			) ||
-			[left, top].some(
+			[pid, left, top].some(
 				(value) => value === undefined || !/^(0|[1-9][0-9]*)$/.test(value),
 			) ||
 			[pid, left, top, width, height].some(
@@ -348,6 +348,25 @@ async function columnSnapshot(tmux: Tmux, owned: ColumnPane[], target: string) {
 	assertServerIdentity(server, await tmux.serverIdentity());
 	panes.sort((a, b) => a.paneId.localeCompare(b.paneId));
 	return { panes, tree, border };
+}
+
+export async function childSplitTarget(
+	tmux: Tmux,
+	owned: ColumnPane[],
+): Promise<string | undefined> {
+	const target = owned.at(-1)?.pane.paneId;
+	if (owned.length < 2) return target;
+	if (target === undefined) throw new Error("Missing child column target.");
+	const snapshot = await columnSnapshot(tmux, owned, target);
+	const column = isolatedColumn(
+		snapshot.tree,
+		owned.map((item) => item.pane.paneId),
+	);
+	// Split a direct leaf so nested rows keep their size and position.
+	const leaf = column.children.findLast((cell) => cell.kind === "pane");
+	if (leaf?.kind !== "pane")
+		throw new Error("The child column has no pane that can be split.");
+	return leaf.paneId;
 }
 
 // Check the whole tree and all identities before each change to the owned subtree.

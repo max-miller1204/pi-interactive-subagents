@@ -98,13 +98,26 @@ export class ChildStartup {
 	fail(error: unknown): void {
 		if (this.fatal !== undefined) return;
 		this.fatal = error instanceof Error ? error.message : String(error);
-		if (this.runDir !== undefined)
-			writeJsonAtomic(
-				join(this.runDir, "fatal.json"),
-				parseStrict(Fatal, { v: 1, message: this.fatal }, "child fatal"),
-			);
-		this.ctx.ui.notify(this.fatal, "error");
-		this.ctx.shutdown();
+		let persistenceError: string | undefined;
+		try {
+			if (this.runDir !== undefined)
+				writeJsonAtomic(
+					join(this.runDir, "fatal.json"),
+					parseStrict(Fatal, { v: 1, message: this.fatal }, "child fatal"),
+				);
+		} catch (error) {
+			persistenceError = error instanceof Error ? error.message : String(error);
+		}
+		try {
+			this.ctx.ui.notify(this.fatal, "error");
+			if (persistenceError !== undefined)
+				this.ctx.ui.notify(
+					`Could not write the subagent fatal record: ${persistenceError}`,
+					"error",
+				);
+		} finally {
+			this.ctx.shutdown();
+		}
 	}
 	onInput(): { action: "handled" } | undefined {
 		if (this.fatal !== undefined) return { action: "handled" };
@@ -204,8 +217,23 @@ class ChildRole {
 		this.writeStatus();
 		runtime.sources.push(this.inboxSource());
 		this.deliverer().reconcile();
-		this.pumpTimer = setInterval(() => this.deliverer().pump(), 250);
-		this.ownerTimer = setInterval(() => this.checkOwner(), 2000);
+		this.pumpTimer = setInterval(
+			() => this.runTimer(() => this.deliverer().pump()),
+			250,
+		);
+		this.ownerTimer = setInterval(
+			() => this.runTimer(() => this.checkOwner()),
+			2000,
+		);
+	}
+	private runTimer(callback: () => void): void {
+		if (!this.active()) return;
+		try {
+			callback();
+		} catch (error) {
+			this.stopTimers();
+			this.startup.fail(error);
+		}
 	}
 	private ready(): { spec: RunSpec; runDir: string } {
 		if (this.spec === undefined || this.runDir === undefined)
@@ -528,7 +556,7 @@ class ChildRole {
 			this.stopTimers();
 			this.statusBar();
 			this.ctx.ui.notify(
-				`The parent Pi process ended without a quit. This pane is now a normal Pi session. Its result is not delivered. Session: ${spec.launch.childSessionFile}`,
+				`The parent Pi process ended without a quit. Continue work in this pane. Parent messaging and auto-exit are off. Session switching and forking remain blocked. Session: ${spec.launch.childSessionFile}`,
 				"error",
 			);
 			return;

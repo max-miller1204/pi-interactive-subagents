@@ -7,11 +7,7 @@ const flag = "--isolated-tmux";
 const args = process.argv.slice(2);
 const isolatedTmux = args.includes(flag);
 const nodeArgs = args.filter((arg) => arg !== flag);
-const environment = Object.fromEntries(
-	Object.entries(process.env).filter(
-		([name]) => !name.startsWith("PI_SUBAGENT_"),
-	),
-);
+const environment = { ...process.env };
 
 function startPrivateServer() {
 	const socketName = `pi-subagents-test-${process.pid}`;

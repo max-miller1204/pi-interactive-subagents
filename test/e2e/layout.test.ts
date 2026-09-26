@@ -375,7 +375,7 @@ test("19.3.27: killed test parent leaves an open orphan and one stopped recovery
 		return !processAlive(child.spec.owner);
 	}, "only test parent exits");
 	assert.deepEqual(processIdentity(process.pid), runnerIdentity);
-	const notice = `The parent Pi process ended without a quit. This pane is now a normal Pi session. Its result is not delivered. Session: ${child.spec.launch.childSessionFile}`;
+	const notice = `The parent Pi process ended without a quit. Continue work in this pane. Parent messaging and auto-exit are off. Session switching and forking remain blocked. Session: ${child.spec.launch.childSessionFile}`;
 	await visible(t, run, `Error: ${notice}`, child.pane.paneId);
 	assert.equal((await verified(run, child)).dead, false);
 	assert.equal(processAlive(child.pane.process), true);

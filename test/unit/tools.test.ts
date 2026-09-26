@@ -1,26 +1,60 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
+import type { CatalogInput, ResolveLaunchOptions } from "../../src/catalog.ts";
 import { discoverAgents } from "../../src/config.ts";
+import type { Runtime } from "../../src/parent.ts";
+import type { LaunchDraft } from "../../src/schema.ts";
 import { type AgentDef, Catalog, parseStrict } from "../../src/schema.ts";
-import {
-	questionContent,
-	registerCommand,
-	registerTools,
-	subagentsSection,
-} from "../../src/tools.ts";
+import type { LaunchResolver } from "../../src/tools.ts";
+import { registerCommand, registerTools } from "../../src/tools.ts";
+
+type CapturedTool = Pick<
+	ToolDefinition,
+	"name" | "parameters" | "executionMode" | "promptGuidelines"
+> & {
+	execute: (
+		id: string,
+		args: Record<string, unknown>,
+		signal?: AbortSignal,
+		update?: unknown,
+		ctx?: ExtensionContext,
+	) => Promise<{
+		content: { type: "text"; text: string }[];
+		details?: unknown;
+	}>;
+};
+
+function firstText(
+	result: Awaited<ReturnType<CapturedTool["execute"]>>,
+): string {
+	const content = result.content[0];
+	assert.ok(content);
+	return content.text;
+}
 
 test("registered tools validate closed parameters and route calls", async () => {
-	const tools = new Map<string, any>();
+	const tools = new Map<string, CapturedTool>();
 	const pi = {
-		registerTool: (tool: any) => tools.set(tool.name, tool),
+		registerTool: (tool: ToolDefinition) =>
+			tools.set(tool.name, tool as unknown as CapturedTool),
 	} as unknown as ExtensionAPI;
 	const calls: unknown[] = [];
 	const runtime = {
-		list: () => ({ live: [], launching: [], branch: new Map() }),
-		spawn: async (draft: any, task: string, id: string) => {
+		list: () => ({
+			live: [],
+			launching: [],
+			reserved: ["scout-1"],
+			branch: new Map(),
+		}),
+		spawn: async (draft: LaunchDraft, task: string, id: string) => {
 			calls.push([draft, task, id]);
 			return {
 				spec: {
@@ -68,15 +102,17 @@ test("registered tools validate closed parameters and route calls", async () => 
 		ignoredProjectAgents: [],
 		projectFilesIgnored: false,
 		profileError: null,
-	} as any;
-	const resolve = (options: any) => ({
-		name: options.name,
-		agent: options.agent,
-		profile: options.profile,
-		autoExit: true,
-	});
-	registerTools(pi, runtime as any, () => catalog, resolve as any);
+	} as unknown as CatalogInput;
+	const resolve: LaunchResolver = (options: ResolveLaunchOptions) =>
+		({
+			name: options.name,
+			agent: options.agent,
+			profile: options.profile,
+			autoExit: true,
+		}) as LaunchDraft;
+	registerTools(pi, runtime as unknown as Runtime, () => catalog, resolve);
 	const start = tools.get("subagent");
+	assert.ok(start);
 	assert.equal(start.executionMode, "sequential");
 	assert.equal(
 		Value.Check(start.parameters, { agent: "scout", task: "Read" }),
@@ -99,7 +135,7 @@ test("registered tools validate closed parameters and route calls", async () => 
 		}),
 		true,
 	);
-	const ctx = { cwd: "/work" } as any;
+	const ctx = { cwd: "/work" } as ExtensionContext;
 	const result = await start.execute(
 		"id",
 		{ agent: "scout", task: "Read", profile: "quick" },
@@ -108,19 +144,20 @@ test("registered tools validate closed parameters and route calls", async () => 
 		ctx,
 	);
 	assert.match(
-		result.content[0].text,
-		/Started subagent "scout-1" \(agent scout, profile quick\) in pane %2/,
+		firstText(result),
+		/Started subagent "scout-2" \(agent scout, profile quick\) in pane %2/,
 	);
 	assert.deepEqual(result.details, {
 		runId: "run",
-		name: "scout-1",
+		name: "scout-2",
 		agent: "scout",
 		profile: "quick",
 		paneId: "%2",
 		childSessionFile: "/child",
 	});
-	assert.equal((calls[0] as any[])[2], "id");
+	assert.equal((calls[0] as readonly unknown[])[2], "id");
 	const message = tools.get("subagent_message");
+	assert.ok(message);
 	assert.equal(message.executionMode, "sequential");
 	assert.equal(
 		Value.Check(message.parameters, {
@@ -138,43 +175,50 @@ test("registered tools validate closed parameters and route calls", async () => 
 	});
 	assert.deepEqual(calls[1], ["scout-1", "yes", "q-abcdef12"]);
 	const list = tools.get("subagents_list");
+	assert.ok(list);
 	assert.equal(Value.Check(list.parameters, {}), true);
 	assert.equal(Value.Check(list.parameters, { legacy: true }), false);
-	assert.match((await list.execute("id", {})).content[0].text, /Agents:/);
-	assert.match(subagentsSection(catalog), /quick: p\/m/);
-	assert.equal(
-		questionContent("scout-1", "scout", "q-abcdef12", "Help?"),
-		'Subagent "scout-1" (agent scout) asks question q-abcdef12:\n\nHelp?\n\nIt waits for your answer. Reply with subagent_message({ name: "scout-1", question_id: "q-abcdef12", message }).',
-	);
+	const listed = firstText(await list.execute("id", {}));
+	assert.match(listed, /Agents:/);
+	assert.match(listed, /scout-1: manual recovery needed/);
 });
 
 test("command selects a profile, launches and sends a non-triggering started message", async () => {
-	let command: any;
+	let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
 	const sent: unknown[] = [];
+	const tasks: string[] = [];
 	const pi = {
-		registerCommand: (_name: string, value: any) => {
+		registerCommand: (
+			_name: string,
+			value: Parameters<ExtensionAPI["registerCommand"]>[1],
+		) => {
 			command = value;
 		},
 		sendMessage: (...args: unknown[]) => sent.push(args),
 	} as unknown as ExtensionAPI;
 	const runtime = {
-		list: () => ({ live: [], launching: [], branch: new Map() }),
-		spawn: async (launch: any) => ({
-			spec: { runId: "run", launch },
-			pane: { paneId: "%2" },
-		}),
+		list: () => ({ live: [], launching: [], reserved: [], branch: new Map() }),
+		spawn: async (launch: LaunchDraft, task: string) => {
+			tasks.push(task);
+			return {
+				spec: { runId: "run", launch },
+				pane: { paneId: "%2" },
+			};
+		},
 	};
 	const catalog = {
 		catalog: {
 			agents: { scout: { modelInvocable: true } },
 			profiles: { quick: {} },
 		},
-	} as any;
-	registerCommand(pi, runtime as any, () => catalog, ((o: any) => ({
+	} as unknown as CatalogInput;
+	registerCommand(pi, runtime as unknown as Runtime, () => catalog, ((
+		o: ResolveLaunchOptions,
+	) => ({
 		name: o.name,
 		agent: o.agent,
 		profile: o.profile,
-	})) as any);
+	})) as LaunchResolver);
 	const ctx = {
 		cwd: "/work",
 		ui: {
@@ -182,11 +226,18 @@ test("command selects a profile, launches and sends a non-triggering started mes
 			editor: async () => "Read files",
 			notify: () => {},
 		},
-	} as any;
+	} as unknown as ExtensionCommandContext;
+	assert.ok(command);
+	assert.ok(command.getArgumentCompletions);
 	assert.deepEqual(command.getArgumentCompletions("sc"), [
 		{ value: "scout", label: "scout" },
 	]);
 	await command.handler("scout", ctx);
+	await command.handler("scout Explain this:\nif ready:\n    run()", ctx);
+	assert.deepEqual(tasks, [
+		"Read files",
+		"Explain this:\nif ready:\n    run()",
+	]);
 	assert.deepEqual(sent[0], [
 		{
 			customType: "subagent_started",
@@ -238,17 +289,21 @@ test("model guidance hides manual agents while command completion shows them", a
 		},
 		"test catalog",
 	);
-	const tools = new Map<string, any>();
-	let command: any;
+	const tools = new Map<string, CapturedTool>();
+	let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
 	const pi = {
-		registerTool: (tool: any) => tools.set(tool.name, tool),
-		registerCommand: (_name: string, value: any) => {
+		registerTool: (tool: ToolDefinition) =>
+			tools.set(tool.name, tool as unknown as CapturedTool),
+		registerCommand: (
+			_name: string,
+			value: Parameters<ExtensionAPI["registerCommand"]>[1],
+		) => {
 			command = value;
 		},
 		sendMessage: () => {},
 	} as unknown as ExtensionAPI;
 	const calls: { agent: string; modelInvocation: boolean }[] = [];
-	const resolve = (options: any) => {
+	const resolve: LaunchResolver = (options: ResolveLaunchOptions) => {
 		calls.push({
 			agent: options.agent,
 			modelInvocation: options.modelInvocation,
@@ -257,12 +312,12 @@ test("model guidance hides manual agents while command completion shows them", a
 			name: options.name,
 			agent: options.agent,
 			profile: options.profile,
-		};
+		} as LaunchDraft;
 	};
 	const runtime = {
 		runs: new Map(),
-		list: () => ({ live: [], launching: [], branch: new Map() }),
-		spawn: async (launch: any) => ({
+		list: () => ({ live: [], launching: [], reserved: [], branch: new Map() }),
+		spawn: async (launch: LaunchDraft) => ({
 			spec: {
 				runId: "run",
 				launch: { ...launch, autoExit: false, childSessionFile: "/child" },
@@ -270,22 +325,29 @@ test("model guidance hides manual agents while command completion shows them", a
 			pane: { paneId: "%2" },
 		}),
 	};
-	registerTools(pi, runtime as any, () => catalog, resolve as any);
-	registerCommand(pi, runtime as any, () => catalog, resolve as any);
-	const guidance = tools.get("subagent").promptGuidelines.join("\n");
+	registerTools(pi, runtime as unknown as Runtime, () => catalog, resolve);
+	registerCommand(pi, runtime as unknown as Runtime, () => catalog, resolve);
+	const start = tools.get("subagent");
+	assert.ok(start);
+	assert.ok(start.promptGuidelines);
+	const guidance = start.promptGuidelines.join("\n");
 	assert.match(guidance, /scout \(package\)/);
 	assert.doesNotMatch(guidance, /manual \(package\)/);
+	const list = tools.get("subagents_list");
+	assert.ok(list);
 	assert.doesNotMatch(
-		(await tools.get("subagents_list").execute("id", {})).content[0].text,
+		firstText(await list.execute("id", {})),
 		/manual \(package\)/,
 	);
+	assert.ok(command);
+	assert.ok(command.getArgumentCompletions);
 	assert.deepEqual(command.getArgumentCompletions("man"), [
 		{ value: "manual", label: "manual" },
 	]);
 	await command.handler("manual Build", {
 		cwd: "/work",
 		ui: { select: async () => "quick", notify: () => {} },
-	} as any);
+	} as unknown as ExtensionCommandContext);
 	assert.deepEqual(calls, [{ agent: "manual", modelInvocation: false }]);
 });
 

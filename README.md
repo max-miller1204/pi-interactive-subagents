@@ -357,7 +357,10 @@ If quit happens before the session has any assistant reply, Pi says the session 
 The stderr line then lists the child session files.
 
 A parent crash does not quit the children.
-Each child shows an error and stays open as a normal Pi session.
+Each child shows an error and stays open.
+You can continue work in that pane.
+Parent messaging and auto-exit stop.
+Session switching and forking remain blocked.
 The next Pi startup records the stopped runs.
 Open the parent session to see the notice.
 
@@ -379,6 +382,7 @@ Each run has a directory under that owner.
 | File | Role |
 | --- | --- |
 | `spec.json` | The launch record. The child reads it at startup. |
+| `launch-state.json` | The launch phase used to clean incomplete runs after restart. |
 | `system-prompt.md` | The child system prompt. |
 | `launch.sh` | The pane command. It deletes itself after it starts. |
 | `pane.json` | The tmux pane and process identity. It exists after a completed launch. |
@@ -386,7 +390,7 @@ Each run has a directory under that owner.
 | `outbox/` | Questions from the child to the parent. |
 | `questions/` | Open questions. |
 | `status.json` | `starting`, `working`, or `waiting`, plus question and human flags. |
-| `fatal.json` | The startup error, when startup fails. |
+| `fatal.json` | The startup or child timer error. |
 | `result.json` | The result waiting for delivery. |
 | `delivery-ack.json` | Proof that the result was saved while pane cleanup is still pending. |
 
@@ -398,11 +402,16 @@ To debug a run, read `spec.json`, `status.json`, `fatal.json`, and `result.json`
 Then read the child session file named in the result.
 A bad JSON file throws and names its path.
 Do not delete a run directory while its pane or process is still alive.
+An incomplete run with a verified `preparing` or `cleanup-confirmed` phase is removed at startup.
+An attempted pane without `pane.json` needs manual recovery.
+Pi reports its run directory and reserves its name until the pane and process are checked.
+An older run without `launch-state.json` also needs manual recovery.
+After manual cleanup, reload Pi to clear the reservation.
 
 ## Limits
 
 The sandbox stops at extension granularity.
-A parent crash leaves children as normal Pi sessions.
+A parent crash leaves children open in their current sessions.
 No process adopts those live panes.
 A message sent after the child decides to exit is listed, not delivered.
 A prompt that starts with `/` can race one delivery.
@@ -434,12 +443,28 @@ The pinned Pi packages are 0.87.1.
 | `npm run test:sdk` | Run in-process Pi tests with the faux provider. |
 | `npm test` | Run the version check, typecheck, lint, unit tests, and SDK tests. |
 | `npm run test:e2e` | Run end-to-end tests on a private tmux server. |
+| `npm run test:docker` | Build a Linux image and run both suites with networking disabled. |
+| `EVIDENCE_DIR=artifacts/recording npm run test:record` | Record an asserted Pi and tmux workflow. |
 
 `npm run test:e2e` starts `tmux -L pi-subagents-test-<pid>`.
 It does not use your default tmux server.
 It stops that private server when the run ends.
 The end-to-end tests use a scripted faux model.
 They do not call a paid model.
+
+The Docker command requires a running Docker engine.
+The image uses a pinned Node 24 base and `npm ci`.
+The build needs network access to install packages.
+The tests run without network access.
+The build context excludes local settings, credentials, and generated artifacts.
+
+The recording command requires VHS, FFmpeg, ttyd, and tmux on `PATH`.
+Create the output parent directory first, for example with `mkdir -p artifacts`.
+Set `EVIDENCE_DIR` to a directory that does not exist.
+The test saves an MP4, a screenshot, terminal captures, checkpoints, and session files.
+It checks questions, reload recovery, result delivery, nested panes, steering, crash reporting, and descendant shutdown.
+It records real Pi processes with scripted model responses.
+It does not test a live model service or prove every possible app behavior.
 
 GitHub Actions runs `npm ci`, installs the pinned Pi command, then runs `npm test` and `npm run test:e2e`.
 The jobs use Ubuntu 24.04 and macOS.

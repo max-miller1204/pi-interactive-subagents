@@ -138,7 +138,7 @@ test("empty list is valid; every malformed pane line fails loudly", async () => 
 	for (const line of [
 		"%1\t2\t0\t\t",
 		"%1\t2\t0\t\t\t\textra",
-		"%1\t0\t0\t\t\t",
+		"%1\t-1\t0\t\t\t",
 		"%1\tx\t0\t\t\t",
 		"%1\t2\t2\t\t\t",
 		"%1\t2\t0\t-1\t\t",
@@ -152,6 +152,19 @@ test("empty list is valid; every malformed pane line fails loudly", async () => 
 		fake("%1\t2\t0\t\t\t\n%1\t3\t0\t\t\t\n").listPanes(),
 		/duplicate/i,
 	);
+});
+
+test("listPanes accepts an empty tmux pane without a process", async () => {
+	const panes = await fake("%1\t123\t0\t\t\t/s1\n%2\t0\t0\t\t\t\n").listPanes();
+	assert.equal(panes.get("%1")?.pid, 123);
+	assert.deepEqual(panes.get("%2"), {
+		paneId: "%2",
+		pid: 0,
+		dead: false,
+		status: null,
+		signal: null,
+		session: "",
+	});
 });
 
 test("an unreaped dead pane signals the tmux server and stays an error if the status is still missing", async () => {

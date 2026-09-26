@@ -28,8 +28,8 @@ import * as queue from "./queue.ts";
 import {
 	ChildStatus,
 	Fatal,
-	type Launch,
 	type LaunchDraft,
+	LaunchState,
 	MAX_DEPTH,
 	OpenQuestion,
 	PaneFile,
@@ -62,6 +62,7 @@ import {
 	type Tmux,
 	verifiedPane,
 } from "./tmux.ts";
+import { resultContent } from "./ui.ts";
 
 export function classifyResult(evidence: {
 	branch: SessionEntry[];
@@ -181,61 +182,6 @@ const DeliveryAck = Type.Object(
 function ownerHash(start: string): string {
 	return createHash("sha256").update(start).digest("hex");
 }
-function resultContent(details: ResultDetails, launch: Launch): string {
-	let first: string;
-	switch (details.status) {
-		case "failed":
-			first = `could not start: ${details.errorMessage}`;
-			break;
-		case "closed":
-			first = `was closed in its pane${!launch.autoExit && details.text ? " by a human" : ""}`;
-			break;
-		case "crashed":
-			first =
-				details.signal !== undefined
-					? `crashed (signal ${details.signal})`
-					: `crashed (exit code ${details.exitCode})`;
-			break;
-		case "no_output":
-			first = "ended without output";
-			break;
-		case "error":
-			first =
-				details.errorMessage === undefined
-					? "failed"
-					: `failed: ${details.errorMessage}`;
-			break;
-		case "aborted":
-			first = "was interrupted";
-			break;
-		case "completed":
-			first = "finished";
-			break;
-	}
-	const lines = [
-		`Subagent "${details.name}" (agent ${details.agent}) ${first} after ${(details.durationMs / 1000).toFixed(1)}s, context ${details.contextTokens === null ? "unknown" : details.contextTokens}.`,
-	];
-	if (details.text) lines.push(details.text);
-	if (details.truncated)
-		lines.push(
-			`[The output is cut. Full transcript: ${details.childSessionFile}]`,
-		);
-	if (details.note !== undefined) lines.push(`Note: ${details.note}`);
-	if (details.status === "crashed" && details.paneTail !== undefined)
-		lines.push(`Pane output (last 40 lines):\n${details.paneTail}`);
-	if (details.undelivered.length)
-		lines.push(
-			`Messages it did not read:\n${details.undelivered.map((text, i) => `${i + 1}. ${text}`).join("\n")}`,
-		);
-	if (details.openQuestions.length)
-		lines.push(
-			`Open questions when it ended:\n${details.openQuestions.map((q) => `- ${q.qid}: ${q.text}`).join("\n")}`,
-		);
-	lines.push(
-		`Continue it with subagent_message({ name: "${details.name}", message }).`,
-	);
-	return lines.join("\n\n");
-}
 
 export class Runtime {
 	readonly runs = new Map<string, ParentRun>();
@@ -260,6 +206,9 @@ export class Runtime {
 	private readonly alive: (identity: ProcessIdentity) => boolean;
 	private readonly now: () => number;
 	private readonly launching = new Map<string, LaunchPlan>();
+	private readonly launchingRunIds = new Set<string>();
+	private readonly incompleteNames = new Map<string, string>();
+	private blockedRecovery: string | undefined;
 	private readonly notified = new Set<string>();
 	private readonly retiredSources = new Set<Source>();
 	private timer: ReturnType<typeof setInterval> | undefined;
@@ -355,7 +304,10 @@ export class Runtime {
 			.filter((name) => !name.startsWith("."))
 			.sort()) {
 			const runDir = join(this.ownerDir, name);
-			if (!existsSync(join(runDir, "pane.json"))) continue;
+			if (!existsSync(join(runDir, "pane.json"))) {
+				this.recoverIncompleteRun(runDir, name, this.ownerKey);
+				continue;
+			}
 			try {
 				const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
 				const pane = readJsonStrict(PaneFile, join(runDir, "pane.json"));
@@ -373,7 +325,13 @@ export class Runtime {
 			ctx,
 			this.sources,
 			() => this.disposed,
-			this.deps.childSpec !== undefined,
+			this.deps.childSpec !== undefined &&
+				!afterMarker(
+					ctx.sessionManager.getBranch(),
+					this.deps.childSpec.runId,
+				)?.some(
+					(entry) => entry.type === "message" && entry.message.role === "user",
+				),
 			() => this.enabled,
 		);
 		if (event.reason === "startup") await this.recoverDeadOwners();
@@ -381,6 +339,65 @@ export class Runtime {
 		this.deliverer.reconcile();
 		this.enabled = true;
 		this.startTick();
+	}
+	private recoverIncompleteRun(
+		runDir: string,
+		runId: string,
+		ownerKey: string,
+	): void {
+		if (this.launchingRunIds.has(runId)) return;
+		let state: LaunchState | undefined;
+		let spec: RunSpec | undefined;
+		let problem: string | undefined;
+		try {
+			const candidate = readJsonStrict(
+				LaunchState,
+				join(runDir, "launch-state.json"),
+			);
+			if (candidate.runId !== runId || candidate.ownerKey !== ownerKey)
+				throw new Error("launch state identity does not match its directory");
+			state = candidate;
+		} catch (error) {
+			problem = `invalid launch state: ${errorText(error)}`;
+		}
+		try {
+			if (existsSync(join(runDir, "spec.json"))) {
+				const candidate = readJsonStrict(RunSpec, join(runDir, "spec.json"));
+				if (candidate.runId !== runId || candidate.ownerKey !== ownerKey)
+					throw new Error("run spec identity does not match its directory");
+				spec = candidate;
+				if (state !== undefined && candidate.launch.name !== state.name)
+					throw new Error("run spec name does not match launch state");
+			}
+		} catch (error) {
+			problem = `invalid run spec: ${errorText(error)}`;
+		}
+		if (
+			problem === undefined &&
+			state !== undefined &&
+			(state.phase === "preparing" || state.phase === "cleanup-confirmed")
+		) {
+			try {
+				if (spec?.kind === "spawn" && existsSync(spec.launch.childSessionFile))
+					unlinkSync(spec.launch.childSessionFile);
+				rmSync(runDir, { recursive: true });
+				this.notify(
+					`Removed incomplete subagent run ${runDir} after ${state.phase}.`,
+				);
+				return;
+			} catch (error) {
+				problem = `cleanup failed: ${errorText(error)}`;
+			}
+		}
+		const names = new Set([state?.name, spec?.launch.name]);
+		names.delete(undefined);
+		if (names.size === 0) this.blockedRecovery = runDir;
+		else
+			for (const name of names)
+				if (name !== undefined) this.incompleteNames.set(name, runDir);
+		this.notify(
+			`Cannot clean subagent run ${runDir}: ${problem ?? "pane creation was attempted, but pane identity is unknown"}. Inspect its pane and process before manual cleanup.`,
+		);
 	}
 	private attach(started: StartedRun): void {
 		const name = started.spec.launch.name;
@@ -594,7 +611,8 @@ export class Runtime {
 					}
 				} catch (error) {
 					this.notify(error);
-					this.finalizeFailed(run, error);
+					if (run.phase !== "finished" && !this.acknowledged(run))
+						this.finalizeFailed(run, error);
 				}
 			}
 			if (this.deliverer === undefined)
@@ -710,7 +728,7 @@ export class Runtime {
 					trigger,
 					message: {
 						customType: "subagent_result",
-						content: resultContent(details, spec.launch),
+						content: resultContent(details),
 						display: true,
 						details,
 					},
@@ -796,6 +814,7 @@ export class Runtime {
 					run.phase === "live" ? routableQuestions(run.runDir) : [],
 			})),
 			launching: [...this.launching.keys()],
+			reserved: [...this.incompleteNames.keys()],
 			branch: this.fold().names,
 		};
 	}
@@ -811,11 +830,6 @@ export class Runtime {
 				session: run.spec.launch.childSessionFile,
 			}));
 	}
-	private newestLivePane(exclude?: string): string | undefined {
-		return [...this.runs.values()]
-			.filter((run) => run.phase === "live" && run.pane.paneId !== exclude)
-			.sort((a, b) => b.spec.startedAt - a.spec.startedAt)[0]?.pane.paneId;
-	}
 	async spawn(
 		launch: LaunchDraft,
 		task: string,
@@ -825,7 +839,7 @@ export class Runtime {
 		return this.launch({
 			kind: "spawn",
 			launch,
-			initialPrompt: task,
+			initialPrompt: `Task from the parent agent:\n\n${task}`,
 			...(launch.session === "fork"
 				? { entries: forkEntries(this.ctx, toolCallId) }
 				: {}),
@@ -834,53 +848,63 @@ export class Runtime {
 	private async launch(plan: LaunchPlan): Promise<StartedRun> {
 		this.versionCheck ??= checkTmuxVersion(this.tmux);
 		await this.versionCheck;
-		return launchRun(plan, {
-			runId: randomUUID(),
-			ownerDir: this.ownerDir,
-			ownerKey: this.ownerKey,
-			owner: this.owner,
-			spawnerSessionId: this.ctx.sessionManager.getSessionId(),
-			spawnerSessionFile: this.ctx.sessionManager.getSessionFile(),
-			sessionDir: this.ctx.sessionManager.getSessionDir(),
-			mode: this.ctx.mode,
-			ownExtensionPath: this.deps.ownExtensionPath,
-			env: this.env,
-			tmux: this.tmux,
-			identity: this.identify,
-			...(this.deps.invocation === undefined
-				? {}
-				: { invocation: this.deps.invocation }),
-			trusted: (cwd) => this.deps.trusted(cwd),
-			isDisposed: () => this.disposed,
-			reserve: (name) => {
-				if (
-					this.runs.has(name) ||
-					this.launching.has(name) ||
-					(plan.kind === "spawn" && this.fold().names.has(name))
-				)
-					throw new Error(`Subagent name "${name}" is already in use.`);
-				this.launching.set(name, plan);
-			},
-			release: (name) => {
-				this.launching.delete(name);
-				const run = this.runs.get(name);
-				if (run) {
-					this.runs.delete(name);
-					const index = this.sources.findIndex(
-						(source) => source.key === run.spec.runId,
-					);
-					if (index !== -1) this.sources.splice(index, 1);
-				}
-			},
-			newestLivePane: (exclude) => this.newestLivePane(exclude),
-			liveColumnPanes: (exclude) => this.liveColumnPanes(exclude),
-			commit: (run) => {
-				this.launching.delete(run.spec.launch.name);
-				this.attach(run);
-			},
-			appendRegistry: (record) => this.pi.appendEntry("subagent", record),
-			startTick: () => this.startTick(),
-		});
+		const runId = randomUUID();
+		this.launchingRunIds.add(runId);
+		try {
+			return await launchRun(plan, {
+				runId,
+				ownerDir: this.ownerDir,
+				ownerKey: this.ownerKey,
+				owner: this.owner,
+				spawnerSessionId: this.ctx.sessionManager.getSessionId(),
+				spawnerSessionFile: this.ctx.sessionManager.getSessionFile(),
+				sessionDir: this.ctx.sessionManager.getSessionDir(),
+				mode: this.ctx.mode,
+				ownExtensionPath: this.deps.ownExtensionPath,
+				env: this.env,
+				tmux: this.tmux,
+				identity: this.identify,
+				...(this.deps.invocation === undefined
+					? {}
+					: { invocation: this.deps.invocation }),
+				trusted: (cwd) => this.deps.trusted(cwd),
+				isDisposed: () => this.disposed,
+				reserve: (name) => {
+					if (this.blockedRecovery !== undefined)
+						throw new Error(
+							`Inspect unresolved subagent run ${this.blockedRecovery} before starting another subagent.`,
+						);
+					if (
+						this.runs.has(name) ||
+						this.launching.has(name) ||
+						this.incompleteNames.has(name) ||
+						(plan.kind === "spawn" && this.fold().names.has(name))
+					)
+						throw new Error(`Subagent name "${name}" is already in use.`);
+					this.launching.set(name, plan);
+				},
+				release: (name) => {
+					this.launching.delete(name);
+					const run = this.runs.get(name);
+					if (run) {
+						this.runs.delete(name);
+						const index = this.sources.findIndex(
+							(source) => source.key === run.spec.runId,
+						);
+						if (index !== -1) this.sources.splice(index, 1);
+					}
+				},
+				liveColumnPanes: (exclude) => this.liveColumnPanes(exclude),
+				commit: (run) => {
+					this.launching.delete(run.spec.launch.name);
+					this.attach(run);
+				},
+				appendRegistry: (record) => this.pi.appendEntry("subagent", record),
+				startTick: () => this.startTick(),
+			});
+		} finally {
+			this.launchingRunIds.delete(runId);
+		}
 	}
 	async message(
 		name: string,
@@ -888,6 +912,12 @@ export class Runtime {
 		question_id?: string,
 	): Promise<string> {
 		this.requireEnabled();
+		const incomplete = this.incompleteNames.get(name);
+		if (incomplete !== undefined)
+			throw new Error(
+				`Subagent "${name}" needs manual recovery in ${incomplete}.`,
+			);
+		this.deliverer?.reconcile();
 		if (this.launching.has(name))
 			throw new Error(`Subagent "${name}" is still starting.`);
 		const run = this.runs.get(name);
@@ -1010,7 +1040,7 @@ export class Runtime {
 				runId,
 				launch,
 				details,
-				content: resultContent(details, launch),
+				content: resultContent(details),
 			};
 		} else record = { v: 1, kind, runId, launch, at: this.now() };
 		const dir = this.undeliveredDir(sessionId);
@@ -1043,7 +1073,10 @@ export class Runtime {
 				.filter((id) => !id.startsWith("."))
 				.sort()) {
 				const runDir = join(ownerDir, id);
-				if (!existsSync(join(runDir, "pane.json"))) continue;
+				if (!existsSync(join(runDir, "pane.json"))) {
+					this.recoverIncompleteRun(runDir, id, name);
+					continue;
+				}
 				try {
 					const spec = readJsonStrict(RunSpec, join(runDir, "spec.json"));
 					const pane = readJsonStrict(PaneFile, join(runDir, "pane.json"));
@@ -1211,7 +1244,7 @@ export class Runtime {
 			}
 		}
 		for (const run of runs) {
-			let missingPaneProcess = false;
+			let stoppingProcess = false;
 			try {
 				run.paneCleanup = "unknown";
 				if (panes === undefined || server === undefined)
@@ -1226,14 +1259,13 @@ export class Runtime {
 				);
 				const live = this.alive(run.pane.process);
 				run.paneCleanup = panes.has(run.pane.paneId) ? "pending" : "complete";
-				missingPaneProcess =
-					live && panes !== undefined && run.paneCleanup === "complete";
-				if (missingPaneProcess) {
-					// Recheck the recorded identity before signaling a process without a pane.
+				if (live) {
+					stoppingProcess = true;
+					// Keep the terminal open while the child stops its own children.
 					const stop =
 						this.deps.stopProcess ??
 						((identity: ProcessIdentity) => {
-							process.kill(identity.pid, "SIGHUP");
+							process.kill(identity.pid, "SIGTERM");
 						});
 					if (this.alive(run.pane.process)) stop(run.pane.process);
 				} else if (run.paneCleanup !== "complete") {
@@ -1244,7 +1276,7 @@ export class Runtime {
 			} catch (error) {
 				killFailed.add(run);
 				errors.push(
-					missingPaneProcess
+					stoppingProcess
 						? `Could not stop process ${run.pane.process.pid}: ${errorText(error)}.`
 						: `Could not close pane ${run.pane.paneId}: ${errorText(error)}.`,
 				);
@@ -1257,8 +1289,21 @@ export class Runtime {
 		while (
 			[...killed].some((run) => this.alive(run.pane.process)) &&
 			this.now() < deadline
-		)
+		) {
 			await delay(Math.min(50, deadline - this.now()));
+			try {
+				const currentServer = await this.tmux.serverIdentity();
+				for (const run of killed)
+					assertServerIdentity(run.pane.server, currentServer);
+				await this.tmux.listPanes();
+				assertServerIdentity(currentServer, await this.tmux.serverIdentity());
+			} catch (error) {
+				const message = `Could not refresh panes during quit: ${errorText(error)}.`;
+				errors.push(message);
+				this.notify(message);
+				break;
+			}
+		}
 		const stopped: string[] = [];
 		const results: string[] = [];
 		const stillLive: ParentRun[] = [];
@@ -1275,7 +1320,15 @@ export class Runtime {
 						this.finalizeFailed(run, error);
 					}
 				}
-				if (killFailed.has(run) || run.paneCleanup !== "complete") continue;
+				if (killFailed.has(run)) continue;
+				if (run.paneCleanup !== "complete") {
+					const error = await this.closePane(run);
+					if (error !== undefined) {
+						errors.push(`Could not close pane ${run.pane.paneId}: ${error}.`);
+						continue;
+					}
+				}
+
 				if (this.acknowledged(run)) {
 					this.removeRun(run);
 					if (killed.has(run)) stopped.push(run.spec.launch.name);

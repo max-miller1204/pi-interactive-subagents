@@ -50,20 +50,6 @@ export const messageParameters = Obj({
 });
 export const listParameters = Obj({});
 
-export function questionContent(
-	name: string,
-	agent: string,
-	qid: string,
-	text: string,
-): string {
-	return `Subagent "${name}" (agent ${agent}) asks question ${qid}:\n\n${text}\n\nIt waits for your answer. Reply with subagent_message({ name: "${name}", question_id: "${qid}", message }).`;
-}
-export function subagentsSection(
-	input: CatalogInput,
-	allowlist?: readonly string[],
-): string {
-	return catalogSummary(input, allowlist);
-}
 const rules = [
 	"Give each subagent a complete task. A standalone subagent sees only the task text.",
 	"Pick a profile for every subagent.",
@@ -100,6 +86,7 @@ function usedNames(runtime: Runtime): Set<string> {
 	return new Set([
 		...list.live.map((run) => run.name),
 		...list.launching,
+		...list.reserved,
 		...list.branch.keys(),
 	]);
 }
@@ -131,62 +118,56 @@ export function registerTools(
 	getCatalog: CatalogProvider,
 	resolve: LaunchResolver = resolveLaunch,
 	child?: { launch: { depth: number; nested: Catalog | null } },
-): { refresh(): void } {
-	let guidelines = "";
-	const registerStart = () => {
-		const input = getCatalog();
-		const next = subagentsSection(input, modelAllow(input, child));
-		if (next === guidelines) return;
-		guidelines = next;
-		pi.registerTool({
-			name: "subagent",
-			label: "Subagent",
-			description:
-				"Start a subagent in a new tmux pane. It returns at once. The result arrives later as a message.",
-			promptSnippet:
-				"subagent: start a named subagent in a tmux pane; its result arrives later as a message",
-			promptGuidelines: [...rules, ...next.split("\n")],
-			parameters: subagentParameters,
-			executionMode: "sequential",
-			async execute(toolCallId, args, _signal, _update, ctx) {
-				const catalog = getCatalog();
-				const name = args.name ?? defaultName(args.agent, usedNames(runtime));
-				const draft = resolve(
-					options(
-						catalog,
-						ctx,
-						args.agent,
-						args.profile,
-						name,
-						args.cwd ?? ctx.cwd,
-						true,
-						child,
-					),
-				);
-				const started = await runtime.spawn(draft, args.task, toolCallId);
-				const { runId, launch } = started.spec;
-				const paneId = started.pane.paneId;
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in pane ${paneId}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : " A human works with it in the pane. The result arrives when the pane closes."}`,
-						},
-					],
-					details: {
-						runId,
-						name,
-						agent: args.agent,
-						profile: args.profile,
-						paneId,
-						childSessionFile: launch.childSessionFile,
+): void {
+	const input = getCatalog();
+	const next = catalogSummary(input, modelAllow(input, child));
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description:
+			"Start a subagent in a new tmux pane. It returns at once. The result arrives later as a message.",
+		promptSnippet:
+			"subagent: start a named subagent in a tmux pane; its result arrives later as a message",
+		promptGuidelines: [...rules, ...next.split("\n")],
+		parameters: subagentParameters,
+		executionMode: "sequential",
+		async execute(toolCallId, args, _signal, _update, ctx) {
+			const catalog = getCatalog();
+			const name = args.name ?? defaultName(args.agent, usedNames(runtime));
+			const draft = resolve(
+				options(
+					catalog,
+					ctx,
+					args.agent,
+					args.profile,
+					name,
+					args.cwd ?? ctx.cwd,
+					true,
+					child,
+				),
+			);
+			const started = await runtime.spawn(draft, args.task, toolCallId);
+			const { runId, launch } = started.spec;
+			const paneId = started.pane.paneId;
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Started subagent "${name}" (agent ${args.agent}, profile ${args.profile}) in pane ${paneId}. Its result arrives as a message. Do not poll.${launch.autoExit ? "" : " A human works with it in the pane. The result arrives when the pane closes."}`,
 					},
-				};
-			},
-			...registerToolRenderers("subagent"),
-		});
-	};
-	registerStart();
+				],
+				details: {
+					runId,
+					name,
+					agent: args.agent,
+					profile: args.profile,
+					paneId,
+					childSessionFile: launch.childSessionFile,
+				},
+			};
+		},
+		...registerToolRenderers("subagent"),
+	});
 	pi.registerTool({
 		name: "subagent_message",
 		label: "Subagent message",
@@ -221,7 +202,7 @@ export function registerTools(
 			const listing = runtime.list();
 			const input = getCatalog();
 			const lines = [
-				subagentsSection(input, modelAllow(input, child)),
+				catalogSummary(input, modelAllow(input, child)),
 				"Live subagents:",
 			];
 			for (const run of listing.live) {
@@ -238,6 +219,8 @@ export function registerTools(
 				);
 			}
 			for (const name of listing.launching) lines.push(`${name}: starting`);
+			for (const name of listing.reserved)
+				lines.push(`${name}: manual recovery needed`);
 			lines.push("Finished subagents on this branch:");
 			for (const [name, record] of listing.branch)
 				if (!listing.live.some((run) => run.name === name))
@@ -248,7 +231,6 @@ export function registerTools(
 			};
 		},
 	});
-	return { refresh: registerStart };
 }
 export function registerCommand(
 	pi: ExtensionAPI,
@@ -267,7 +249,7 @@ export function registerCommand(
 			return names.map((name) => ({ value: name, label: name }));
 		},
 		async handler(args, ctx) {
-			const [agent, ...parts] = args.trim().split(/\s+/);
+			const [agent] = args.trim().split(/\s+/, 1);
 			if (!agent) {
 				ctx.ui.notify("Usage: /subagent <agent> [task]", "error");
 				return;
@@ -278,7 +260,7 @@ export function registerCommand(
 				const profile = await ctx.ui.select(`Profile for ${agent}`, profiles);
 				if (profile === undefined) return;
 				const task =
-					parts.join(" ").trim() ||
+					args.trim().slice(agent.length).trim() ||
 					(await ctx.ui.editor(`Task for ${agent}`))?.trim();
 				if (!task) return;
 				const name = defaultName(agent, usedNames(runtime));

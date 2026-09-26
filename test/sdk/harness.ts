@@ -117,7 +117,8 @@ export async function createRuntimeHarness(
 	mkdirSync(agentDir);
 
 	const tmux = options.tmux ?? new FakeTmux();
-	const owner = processIdentity(process.pid);
+	// The SDK child and its parent need distinct owners, as real processes do.
+	const owner = processIdentity(options.child ? process.ppid : process.pid);
 	assert.ok(owner);
 	const ownerKey = `${owner.pid}-${createHash("sha256").update(owner.start).digest("hex")}`;
 	const runsRoot = join(root, "runs");

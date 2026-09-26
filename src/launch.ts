@@ -13,6 +13,7 @@ import { processIdentity } from "./process.ts";
 import {
 	Launch,
 	LaunchDraft,
+	LaunchState,
 	Name,
 	PaneFile,
 	type ProcessIdentity,
@@ -26,6 +27,7 @@ import { parentSessionPath, writeChildSession } from "./session-file.ts";
 import {
 	balancePaneColumn,
 	type ColumnPane,
+	childSplitTarget,
 	type Tmux,
 	verifiedPane,
 } from "./tmux.ts";
@@ -178,7 +180,6 @@ export interface LaunchContext {
 	reserve(name: string): void;
 	// Remove the reserved run, including a run whose commit callback succeeded.
 	release(name: string): void;
-	newestLivePane(excludePaneId?: string): string | undefined;
 	liveColumnPanes(excludePaneId?: string): ColumnPane[];
 	// Store the run with phase live. Commit must be synchronous.
 	commit(run: StartedRun): void;
@@ -263,6 +264,7 @@ export async function launchRun(
 	let paneId: string | undefined;
 	let paneCreated = false;
 	let savedPane: PaneFile | undefined;
+	let launchState: LaunchState | undefined;
 	const identify = context.identity ?? processIdentity;
 	try {
 		checkDisposed(context, name);
@@ -330,7 +332,11 @@ export async function launchRun(
 		};
 		// Validate the full command before mkdir or the session writer can write a file.
 		renderLaunchScript(scriptOptions);
-		const target = context.newestLivePane();
+		const target = await childSplitTarget(
+			context.tmux,
+			context.liveColumnPanes(),
+		);
+		checkDisposed(context, name);
 		if (target !== undefined && !/^%[0-9]+$/.test(target))
 			throw new Error(`Invalid live pane id: ${target}.`);
 		const parentPane = context.env.TMUX_PANE;
@@ -339,6 +345,12 @@ export async function launchRun(
 		mkdirSync(directory, { mode: 0o700 });
 		runDir = directory;
 		runDir = realpathSync(runDir);
+		launchState = parseStrict(
+			LaunchState,
+			{ v: 1, runId, ownerKey: context.ownerKey, name, phase: "preparing" },
+			"launch state",
+		);
+		writeJsonAtomic(join(runDir, "launch-state.json"), launchState);
 		for (const box of ["inbox", "outbox", "questions"])
 			mkdirSync(join(runDir, box), { mode: 0o700 });
 		if (plan.kind === "spawn") {
@@ -374,6 +386,12 @@ export async function launchRun(
 		);
 		const server = await context.tmux.serverIdentity();
 		checkDisposed(context, name);
+		const attemptedState: LaunchState = {
+			...launchState,
+			phase: "pane-attempted",
+		};
+		writeJsonAtomic(join(runDir, "launch-state.json"), attemptedState);
+		launchState = attemptedState;
 		// Start a real process so every server client can read strict snapshots.
 		// An empty command leaves pane_pid at zero until respawn, even on failure.
 		const paneOutput = (
@@ -434,8 +452,6 @@ export async function launchRun(
 			launchScript,
 		]);
 		checkDisposed(context, name);
-		if (paneId === undefined)
-			throw new Error("Pane creation did not return an identity.");
 		const pidText = (
 			await context.tmux.run([
 				"display-message",
@@ -491,8 +507,8 @@ export async function launchRun(
 		return result;
 	} catch (error) {
 		const errors: unknown[] = [error];
-		let safeToRemove = !paneCreated;
-		if (paneCreated && paneId === undefined)
+		let safeToRemove = !paneCreated && launchState?.phase !== "pane-attempted";
+		if (!safeToRemove && paneId === undefined)
 			errors.push(
 				new Error(
 					`The new pane identity is unknown. Kept its name and recovery files in ${runDir}. Inspect the tmux server before manual cleanup.`,
@@ -535,20 +551,22 @@ export async function launchRun(
 				);
 			}
 		}
-		for (const cleanup of safeToRemove
-			? [
-					() => {
-						if (runDir !== undefined)
-							rmSync(runDir, { recursive: true, force: true });
-					},
-					() => {
-						if (newSession !== undefined) rmSync(newSession, { force: true });
-					},
-					() => context.release(name),
-				]
-			: []) {
+		if (safeToRemove && runDir !== undefined && launchState !== undefined) {
 			try {
-				cleanup();
+				writeJsonAtomic(join(runDir, "launch-state.json"), {
+					...launchState,
+					phase: "cleanup-confirmed",
+				});
+			} catch (cleanupError) {
+				errors.push(cleanupError);
+			}
+		}
+		if (safeToRemove) {
+			try {
+				if (newSession !== undefined) rmSync(newSession, { force: true });
+				if (runDir !== undefined)
+					rmSync(runDir, { recursive: true, force: true });
+				context.release(name);
 			} catch (cleanupError) {
 				errors.push(cleanupError);
 			}
